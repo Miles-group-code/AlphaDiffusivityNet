@@ -138,6 +138,3 @@ solution = solve(problem, method="pinn", **settings)
     *   `method_bilo.py`: BiLO implementation.
 *   `diagnostics.py`: Plotting and metric calculation tools.
 
-## License
-
-[Insert License Here]
