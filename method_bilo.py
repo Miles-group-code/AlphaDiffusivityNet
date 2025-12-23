@@ -230,22 +230,24 @@ def _calc_physics_loss(
     local_op: nn.Module,
     x_res: torch.Tensor,
     z_tensor: torch.Tensor,
+    z_idx: int,
     alpha: float,
     mu: float,
     w_jump: float,
     w_resgrad: float,
-    mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute PDE residual and jump penalties for the lower-level objective.
 
     Args:
-        mask: Precomputed boolean mask that excludes source-adjacent points.
+        z_idx: Index of the source location on the grid (excluded from residual).
     """
     x_pde = x_res.clone().detach().requires_grad_(True)
     logd_pde = logd_net(x_pde)
     u_hat_pde, _ = local_op(x_pde, logd_pde, z_tensor)
     residual = _alpha_flux_residual(x_pde, logd_pde, u_hat_pde, alpha, mu)
-    res_loss = torch.mean(residual[mask] ** 2)
+    # Exclude the source point from residual loss
+    n = residual.shape[0]
+    res_loss = (torch.sum(residual ** 2) - residual[z_idx] ** 2) / (n - 1)
 
     z_probe = z_tensor.clone().detach().requires_grad_(True)
     logd_z = logd_net(z_probe)
@@ -272,11 +274,13 @@ def _calc_physics_loss(
         jump_rgrad = torch.mean(grad_jump ** 2) if grad_jump is not None else torch.tensor(
             0.0, device=x_res.device, dtype=x_res.dtype
         )
-        grad_outputs_masked = mask.to(dtype=residual.dtype)
+        # Zero out the source point in grad_outputs for resgrad
+        grad_outputs = torch.ones_like(residual)
+        grad_outputs[z_idx] = 0.0
         grad_res = torch.autograd.grad(
             residual,
             logd_pde,
-            grad_outputs=grad_outputs_masked,
+            grad_outputs=grad_outputs,
             create_graph=True,
             allow_unused=True,
         )[0]
@@ -324,8 +328,8 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
         u_true = None
 
     z_tensor = torch.tensor(cfg.physics.sources[0], device=device, dtype=dtype).view(1, 1)
-    # Mask out source-adjacent points once to avoid per-iteration recomputation.
-    pde_mask = torch.abs(x_res - z_tensor) > 1e-4
+    # Since z is exactly on the aligned grid, find the single index to exclude from residual.
+    z_idx = int(torch.argmin(torch.abs(x_res - z_tensor)).item())
 
     d_init_base = cfg.d_profile.d_init_base
     if cfg.d_profile.use_ddi:
@@ -399,11 +403,11 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                 local_op,
                 x_res,
                 z_tensor,
+                z_idx,
                 cfg.physics.alpha,
                 cfg.physics.mu,
                 cfg.reg.w_jump,
                 cfg.reg.w_resgrad,
-                pde_mask,
             )
             logd_curr = logd_net(x_res).detach()
             u_pred, _ = local_op(x_res, logd_curr, z_tensor)
@@ -434,11 +438,11 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                 local_op,
                 x_res,
                 z_tensor,
+                z_idx,
                 cfg.physics.alpha,
                 cfg.physics.mu,
                 cfg.reg.w_jump,
                 cfg.reg.w_resgrad,
-                pde_mask,
             )
             logd_curr = logd_net(x_res).detach()
             u_pred, _ = local_op(x_res, logd_curr, z_tensor)
@@ -518,11 +522,11 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
             local_op,
             x_res,
             z_tensor,
+            z_idx,
             cfg.physics.alpha,
             cfg.physics.mu,
             cfg.reg.w_jump,
             cfg.reg.w_resgrad,
-            pde_mask,
         )
 
         # Compute lower gradients for local_op only (treat logd_net as constant).

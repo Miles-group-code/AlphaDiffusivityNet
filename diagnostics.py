@@ -315,29 +315,27 @@ def plot_training_history(
         arr = np.asarray(values, dtype=float)
         return arr[np.isfinite(arr)]
 
-    # Determine global shift for log plotting if values are negative (e.g. NLL)
-    # We use a very small shift to preserve precision but clamp the view later.
-    min_val = None
-    all_keys = ["total", "upper", "lower"] + all_components
-    for key in all_keys:
-        if key in hist:
-            vals = _finite(hist[key])
-            if vals.size:
-                key_min = float(np.min(vals))
-                min_val = key_min if min_val is None else min(min_val, key_min)
-                if weights and key in weights:
-                    w = weights[key]
-                    if w != 0.0:
-                        weighted_min = float(np.min(vals * w))
-                        min_val = min(min_val, weighted_min)
-
-    shift = 0.0
-    if min_val is not None and min_val <= 0.0:
-        shift_amount = 1e-12
-        shift = -min_val + shift_amount
+    def _compute_shift(keys: list[str]) -> float:
+        """Compute per-panel shift for log plotting if any values are <= 0."""
+        min_val = None
+        for key in keys:
+            if key in hist:
+                vals = _finite(hist[key])
+                if vals.size:
+                    key_min = float(np.min(vals))
+                    min_val = key_min if min_val is None else min(min_val, key_min)
+                    if weights and key in weights:
+                        w = weights[key]
+                        if w != 0.0:
+                            weighted_min = float(np.min(vals * w))
+                            min_val = min(min_val, weighted_min)
+        if min_val is not None and min_val <= 0.0:
+            shift_amount = 1e-12
+            return -min_val + shift_amount
+        return 0.0
 
     # --- Plotting Helper ---
-    def _plot_group(ax, keys, aggregate_key=None, aggregate_label="Total", aggregate_color="k"):
+    def _plot_group(ax, keys, shift, aggregate_key=None, aggregate_label="Total", aggregate_color="k"):
         if aggregate_key and aggregate_key in hist:
             vals = np.array(hist[aggregate_key])
             ax.plot(iters, vals + shift, color=aggregate_color, linewidth=2, label=aggregate_label)
@@ -377,19 +375,43 @@ def plot_training_history(
     # --- Execute Plotting ---
     
     if is_bilo:
+        shift_upper = _compute_shift(["upper"] + upper_components)
+        shift_lower = _compute_shift(["lower"] + lower_components)
         # Panel 1: Upper Level
-        _plot_group(ax_upper, upper_components, aggregate_key="upper", aggregate_label="Upper Total", aggregate_color="b")
+        _plot_group(
+            ax_upper,
+            upper_components,
+            shift_upper,
+            aggregate_key="upper",
+            aggregate_label="Upper Total",
+            aggregate_color="b",
+        )
         ax_upper.set_title(f"Training History: {name} (Upper Level)")
         
         # Panel 2: Lower Level
         # Note: "lower" aggregate is usually present in BILO logs
-        _plot_group(ax_lower, lower_components, aggregate_key="lower", aggregate_label="Lower Total", aggregate_color="r")
+        _plot_group(
+            ax_lower,
+            lower_components,
+            shift_lower,
+            aggregate_key="lower",
+            aggregate_label="Lower Total",
+            aggregate_color="r",
+        )
         ax_lower.set_title("Lower Level")
     else:
         # Single Panel: Total Loss + all components
         # Try to find a total key
         agg_key = "total" if "total" in hist else None
-        _plot_group(ax_upper, all_components, aggregate_key=agg_key, aggregate_label="Total", aggregate_color="k")
+        shift_total = _compute_shift((["total"] if agg_key else []) + all_components)
+        _plot_group(
+            ax_upper,
+            all_components,
+            shift_total,
+            aggregate_key=agg_key,
+            aggregate_label="Total",
+            aggregate_color="k",
+        )
         ax_upper.set_title(f"Training History: {name}")
 
     # --- b0 and Mean D (Common) ---
@@ -536,7 +558,12 @@ def plot_bilo_neighborhood_check(
     outdir: str | None = None,
     filename: str = "bilo_neighborhood_check.png",
 ) -> None:
-    """Compare local operator outputs under small log-D perturbations."""
+    """Compare local operator outputs under small log-D perturbations.
+
+    Note: The FDM reference solve assumes a uniform grid. For BiLO with aligned
+    grids (where z is exactly on the grid), the grid is nearly uniform and the
+    FDM comparison remains valid for visualization purposes.
+    """
     device = x_res.device
     dtype = x_res.dtype
     z_tensor = torch.tensor(z, device=device, dtype=dtype).view(1, 1)

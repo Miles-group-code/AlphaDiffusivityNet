@@ -175,21 +175,23 @@ def _compute_physics_losses(
     u_net: nn.Module,
     x_res: torch.Tensor,
     z_tensor: torch.Tensor,
+    z_idx: int,
     alpha: float,
     mu: float,
     w_jump: float,
-    mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute PDE residual and jump losses for the PINN objective.
 
     Args:
-        mask: Precomputed boolean mask that excludes source-adjacent points.
+        z_idx: Index of the source location on the grid (excluded from residual).
     """
     x_pde = x_res.clone().detach().requires_grad_(True)
     logd = logd_net(x_pde)
     u_hat, _ = u_net(x_pde, z_tensor)
     residual = _alpha_flux_residual(x_pde, logd, u_hat, alpha, mu)
-    res_loss = torch.mean(residual[mask] ** 2)
+    # Exclude the source point from residual loss
+    n = residual.shape[0]
+    res_loss = (torch.sum(residual ** 2) - residual[z_idx] ** 2) / (n - 1)
 
     z_probe = z_tensor.clone().detach().requires_grad_(True)
     logd_z = logd_net(z_probe)
@@ -238,8 +240,8 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
         u_true = None
 
     z_tensor = torch.tensor(cfg.physics.sources[0], device=device, dtype=dtype).view(1, 1)
-    # Mask out source-adjacent points once to avoid per-iteration recomputation.
-    pde_mask = torch.abs(x_res - z_tensor) > 1e-4
+    # Since z is exactly on the aligned grid, find the single index to exclude from residual.
+    z_idx = int(torch.argmin(torch.abs(x_res - z_tensor)).item())
 
     d_init_base = cfg.d_profile.d_init_base
     if cfg.d_profile.use_ddi:
@@ -296,10 +298,10 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
                 u_net,
                 x_res,
                 z_tensor,
+                z_idx,
                 cfg.physics.alpha,
                 cfg.physics.mu,
                 cfg.reg.w_jump,
-                pde_mask,
             )
             logd_pred = logd_net(x_res)
             anchor_loss = physics.log_scale_anchor(logd_pred, log_target)
@@ -373,10 +375,10 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
             u_net,
             x_res,
             z_tensor,
+            z_idx,
             cfg.physics.alpha,
             cfg.physics.mu,
             cfg.reg.w_jump,
-            pde_mask,
         )
 
         x_reg = x_res.clone().detach().requires_grad_(True)

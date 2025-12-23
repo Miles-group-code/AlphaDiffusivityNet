@@ -165,14 +165,32 @@ class DtoAlphaVarPro(nn.Module):
         self.theta_int = nn.Parameter(logd_init[1:-1].clone().detach())
 
         with torch.no_grad():
-            self.z_indices = []
-            for z in self.sources:
-                idx = torch.argmin(torch.abs(self.x_res - float(z))).item()
-                self.z_indices.append(int(idx))
             rhs = torch.zeros(self.n - 2, device=self.x_res.device, dtype=self.x_res.dtype)
-            for idx in self.z_indices:
-                idx = max(1, min(self.n - 2, idx))
-                rhs[idx - 1] = rhs[idx - 1] - (1.0 / self.h)
+            h_val = self.h
+            for z in self.sources:
+                z_t = torch.tensor(float(z), device=self.x_res.device, dtype=self.x_res.dtype)
+                # p2h-s1 hat delta: distribute source to the two nearest grid points
+                # using weights w_i = 1 - |x_i - z| / h (if |x_i - z| <= h)
+                # Find bracketing indices using searchsorted
+                idx_right = int(torch.searchsorted(self.x_res, z_t, side="right").item())
+                idx_left = idx_right - 1
+                # Clamp to valid interior range [1, n-2]
+                idx_left = max(1, min(self.n - 2, idx_left))
+                idx_right = max(1, min(self.n - 2, idx_right))
+                if idx_left == idx_right:
+                    # z is exactly on a grid point (or at boundary)
+                    rhs[idx_left - 1] -= 1.0 / h_val
+                else:
+                    # Distribute between two points using hat function
+                    x_left = self.x_res[idx_left]
+                    x_right = self.x_res[idx_right]
+                    # w_left = 1 - |x_left - z| / h = 1 - (z - x_left) / h
+                    # w_right = 1 - |x_right - z| / h = 1 - (x_right - z) / h
+                    w_left = 1.0 - torch.abs(x_left - z_t) / h_val
+                    w_right = 1.0 - torch.abs(x_right - z_t) / h_val
+                    # Apply to RHS (interior indexing is offset by 1)
+                    rhs[idx_left - 1] -= w_left / h_val
+                    rhs[idx_right - 1] -= w_right / h_val
         # Unit-source RHS is constant across iterations; cache as a buffer.
         self.register_buffer("rhs_unit", rhs)
 

@@ -663,13 +663,26 @@ def solve(
 
     x_grid_flat = problem.x_grid.view(-1)
     domain = (float(x_grid_flat[0].item()), float(x_grid_flat[-1].item()))
-    x_res = torch.linspace(
-        domain[0],
-        domain[1],
-        int(config.grid.n_res),
-        device=problem.x_grid.device,
-        dtype=problem.x_grid.dtype,
-    )
+
+    method_lower = method.lower()
+    if method_lower in ("pinn", "bilo"):
+        # PINN/BiLO: use aligned grid so z is exactly a grid point
+        x_res = physics.build_aligned_grid(
+            domain,
+            int(config.grid.n_res),
+            problem.source_location,
+            problem.x_grid.device,
+            problem.x_grid.dtype,
+        )
+    else:
+        # DTO: use uniform grid (hat delta handles arbitrary z)
+        x_res = torch.linspace(
+            domain[0],
+            domain[1],
+            int(config.grid.n_res),
+            device=problem.x_grid.device,
+            dtype=problem.x_grid.dtype,
+        )
 
     config.physics.alpha = problem.alpha
     config.physics.mu = problem.mu
@@ -729,7 +742,6 @@ def solve(
 
     config.validate()
 
-    method_lower = method.lower()
     def _warn_irrelevant(name: str, value: Any, message: str) -> None:
         if value is None:
             return

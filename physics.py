@@ -230,3 +230,49 @@ def tv_smoothness_logd_discrete(
 def log_scale_anchor(logd: torch.Tensor, log_target: float) -> torch.Tensor:
     """Pointwise log-normal scale anchor that tethers log D to a target value."""
     return torch.mean((logd - log_target) ** 2)
+
+
+def build_aligned_grid(
+    domain: Tuple[float, float],
+    n_res: int,
+    z: float,
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Build a grid that explicitly includes z as a grid point.
+
+    This is used for PINN/BiLO where the source location must be exactly on the
+    residual grid. The grid is constructed by splitting points proportionally
+    on each side of z to maintain roughly uniform spacing throughout.
+
+    Args:
+        domain: (x_min, x_max) domain bounds.
+        n_res: Total number of grid points.
+        z: Source location to include as a grid point.
+        device: Torch device.
+        dtype: Torch dtype.
+
+    Returns:
+        1D tensor of grid points with z included.
+    """
+    if n_res < 3:
+        raise ValueError("n_res must be >= 3.")
+    x_min, x_max = domain
+    if not (x_min < z < x_max):
+        raise ValueError(f"z={z} must be strictly inside domain {domain}.")
+
+    # Fraction of domain to the left of z
+    frac = (z - x_min) / (x_max - x_min)
+    # Allocate points proportionally (n_res - 1 intervals, plus 1 for endpoints)
+    n_left = int(round(frac * (n_res - 1))) + 1
+    n_right = n_res - n_left + 1  # +1 because z is shared
+
+    # Ensure at least 2 points on each side
+    n_left = max(2, min(n_res - 1, n_left))
+    n_right = n_res - n_left + 1
+
+    x_left = torch.linspace(x_min, z, n_left, device=device, dtype=dtype)
+    x_right = torch.linspace(z, x_max, n_right, device=device, dtype=dtype)
+
+    # Concatenate, excluding the duplicate z from x_right
+    return torch.cat([x_left, x_right[1:]])
