@@ -6,6 +6,7 @@ visualizations used by example scripts and notebooks.
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Dict, Optional
 
@@ -23,7 +24,6 @@ def _compute_metrics_core(
     *,
     u_true: Optional[np.ndarray] = None,
     u_pred: Optional[np.ndarray] = None,
-    logd_pred: Optional[np.ndarray] = None,
     b0_star: Optional[float] = None,
     b_true: Optional[float] = None,
 ) -> Dict[str, float]:
@@ -33,8 +33,7 @@ def _compute_metrics_core(
     d_err = float(np.trapz((d_pred - d_true) ** 2, x))
     d_true_err = float(np.trapz(d_true ** 2, x))
 
-    if logd_pred is None:
-        logd_pred = np.log(np.clip(d_pred, eps, None))
+    logd_pred = np.log(np.clip(d_pred, eps, None))
     logd_true = np.log(np.clip(d_true, eps, None))
     logd_err = float(np.trapz((logd_pred - logd_true) ** 2, x))
     logd_true_err = float(np.trapz(logd_true ** 2, x))
@@ -95,7 +94,6 @@ def compute_solution_metrics(
     *,
     u_true: Optional[np.ndarray] = None,
     u_pred: Optional[np.ndarray] = None,
-    logd_pred: Optional[np.ndarray] = None,
     b0_star: Optional[float] = None,
     b_true: Optional[float] = None,
 ) -> Dict[str, float]:
@@ -106,7 +104,6 @@ def compute_solution_metrics(
         d_pred,
         u_true=u_true,
         u_pred=u_pred,
-        logd_pred=logd_pred,
         b0_star=b0_star,
         b_true=b_true,
     )
@@ -129,7 +126,7 @@ def compute_solution_metrics(
         metrics["u_rel_error"] = base["u_error_rel"]
     if "b0_star_err" in base:
         metrics["b0_abs_error"] = base["b0_star_err"]
-        metrics["b0_rel_error"] = base["b0_star_rel_err"]
+        metrics["b0_rel_error"] = base["b0_star_rel_error"] if "b0_star_rel_error" in base else base.get("b0_star_rel_err", 0.0)
     if "integral_u" in base:
         metrics["integral_u"] = base["integral_u"]
     return metrics
@@ -141,7 +138,6 @@ def compute_field_metrics(
     u_true: np.ndarray,
     d_pred: np.ndarray,
     u_pred: np.ndarray,
-    logd_pred: np.ndarray,
     b0_star: float,
     b_true: float,
 ) -> Dict[str, float]:
@@ -155,7 +151,6 @@ def compute_field_metrics(
         d_pred,
         u_true=u_true,
         u_pred=u_pred,
-        logd_pred=logd_pred,
         b0_star=b0_star,
         b_true=b_true,
     )
@@ -272,6 +267,11 @@ def plot_training_history(
 ) -> None:
     """Plot training loss curves and summary statistics.
 
+    Loss components are plotted as change from initial value (val - val[0]),
+    which puts all components on commensurate scales. This is especially useful
+    for particle mode where NLL can be large negative (-50) but changes by small
+    amounts that are meaningful relative to other loss terms.
+
     Args:
         name: Method name.
         hist: Dictionary of history lists.
@@ -291,21 +291,6 @@ def plot_training_history(
     # Detect BILO mode: if "upper" and "lower" are present, split the loss panel.
     is_bilo = "upper" in hist and "lower" in hist
 
-    if is_bilo:
-        # Layout: Upper Loss, Lower Loss, b0, Mean D
-        fig, axes = plt.subplots(4, 1, figsize=(10, 16), sharex=True)
-        ax_upper = axes[0]
-        ax_lower = axes[1]
-        ax_b = axes[2]
-        ax_mean = axes[3]
-    else:
-        # Layout: Total Loss, b0, Mean D
-        fig, axes = plt.subplots(3, 1, figsize=(10, 12), sharex=True)
-        ax_upper = axes[0]  # Use this for total/single loss
-        ax_lower = None
-        ax_b = axes[1]
-        ax_mean = axes[2]
-
     # Define component groups
     upper_components = ["data", "reg_smooth", "reg_scale"]
     lower_components = ["phys", "res", "jump", "rgrad", "jump_rgrad"]
@@ -315,30 +300,74 @@ def plot_training_history(
         arr = np.asarray(values, dtype=float)
         return arr[np.isfinite(arr)]
 
-    def _compute_shift(keys: list[str]) -> float:
-        """Compute per-panel shift for log plotting if any values are <= 0."""
-        min_val = None
-        for key in keys:
-            if key in hist:
-                vals = _finite(hist[key])
-                if vals.size:
-                    key_min = float(np.min(vals))
-                    min_val = key_min if min_val is None else min(min_val, key_min)
-                    if weights and key in weights:
-                        w = weights[key]
-                        if w != 0.0:
-                            weighted_min = float(np.min(vals * w))
-                            min_val = min(min_val, weighted_min)
-        if min_val is not None and min_val <= 0.0:
-            shift_amount = 1e-12
-            return -min_val + shift_amount
-        return 0.0
+    def _subtract_initial(vals: np.ndarray) -> tuple[np.ndarray, float]:
+        """Subtract initial value, return (shifted_vals, initial_value)."""
+        if len(vals) == 0:
+            return vals, 0.0
+        v0 = vals[0]
+        if not np.isfinite(v0):
+            v0 = 0.0
+        return vals - v0, v0
 
-    # --- Plotting Helper ---
-    def _plot_group(ax, keys, shift, aggregate_key=None, aggregate_label="Total", aggregate_color="k"):
+    def _compute_symlog_params(all_delta_vals: list) -> tuple[float, float, float]:
+        """Compute symlog linthresh and axis limits from delta values."""
+        if not all_delta_vals:
+            return 1.0, -1, 1
+
+        all_vals = np.concatenate([v for v in all_delta_vals if len(v) > 0])
+        if len(all_vals) == 0:
+            return 1.0, -1, 1
+
+        abs_vals = np.abs(all_vals[all_vals != 0])
+
+        # linthresh: use a small percentile of absolute values for smooth transition
+        if abs_vals.size > 0:
+            linthresh = max(np.percentile(abs_vals, 10), 1e-10)
+        else:
+            linthresh = 1e-6
+
+        # Axis limits: tight to data with small padding
+        vmin, vmax = np.min(all_vals), np.max(all_vals)
+        if vmin == vmax:
+            vmin, vmax = vmin - 1, vmax + 1
+        pad = 0.1 * max(abs(vmax), abs(vmin), linthresh)
+        return linthresh, vmin - pad, vmax + pad
+
+    def _plot_group_delta(ax, keys, aggregate_key=None, aggregate_label="Total", aggregate_color="k"):
+        """Plot loss components as change from initial value using symlog scale."""
+        # First pass: compute all delta values and initial values for legend
+        delta_vals_list = []
+        initial_vals = {}
+
         if aggregate_key and aggregate_key in hist:
             vals = np.array(hist[aggregate_key])
-            ax.plot(iters, vals + shift, color=aggregate_color, linewidth=2, label=aggregate_label)
+            delta, v0 = _subtract_initial(vals)
+            delta_vals_list.append(delta)
+            initial_vals[aggregate_key] = v0
+
+        for key in keys:
+            if key in hist and len(hist[key]) > 0:
+                val = np.array(hist[key])
+                if weights and key in weights:
+                    w = weights[key]
+                    if w != 0.0:
+                        eff_val = val * w
+                        delta, v0 = _subtract_initial(eff_val)
+                        delta_vals_list.append(delta)
+                        initial_vals[f"{key}_eff"] = v0
+                else:
+                    delta, v0 = _subtract_initial(val)
+                    delta_vals_list.append(delta)
+                    initial_vals[key] = v0
+
+        linthresh, ymin, ymax = _compute_symlog_params(delta_vals_list)
+
+        # Second pass: plot
+        if aggregate_key and aggregate_key in hist:
+            vals = np.array(hist[aggregate_key])
+            delta, v0 = _subtract_initial(vals)
+            label = f"{aggregate_label} (init: {v0:.2e})"
+            ax.plot(iters, delta, color=aggregate_color, linewidth=2, label=label)
 
         for key in keys:
             if key in hist and len(hist[key]) > 0:
@@ -347,84 +376,56 @@ def plot_training_history(
                     w = weights[key]
                     color = None
                     if w != 0.0:
-                        eff_val = val * w + shift
-                        (line,) = ax.plot(iters, eff_val, alpha=0.7, label=f"{key} (eff)")
+                        eff_val = val * w
+                        delta, v0 = _subtract_initial(eff_val)
+                        label = f"{key} (init: {v0:.2e})"
+                        (line,) = ax.plot(iters, delta, alpha=0.7, label=label)
                         color = line.get_color()
                     if w != 1.0:
-                        ax.plot(
-                            iters,
-                            val + shift,
-                            color=color,
-                            linestyle="--",
-                            alpha=0.4,
-                            label=f"{key} (raw)",
-                        )
+                        delta_raw, _ = _subtract_initial(val)
+                        ax.plot(iters, delta_raw, color=color, linestyle="--", alpha=0.4)
                 else:
-                    ax.plot(iters, val + shift, alpha=0.6, label=key)
-        
-        if shift > 0.0:
-            ax.set_ylabel(f"Loss (shifted +{shift:.1e})")
-        else:
-            ax.set_ylabel("Loss")
-        ax.set_yscale("log")
-        # Clamp minimum y to avoid visual explosion from small shifts
-        ax.set_ylim(bottom=1e-5)
-        ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+                    delta, v0 = _subtract_initial(val)
+                    label = f"{key} (init: {v0:.2e})"
+                    ax.plot(iters, delta, alpha=0.6, label=label)
+
+        ax.axhline(0, color="k", linestyle=":", alpha=0.3, linewidth=0.5)
+        ax.set_yscale("symlog", linthresh=linthresh)
+        ax.set_ylim(ymin, ymax)
+        ax.set_ylabel("Δ Loss (from initial)")
+        ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
         ax.grid(True, alpha=0.2)
 
-    # --- Execute Plotting ---
-    
+    # ==================== Create Figure ====================
     if is_bilo:
-        shift_upper = _compute_shift(["upper"] + upper_components)
-        shift_lower = _compute_shift(["lower"] + lower_components)
-        # Panel 1: Upper Level
-        _plot_group(
-            ax_upper,
-            upper_components,
-            shift_upper,
-            aggregate_key="upper",
-            aggregate_label="Upper Total",
-            aggregate_color="b",
-        )
+        fig, axes = plt.subplots(4, 1, figsize=(10, 16), sharex=True)
+        ax_upper, ax_lower, ax_b, ax_mean = axes
+    else:
+        fig, axes = plt.subplots(3, 1, figsize=(10, 12), sharex=True)
+        ax_upper, ax_b, ax_mean = axes
+        ax_lower = None
+
+    if is_bilo:
+        _plot_group_delta(ax_upper, upper_components, aggregate_key="upper",
+                         aggregate_label="Upper Total", aggregate_color="b")
         ax_upper.set_title(f"Training History: {name} (Upper Level)")
-        
-        # Panel 2: Lower Level
-        # Note: "lower" aggregate is usually present in BILO logs
-        _plot_group(
-            ax_lower,
-            lower_components,
-            shift_lower,
-            aggregate_key="lower",
-            aggregate_label="Lower Total",
-            aggregate_color="r",
-        )
+
+        _plot_group_delta(ax_lower, lower_components, aggregate_key="lower",
+                         aggregate_label="Lower Total", aggregate_color="r")
         ax_lower.set_title("Lower Level")
     else:
-        # Single Panel: Total Loss + all components
-        # Try to find a total key
         agg_key = "total" if "total" in hist else None
-        shift_total = _compute_shift((["total"] if agg_key else []) + all_components)
-        _plot_group(
-            ax_upper,
-            all_components,
-            shift_total,
-            aggregate_key=agg_key,
-            aggregate_label="Total",
-            aggregate_color="k",
-        )
+        _plot_group_delta(ax_upper, all_components, aggregate_key=agg_key,
+                         aggregate_label="Total", aggregate_color="k")
         ax_upper.set_title(f"Training History: {name}")
 
-    # --- b0 and Mean D (Common) ---
+    # b0 and Mean D panels
     if "b0_star" in hist:
         b_vals = np.array(hist["b0_star"])
         ax_b.plot(iters, b_vals, label="b0*")
         ax_b.axhline(b_true, color="k", linestyle="--", linewidth=1.0, label="b_true")
-        if (
-            b_true > 0.0
-            and b_vals.size > 0
-            and np.all(b_vals > 0.0)
-            and np.nanmax(b_vals) > log_threshold * b_true
-        ):
+        if (b_true > 0.0 and b_vals.size > 0 and np.all(b_vals > 0.0)
+                and np.nanmax(b_vals) > log_threshold * b_true):
             ax_b.set_yscale("log")
     ax_b.set_ylabel("Source Strength b0")
     ax_b.legend()
@@ -433,29 +434,24 @@ def plot_training_history(
     if "mean_d" in hist:
         mean_vals = np.array(hist["mean_d"])
         ax_mean.plot(iters, mean_vals, label="⟨D⟩")
-        if (
-            mean_d_true is not None
-            and mean_d_true > 0.0
-            and mean_vals.size > 0
-            and np.all(mean_vals > 0.0)
-            and np.nanmax(mean_vals) > log_threshold * mean_d_true
-        ):
+        if (mean_d_true is not None and mean_d_true > 0.0 and mean_vals.size > 0
+                and np.all(mean_vals > 0.0) and np.nanmax(mean_vals) > log_threshold * mean_d_true):
             ax_mean.set_yscale("log")
     if mean_d_true is not None:
-        ax_mean.axhline(
-            mean_d_true, color="k", linestyle="--", linewidth=1.0, label="⟨D⟩ true"
-        )
+        ax_mean.axhline(mean_d_true, color="k", linestyle="--", linewidth=1.0, label="⟨D⟩ true")
     ax_mean.set_xlabel("Iteration")
     ax_mean.set_ylabel("⟨D⟩")
     ax_mean.legend()
     ax_mean.grid(True, alpha=0.2)
 
     plt.tight_layout()
+
     if outdir:
         os.makedirs(outdir, exist_ok=True)
         if filename is None:
             filename = f"{name.lower()}_history.png"
         fig.savefig(os.path.join(outdir, filename), dpi=150)
+        plt.close(fig)
     else:
         plt.show()
 
@@ -548,58 +544,51 @@ def plot_particle_comparison(
 
 
 def plot_bilo_neighborhood_check(
-    logd_net: torch.nn.Module,
+    d_net: torch.nn.Module,
     local_op: torch.nn.Module,
     x_res: torch.Tensor,
     z: float,
     alpha: float,
     mu: float,
-    delta_log: float = 0.2,
+    delta_d: float = 0.05,
     outdir: str | None = None,
     filename: str = "bilo_neighborhood_check.png",
 ) -> None:
-    """Compare local operator outputs under small log-D perturbations.
-
-    Note: The FDM reference solve assumes a uniform grid. For BiLO with aligned
-    grids (where z is exactly on the grid), the grid is nearly uniform and the
-    FDM comparison remains valid for visualization purposes.
-    """
+    """Compare local operator outputs under small D perturbations."""
     device = x_res.device
     dtype = x_res.dtype
     z_tensor = torch.tensor(z, device=device, dtype=dtype).view(1, 1)
     x_plot = x_res.view(-1, 1)
 
     with torch.no_grad():
-        logd_base = logd_net(x_plot)
-        logd_delta = logd_base + delta_log
-        u_hat_base, _ = local_op(x_plot, logd_base, z_tensor)
-        u_hat_delta, _ = local_op(x_plot, logd_delta, z_tensor)
+        d_base = d_net(x_plot)
+        d_perturbed = d_base + delta_d
+        u_hat_base, _ = local_op(x_plot, d_base, z_tensor)
+        u_hat_perturbed, _ = local_op(x_plot, d_perturbed, z_tensor)
 
     x_np = x_plot.detach().cpu().numpy().reshape(-1)
-    logd_base_np = logd_base.detach().cpu().numpy().reshape(-1)
-    logd_delta_np = logd_delta.detach().cpu().numpy().reshape(-1)
-    d_base = np.exp(logd_base_np)
-    d_delta = np.exp(logd_delta_np)
+    d_base_np = d_base.detach().cpu().numpy().reshape(-1)
+    d_perturbed_np = d_perturbed.detach().cpu().numpy().reshape(-1)
 
     u_fdm_base = physics.fdm_solve_alpha_dirichlet(
-        logd_base_np, alpha, mu, x_np, 1.0, [float(z)]
+        d_base_np, alpha, mu, x_np, 1.0, [float(z)]
     )
-    u_fdm_delta = physics.fdm_solve_alpha_dirichlet(
-        logd_delta_np, alpha, mu, x_np, 1.0, [float(z)]
+    u_fdm_perturbed = physics.fdm_solve_alpha_dirichlet(
+        d_perturbed_np, alpha, mu, x_np, 1.0, [float(z)]
     )
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    axes[0].plot(x_np, d_base, "k-", label="D")
-    axes[0].plot(x_np, d_delta, "r-", label="D * exp(ΔlogD)")
+    axes[0].plot(x_np, d_base_np, "k-", label="D")
+    axes[0].plot(x_np, d_perturbed_np, "r-", label="D + ΔD")
     axes[0].set_title("D perturbation")
     axes[0].legend()
     axes[0].grid(True, alpha=0.2)
 
     axes[1].plot(x_np, u_hat_base.detach().cpu().numpy().flatten(), label="LocalOp unit (D)")
-    axes[1].plot(x_np, u_hat_delta.detach().cpu().numpy().flatten(), label="LocalOp unit (D·exp Δ)")
+    axes[1].plot(x_np, u_hat_perturbed.detach().cpu().numpy().flatten(), label="LocalOp unit (D+ΔD)")
     axes[1].plot(x_np, u_fdm_base, "k--", label="FDM unit (D)")
-    axes[1].plot(x_np, u_fdm_delta, "r--", label="FDM unit (D·exp Δ)")
-    axes[1].set_title(f"Neighborhood check (ΔlogD={delta_log:+.2f})")
+    axes[1].plot(x_np, u_fdm_perturbed, "r--", label="FDM unit (D+ΔD)")
+    axes[1].set_title(f"Neighborhood check (ΔD={delta_d:+.2f})")
     axes[1].legend()
     axes[1].grid(True, alpha=0.2)
 

@@ -1,10 +1,10 @@
 """Physics and numerical helpers for the 1D alpha-PDE.
 
 Includes flux-form finite-difference assembly, a NumPy Thomas solver for
-ground-truth FDM, and regularizers for log D.
+ground-truth FDM, and regularizers for D.
 
-Key entry points: fdm_solve_alpha_dirichlet, h1_smoothness_logd,
-tv_smoothness_logd, log_scale_anchor.
+Key entry points: fdm_solve_alpha_dirichlet, h1_smoothness_d,
+tv_smoothness_d, scale_anchor.
 """
 
 from __future__ import annotations
@@ -16,18 +16,20 @@ import torch
 
 
 def _build_fdm_tridiag(
-    logd: np.ndarray,
+    d: np.ndarray,
     alpha: float,
     mu: float,
     x: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Assemble tridiagonal coefficients for the alpha-PDE FDM system.
 
+    Handles non-uniform grids by computing local step sizes.
+
     Args:
-        logd: Log diffusion values on the grid (length N).
+        d: Diffusion values on the grid (length N).
         alpha: Stochastic convention in [0, 1].
         mu: Death rate.
-        x: Uniform grid locations (length N).
+        x: Grid locations (length N).
 
     Returns:
         (lower, diag, upper) arrays for the interior system (length N-2).
@@ -35,53 +37,45 @@ def _build_fdm_tridiag(
     n = x.size
     if n < 3:
         raise ValueError("Need at least 3 grid points for Dirichlet problem.")
-    h = x[1] - x[0]
+    
+    # h[i] = x[i+1] - x[i]
+    h = x[1:] - x[:-1]
 
-    g = np.exp((1.0 - alpha) * logd)
-    logd_half = 0.5 * (logd[:-1] + logd[1:])
-    d_half_alpha = np.exp(alpha * logd_half)
-    a_half = d_half_alpha / h
+    # Flux form: J = D^alpha * d/dx (D^(1-alpha) * u)
+    # Let q = D^(1-alpha) * u. Then J = D^alpha * dq/dx.
+    # We discretize q at nodes and J at half-nodes.
+    
+    g = d ** (1.0 - alpha)
+    d_half = 0.5 * (d[:-1] + d[1:])
+    
+    # Flux coefficient at i+1/2: D_{i+1/2}^alpha / h_i
+    a_half = (d_half ** alpha) / h
 
     # Vectorized assembly
-    # lower comes from a_half[i-1] * g[i-1] where i ranges 1..n-2 (indices of interior points)
-    # interior points are at indices 1, 2, ..., n-2
-    # lower[idx-1] corresponds to row corresponding to x[i] coupling with x[i-1]
-    # For i=2 (first row with a lower coupling), we need a_half[1]*g[1]
-    # lower array indices: 0..n-4 (length n-3)
-    # logic in loop: if i > 1: lower[idx-1] = ...
-    # i ranges 1 to n-2. i>1 means i ranges 2 to n-2.
-    # idx = i-1 ranges 1 to n-3.
-    # idx-1 ranges 0 to n-4.
-    # We need a_half[1:n-2] * g[1:n-2]
-    #
-    # Let's map indices carefully from the original loop:
-    # for i in range(1, n-1): (interior nodes 1 to n-2)
-    #   idx = i - 1  (row index 0 to n-3)
-    #   lower entry at idx-1 (exists if i > 1, i.e., rows 1 to n-3):
-    #     lower[idx-1] = a_half[i-1] * g[i-1] / h
-    #   upper entry at idx (exists if i < n-2, i.e., rows 0 to n-4):
-    #     upper[idx] = a_half[i] * g[i+1] / h
-    #   diag entry at idx:
-    #     diag[idx] = -(a_half[i] + a_half[i-1]) * g[i] / h - mu
-    #
-    # Vectorized:
-    # Diag (i=1..n-2):
-    #   -(a_half[1:n-1] + a_half[0:n-2]) * g[1:n-1] / h - mu
-    # Lower (i=2..n-2):
-    #   a_half[1:n-2] * g[1:n-2] / h
-    # Upper (i=1..n-3):
-    #   a_half[1:n-2] * g[2:n-1] / h
     n_int = n - 2
     lower = np.zeros(n_int - 1, dtype=float)
     diag = np.zeros(n_int, dtype=float)
     upper = np.zeros(n_int - 1, dtype=float)
+    
+    # Voronoi volumes for interior nodes 1..N-2
+    # vol[i] = (h[i-1] + h[i]) / 2  where i is global index
+    # interior index k=0 corresponds to global i=1
+    # vol[k] = (h[k] + h[k+1]) / 2
+    
+    vol = 0.5 * (h[:-1] + h[1:])
+
     for i in range(1, n - 1):
         idx = i - 1
+        v = vol[idx]
+        
+        # Divergence is (J_{i+1/2} - J_{i-1/2}) / v
+        
         if i > 1:
-            lower[idx - 1] = (a_half[i - 1] * g[i - 1]) / h
+            lower[idx - 1] = (a_half[i - 1] * g[i - 1]) / v
         if i < n - 2:
-            upper[idx] = (a_half[i] * g[i + 1]) / h
-        diag[idx] = -(a_half[i] + a_half[i - 1]) * g[i] / h - mu
+            upper[idx] = (a_half[i] * g[i + 1]) / v
+        
+        diag[idx] = -(a_half[i] + a_half[i - 1]) * g[i] / v - mu
     return lower, diag, upper
 
 
@@ -90,12 +84,13 @@ def _build_delta_rhs(
     sources: Iterable[float],
     b0: float,
 ) -> np.ndarray:
-    """Construct the interior RHS for point sources on a uniform grid.
+    """Construct the interior RHS for point sources on a non-uniform grid.
 
-    Each source contributes a -b0/h impulse to the nearest interior node.
+    Each source contributes -b0/vol to the nearest interior node,
+    where vol is the Voronoi volume (average of adjacent steps).
 
     Args:
-        x: Uniform grid locations (length N).
+        x: Grid locations (length N).
         sources: Source locations (assumed strictly inside the domain).
         b0: Source amplitude.
 
@@ -103,13 +98,21 @@ def _build_delta_rhs(
         RHS vector for interior nodes (length N-2).
     """
     n = x.size
-    h = x[1] - x[0]
+    h = x[1:] - x[:-1]
+    vol = 0.5 * (h[:-1] + h[1:]) # Length N-2
+    
     rhs = np.zeros(n - 2, dtype=float)
-    x0 = x[0]
+    
     for z in sources:
-        idx = int(round((z - x0) / h))
-        idx = max(1, min(n - 2, idx))
-        rhs[idx - 1] += -b0 / h
+        # Find nearest interior node
+        # Interior nodes are indices 1..N-2 in x
+        idx_global = (np.abs(x - z)).argmin()
+        
+        # Force source to nearest interior node if it falls on boundary (unlikely given assumptions)
+        idx_global = max(1, min(n - 2, idx_global))
+        idx_int = idx_global - 1
+        
+        rhs[idx_int] += -b0 / vol[idx_int]
     return rhs
 
 
@@ -150,7 +153,7 @@ def _thomas_solve(
 
 
 def fdm_solve_alpha_dirichlet(
-    logd: Sequence[float],
+    d: Sequence[float],
     alpha: float,
     mu: float,
     x: Sequence[float],
@@ -160,7 +163,7 @@ def fdm_solve_alpha_dirichlet(
     """Solve the steady 1D alpha-PDE on a uniform grid with Dirichlet BCs.
 
     Args:
-        logd: Log diffusion values on the grid (length N).
+        d: Diffusion values on the grid (length N).
         alpha: Stochastic convention in [0, 1].
         mu: Death rate.
         x: Uniform grid locations (length N).
@@ -170,12 +173,14 @@ def fdm_solve_alpha_dirichlet(
     Returns:
         u(x) on the grid with boundary values set to zero.
     """
-    logd = np.asarray(logd, dtype=float).reshape(-1)
+    d = np.asarray(d, dtype=float).reshape(-1)
+    if np.any(d <= 0):
+        raise ValueError("D must be strictly positive.")
     x = np.asarray(x, dtype=float).reshape(-1)
-    if x.size != logd.size:
-        raise ValueError("logd and x must have the same length.")
+    if x.size != d.size:
+        raise ValueError("d and x must have the same length.")
 
-    lower, diag, upper = _build_fdm_tridiag(logd, alpha, mu, x)
+    lower, diag, upper = _build_fdm_tridiag(d, alpha, mu, x)
     rhs = _build_delta_rhs(x, sources, b0)
 
     u_int = _thomas_solve(lower, diag, upper, rhs)
@@ -184,52 +189,47 @@ def fdm_solve_alpha_dirichlet(
     return u
 
 
-def h1_smoothness_logd(x: torch.Tensor, logd: torch.Tensor) -> torch.Tensor:
+def h1_smoothness_d(x: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
     """Compute H1 seminorm regularization using autograd gradients."""
     if not x.requires_grad:
         raise ValueError("x must have requires_grad=True for H1 regularization.")
-    ones = torch.ones_like(logd)
-    grad = torch.autograd.grad(logd, x, grad_outputs=ones, create_graph=True, retain_graph=True)[0]
+    ones = torch.ones_like(d)
+    grad = torch.autograd.grad(d, x, grad_outputs=ones, create_graph=True, retain_graph=True)[0]
     return torch.mean(grad ** 2)
 
 
-def h1_smoothness_logd_discrete(logd: torch.Tensor, h: float = 1.0) -> torch.Tensor:
-    """Discrete H1 regularization for log-D on a grid.
-
-    NOTE: Use this with DTO, where logD is a raw parameter on grid nodes rather
-    than a differentiable function of x. Autograd-based smoothness will not
-    work when logd is indexed data rather than a function.
-    """
-    diffs = (logd[1:] - logd[:-1]) / h
+def h1_smoothness_d_discrete(d: torch.Tensor, h: float = 1.0) -> torch.Tensor:
+    """Discrete H1 regularization for D on a grid."""
+    diffs = (d[1:] - d[:-1]) / h
     return torch.mean(diffs ** 2)
 
 
-def tv_smoothness_logd(
+def tv_smoothness_d(
     x: torch.Tensor,
-    logd: torch.Tensor,
+    d: torch.Tensor,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """TV regularization for log-D using a smoothed L1 penalty."""
+    """TV regularization for D using a smoothed L1 penalty."""
     if not x.requires_grad:
         raise ValueError("x must have requires_grad=True for TV regularization.")
-    ones = torch.ones_like(logd)
-    grad = torch.autograd.grad(logd, x, grad_outputs=ones, create_graph=True, retain_graph=True)[0]
+    ones = torch.ones_like(d)
+    grad = torch.autograd.grad(d, x, grad_outputs=ones, create_graph=True, retain_graph=True)[0]
     return torch.mean(torch.sqrt(grad ** 2 + eps))
 
 
-def tv_smoothness_logd_discrete(
-    logd: torch.Tensor,
+def tv_smoothness_d_discrete(
+    d: torch.Tensor,
     h: float = 1.0,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Discrete TV regularization for log-D on a grid."""
-    diffs = (logd[1:] - logd[:-1]) / h
+    """Discrete TV regularization for D on a grid."""
+    diffs = (d[1:] - d[:-1]) / h
     return torch.mean(torch.sqrt(diffs ** 2 + eps))
 
 
-def log_scale_anchor(logd: torch.Tensor, log_target: float) -> torch.Tensor:
-    """Pointwise log-normal scale anchor that tethers log D to a target value."""
-    return torch.mean((logd - log_target) ** 2)
+def scale_anchor(d: torch.Tensor, d_target: float) -> torch.Tensor:
+    """Pointwise scale anchor that tethers D to a target value."""
+    return torch.mean((d - d_target) ** 2)
 
 
 def build_aligned_grid(

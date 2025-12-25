@@ -40,8 +40,8 @@ DEFAULT_SETTINGS = {
     "w_resgrad": 0.01,
 
     # Regularization
-    "wreg_smooth": 1e-7,
-    "wreg_scale": 0.1,
+    "wreg_smooth": 1e-7,  # Smoothness on D
+    "wreg_scale": 0.1,    # Scale anchor on D
     "smoothness_type": "h1",
 
     # Data
@@ -55,6 +55,7 @@ DEFAULT_SETTINGS = {
 
     # Architecture
     "use_rff": True,
+    "rff_scale": 1.0,
     "n_res": 201,
 
     # Early stopping
@@ -97,13 +98,17 @@ def show_settings(settings: Optional[Dict[str, Any]] = None) -> None:
     descriptions = {
         "max_iters": "Finetune iterations",
         "pretrain_iters": "Physics warmup (pinn/bilo)",
-        "lr_d": "Learning rate for D(x)",
-        "lr_lower": "Learning rate for u-net (pinn/bilo)",
+        "lr_d": "Learning rate for D(x) (both phases)",
+        "lr_d_pre": "LR for D(x) pretrain (overrides lr_d)",
+        "lr_d_fine": "LR for D(x) finetune (overrides lr_d)",
+        "lr_lower": "Learning rate for u-net (both phases)",
+        "lr_lower_pre": "LR for u-net pretrain (overrides lr_lower)",
+        "lr_lower_fine": "LR for u-net finetune (overrides lr_lower)",
         "use_scheduler": "Cosine LR decay",
         "w_data": "Data loss weight (pinn only)",
         "w_phys": "Physics loss weight (pinn only)",
-        "wreg_smooth": "Smoothness penalty on log D",
-        "wreg_scale": "Scale anchor on log D",
+        "wreg_smooth": "Smoothness penalty on D",
+        "wreg_scale": "Scale anchor on D",
         "smoothness_type": "'h1' or 'tv'",
         "w_jump": "Jump condition (pinn/bilo)",
         "w_resgrad": "Residual gradient (bilo only)",
@@ -113,6 +118,7 @@ def show_settings(settings: Optional[Dict[str, Any]] = None) -> None:
         "d_init_scale": "Init perturbation amplitude",
         "d_init_freq": "Init perturbation frequency",
         "use_rff": "Fourier features (pinn/bilo)",
+        "rff_scale": "RFF freq multiplier (higher=sharper)",
         "n_res": "Solver grid points",
         "early_burnin": "Warmup before early stop",
         "early_patience": "Patience iterations",
@@ -190,8 +196,11 @@ def _build_d_profile(
         return d_callable, dprime_callable
 
     if profile == "steps":
+        # Random phase shift to avoid jumps landing exactly on grid points (e.g. source at 0.5)
+        phase_shift = np.random.rand()
+
         def d_callable(x: np.ndarray) -> np.ndarray:
-            phase = np.sin(2.0 * np.pi * frequency * x)
+            phase = np.sin(2.0 * np.pi * frequency * (x + phase_shift))
             step = np.where(phase >= 0.0, 1.0, -1.0)
             return mean + amplitude * step
 
@@ -258,6 +267,7 @@ class Problem:
             d_profile: "sinusoidal", "steps", or "custom".
             d_profile_params: (mean, amplitude, frequency) for sinusoidal/steps.
                 Steps uses a square-wave pattern with values mean ± amplitude.
+                Note: "steps" includes a random phase shift (use `seed` to control).
                 Use None when d_profile="custom".
             mu: Death rate in the PDE.
             b_true: True source strength for synthetic data.
@@ -294,9 +304,8 @@ class Problem:
         )
 
         d_true = np.asarray(d_callable(x_field_np))
-        logd_true = np.log(d_true)
         u_true = physics.fdm_solve_alpha_dirichlet(
-            logd_true,
+            d_true,
             alpha,
             mu,
             x_field_np,
@@ -419,8 +428,8 @@ class Solution:
         b0_star: Projected source amplitude.
         history: Loss curves and diagnostics from training (keys vary by method).
         weights: Loss weights used (useful for plotting history).
-        logd_net: Optional trained logD network (BiLO only).
-        local_op: Optional trained local operator network (BiLO only).
+        d_net: Optional trained D network (BiLO/PINN).
+        local_op: Optional trained local operator network (BiLO/PINN).
         _raw_result: Method-specific result dataclass with full outputs
             (DTOResult/PINNResult/BiLOResult).
     """
@@ -432,7 +441,7 @@ class Solution:
     b0_star: float
     history: Dict[str, List[float]]
     weights: Dict[str, float] = field(default_factory=dict)
-    logd_net: Optional[Any] = None
+    d_net: Optional[Any] = None
     local_op: Optional[Any] = None
     _raw_result: Any = None
 
@@ -457,10 +466,8 @@ class Solution:
         u_np = self._to_numpy(self.u_pred).reshape(-1)
         u_fdm = None
         if problem is not None and self.method in {"PINN", "BILO"}:
-            d_safe = np.clip(d_np, 1e-12, None)
-            logd_pred = np.log(d_safe)
             u_fdm = physics.fdm_solve_alpha_dirichlet(
-                logd_pred,
+                d_np,
                 problem.alpha,
                 problem.mu,
                 x_res_np,
@@ -582,7 +589,11 @@ def solve(
     pretrain_iters: Optional[int] = None,
     n_res: Optional[int] = None,
     lr_d: Optional[float] = None,
+    lr_d_pre: Optional[float] = None,
+    lr_d_fine: Optional[float] = None,
     lr_lower: Optional[float] = None,
+    lr_lower_pre: Optional[float] = None,
+    lr_lower_fine: Optional[float] = None,
     w_data: Optional[float] = None,
     w_phys: Optional[float] = None,
     wreg_smooth: Optional[float] = None,
@@ -597,6 +608,7 @@ def solve(
     d_init_freq: Optional[float] = None,
     use_scheduler: Optional[bool] = None,
     use_rff: Optional[bool] = None,
+    rff_scale: Optional[float] = None,
     early_burnin: Optional[int] = None,
     early_patience: Optional[int] = None,
     early_tol: Optional[float] = None,
@@ -612,12 +624,16 @@ def solve(
         max_iters: Main training iterations (finetune phase).
         pretrain_iters: Warmup iterations for physics/anchor steps.
         n_res: Number of solver grid points for D/u (overrides config.grid.n_res).
-        lr_d: Learning rate for D(x) parameters (sets pretrain + finetune).
-        lr_lower: Learning rate for u(x) / physics network (pretrain + finetune).
+        lr_d: Learning rate for D(x) parameters (sets both pretrain + finetune).
+        lr_d_pre: Learning rate for D(x) during pretrain (overrides lr_d for pretrain).
+        lr_d_fine: Learning rate for D(x) during finetune (overrides lr_d for finetune).
+        lr_lower: Learning rate for u(x) / physics network (sets both pretrain + finetune).
+        lr_lower_pre: LR for physics network during pretrain (overrides lr_lower).
+        lr_lower_fine: LR for physics network during finetune (overrides lr_lower).
         w_data: Data loss weight (PINN only).
         w_phys: Physics loss weight (PINN only).
-        wreg_smooth: Smoothness penalty on log D(x) (H1 or TV).
-        wreg_scale: Log-normal scale anchor weight on log D(x).
+        wreg_smooth: Smoothness penalty on D(x).
+        wreg_scale: Scale anchor weight on D(x).
         w_jump: Jump condition weight (PINN/BiLO).
         w_resgrad: Residual gradient penalty (BiLO).
         smoothness_type: Smoothness penalty selector ("h1" or "tv").
@@ -628,6 +644,7 @@ def solve(
         d_init_freq: Frequency of initial D(x) wiggles.
         use_scheduler: Enable cosine LR scheduling.
         use_rff: Enable random Fourier features in networks.
+        rff_scale: RFF frequency multiplier (higher values allow sharper features).
         early_burnin: Iterations before early stopping activates.
         early_patience: Iterations without improvement before stop.
         early_tol: Minimum relative improvement to reset patience.
@@ -645,7 +662,7 @@ def solve(
 
     Returns:
         Solution with the main predictions and training history. Use
-        `solution._raw_result` to access method-specific outputs like logd,
+        `solution._raw_result` to access method-specific outputs like d_pred,
         u_hat_unit, or the trained networks.
     """
     if problem.mode not in {"field", "particles"}:
@@ -696,12 +713,21 @@ def solve(
         config.train.finetune_iters = max_iters
     if pretrain_iters is not None:
         config.train.pretrain_iters = pretrain_iters
+    # Learning rates: general param sets both, specific params override individually
     if lr_d is not None:
         config.train.lr_d_fine = lr_d
         config.train.lr_d_pre = lr_d
+    if lr_d_pre is not None:
+        config.train.lr_d_pre = lr_d_pre
+    if lr_d_fine is not None:
+        config.train.lr_d_fine = lr_d_fine
     if lr_lower is not None:
         config.train.lr_lower_fine = lr_lower
         config.train.lr_lower_pre = lr_lower
+    if lr_lower_pre is not None:
+        config.train.lr_lower_pre = lr_lower_pre
+    if lr_lower_fine is not None:
+        config.train.lr_lower_fine = lr_lower_fine
     if w_data is not None:
         config.reg.w_data = w_data
     if w_phys is not None:
@@ -730,7 +756,9 @@ def solve(
         config.train.use_scheduler = use_scheduler
     if use_rff is not None:
         config.arch.use_rff_geom = use_rff
-        config.arch.use_rff_logd = use_rff
+        config.arch.use_rff_d = use_rff
+    if rff_scale is not None:
+        config.arch.rff_scale = rff_scale
     if early_burnin is not None:
         config.train.early_burnin = early_burnin
     if early_patience is not None:
@@ -758,6 +786,7 @@ def solve(
         _warn_irrelevant("w_jump", w_jump, "'w_jump' is ignored for DTO.")
         _warn_irrelevant("w_resgrad", w_resgrad, "'w_resgrad' is ignored for DTO.")
         _warn_irrelevant("use_rff", use_rff, "'use_rff' is ignored for DTO.")
+        _warn_irrelevant("rff_scale", rff_scale, "'rff_scale' is ignored for DTO.")
     elif method_lower == "pinn":
         _warn_irrelevant("w_resgrad", w_resgrad, "'w_resgrad' is ignored for PINN.")
     elif method_lower == "bilo":
@@ -783,7 +812,7 @@ def solve(
             ppp=problem.particles,
         )
         result = method_dto.fit(data_bundle, config, verbose=verbose)
-        logd_net = None
+        d_net = None
         local_op = None
     elif method_lower == "pinn":
         data_bundle = method_pinn.PINNData(
@@ -794,7 +823,7 @@ def solve(
             ppp=problem.particles,
         )
         result = method_pinn.fit(data_bundle, config, verbose=verbose)
-        logd_net = None
+        d_net = None
         local_op = None
     elif method_lower == "bilo":
         data_bundle = method_bilo.BiLOData(
@@ -805,7 +834,7 @@ def solve(
             ppp=problem.particles,
         )
         result = method_bilo.fit(data_bundle, config, verbose=verbose)
-        logd_net = getattr(result, "logd_net", None)
+        d_net = getattr(result, "d_net", None)
         local_op = getattr(result, "local_op", None)
     else:
         raise ValueError(f"Unknown method '{method}'. Choose from dto, pinn, bilo.")
@@ -814,9 +843,12 @@ def solve(
         print(f"[Solve] Done | b₀*: {result.b0_star:.4f}")
 
     # Capture weights for plotting effective losses
+    # For PINN: phys = w_phys*res + w_jump*jump (already weighted), so phys weight is 1.0
+    # For BiLO: lower = res + w_jump*jump + w_resgrad*rgrad (res has implicit weight 1.0)
     weights = {
         "data": config.reg.w_data,
-        "phys": config.reg.w_phys,
+        "phys": 1.0,  # phys is already the weighted sum in PINN
+        "res": config.reg.w_phys,  # PINN: w_phys weights res; BiLO: implicit 1.0 (close enough)
         "reg_smooth": config.reg.wreg_smooth,
         "reg_scale": config.reg.wreg_scale,
         "jump": config.reg.w_jump,
@@ -832,7 +864,7 @@ def solve(
         b0_star=float(result.b0_star),
         history=result.history,
         weights=weights,
-        logd_net=logd_net,
+        d_net=d_net,
         local_op=local_op,
         _raw_result=result,
     )

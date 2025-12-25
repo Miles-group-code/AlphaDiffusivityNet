@@ -1,18 +1,8 @@
 """PINN solver for the 1D alpha-PDE inverse problem.
 
-Defines PINNData/PINNResult, network modules for logD and u, and the
+Defines PINNData/PINNResult, network modules for D and u, and the
 single-level training loop that couples data and physics losses.
 """
-
-# NOTE: This file intentionally duplicates some utilities (LogD init helpers)
-# from other method files. This keeps each method self-contained and readable.
-# If you modify shared logic, update all three method files.
-#
-# PINN overview:
-# - Unique: joint training of logD_net and u_net with PDE residual loss.
-# - Loss: w_data * data + w_phys * physics residual/jump + smoothness/scale anchor.
-# - Optimization: single-level gradient descent on both networks.
-# - Key knobs: w_data, w_phys, w_jump, wreg_smooth, wreg_scale, smoothness_type, lr_d/lr_lower.
 
 from __future__ import annotations
 
@@ -27,6 +17,8 @@ import torch.nn.functional as F
 from config import Config
 from data import PPPData, estimate_ddi_scale
 import physics, varpro
+
+D_MIN = 1e-6
 
 
 @dataclass
@@ -56,8 +48,7 @@ class PINNResult:
 
     Fields:
         x_res: Solver grid (1D).
-        logd: log D(x) on x_res (1D).
-        d_pred: D(x) = exp(logd) on x_res (1D).
+        d_pred: D(x) on x_res (1D).
         u_hat_unit: Unit-source response u_hat for b0=1 on x_res (1D).
         u_pred: Predicted field b0* * u_hat_unit on x_res (1D).
         b0_star: Projected source amplitude.
@@ -67,7 +58,6 @@ class PINNResult:
     """
 
     x_res: torch.Tensor
-    logd: torch.Tensor
     d_pred: torch.Tensor
     u_hat_unit: torch.Tensor
     u_pred: torch.Tensor
@@ -75,42 +65,50 @@ class PINNResult:
     history: Dict[str, List[float]]
 
 
-class LogDNet(nn.Module):
-    """RFF-embedded MLP that parameterizes log D(x)."""
+class DNet(nn.Module):
+    """RFF-embedded MLP that parameterizes D(x) with shifted softplus."""
 
-    def __init__(self, width: int = 128, use_rff: bool = True) -> None:
+    def __init__(
+        self, width: int = 128, use_rff: bool = True, rff_scale: float = 1.0, d_min: float = D_MIN
+    ) -> None:
         super().__init__()
         self.use_rff = use_rff
+        self.rff_scale = rff_scale
+        self.d_min = d_min
         self.embed = nn.Linear(1, width)
         if use_rff:
             for param in self.embed.parameters():
                 param.requires_grad = False
+        # SiLU (Swish) activation: avoids Tanh's low-frequency bias and
+        # saturation issues while maintaining smooth gradients for PDE learning.
         self.net = nn.Sequential(
             nn.Linear(width, width),
-            nn.Tanh(),
+            nn.SiLU(),
             nn.Linear(width, width),
-            nn.Tanh(),
+            nn.SiLU(),
             nn.Linear(width, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Evaluate log D(x) at given coordinates."""
+        """Evaluate D(x) at given coordinates."""
         x = x.view(-1, 1)
         if self.use_rff:
-            feat = torch.sin(2.0 * torch.pi * self.embed(x))
+            feat = torch.sin(2.0 * torch.pi * self.rff_scale * self.embed(x))
         else:
             feat = self.embed(x)
-        return self.net(feat)
+        raw = self.net(feat)
+        return F.softplus(raw) + self.d_min
 
 
 class LocalOperator(nn.Module):
     """Local operator network for the unit response u_hat(x)."""
 
-    def __init__(self, width: int = 128, use_rff: bool = True) -> None:
+    def __init__(self, width: int = 128, use_rff: bool = True, rff_scale: float = 1.0) -> None:
         super().__init__()
-        # NOTE: Unlike BiLO, the PINN u-network does NOT condition on logD.
-        # This is standard PINN practice: u_net and logD_net are trained jointly.
+        # NOTE: Unlike BiLO, the PINN u-network does NOT condition on D.
+        # This is standard PINN practice: u_net and d_net are trained jointly.
         self.use_rff = use_rff
+        self.rff_scale = rff_scale
         self.geom_layer = nn.Linear(2, width)
         if use_rff:
             self.geom_layer.weight.requires_grad = False
@@ -118,7 +116,8 @@ class LocalOperator(nn.Module):
                 self.geom_layer.bias.requires_grad = False
         self.hidden = nn.ModuleList([nn.Linear(width, width) for _ in range(3)])
         self.output = nn.Linear(width, 1)
-        self.activation = torch.tanh
+        # SiLU (Swish) avoids Tanh's low-frequency bias and saturation.
+        self.activation = F.silu
 
     def forward(self, x: torch.Tensor, z_known: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Evaluate u_hat and return the |x-z| feature for jump constraints."""
@@ -129,32 +128,21 @@ class LocalOperator(nn.Module):
         geom_in = torch.cat([x, phi_z], dim=1)
         geom_lin = self.geom_layer(geom_in)
         if self.use_rff:
-            h = self.activation(torch.sin(2.0 * torch.pi * geom_lin))
+            h = self.activation(torch.sin(2.0 * torch.pi * self.rff_scale * geom_lin))
         else:
             h = self.activation(geom_lin)
         for layer in self.hidden:
             h = self.activation(layer(h))
         u_raw = self.output(h)
+        # Hard enforcement of homogeneous Dirichlet BCs: u(0) = u(1) = 0.
+        # This ansatz ensures the network output is always valid at boundaries.
         u = F.softplus(u_raw) * x * (1.0 - x)
         return u, phi_z
 
 
-def _init_logd_profile(
-    x: torch.Tensor,
-    base: float,
-    scale: float,
-    freq: float,
-) -> torch.Tensor:
-    """Build a sinusoidal log-D initialization on the grid."""
-    if scale >= 1.0:
-        raise ValueError("d_init_pert_scale must be < 1 to keep D_init positive.")
-    d_init = base * (1.0 + scale * torch.sin(2.0 * torch.pi * freq * x))
-    return torch.log(d_init)
-
-
 def _alpha_flux_residual(
     x: torch.Tensor,
-    logd: torch.Tensor,
+    d: torch.Tensor,
     u: torch.Tensor,
     alpha: float,
     mu: float,
@@ -163,38 +151,39 @@ def _alpha_flux_residual(
     if not x.requires_grad:
         raise ValueError("x must have requires_grad=True for autograd residuals.")
     ones = torch.ones_like(u)
-    q = torch.exp((1.0 - alpha) * logd) * u
+    q = (d ** (1.0 - alpha)) * u
     q_x = torch.autograd.grad(q, x, grad_outputs=ones, create_graph=True, retain_graph=True)[0]
-    J = torch.exp(alpha * logd) * q_x
+    J = (d ** alpha) * q_x
     J_x = torch.autograd.grad(J, x, grad_outputs=ones, create_graph=True, retain_graph=True)[0]
     return J_x - mu * u
 
 
 def _compute_physics_losses(
-    logd_net: nn.Module,
+    d_net: nn.Module,
     u_net: nn.Module,
     x_res: torch.Tensor,
     z_tensor: torch.Tensor,
     z_idx: int,
     alpha: float,
     mu: float,
-    w_jump: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute PDE residual and jump losses for the PINN objective.
+
+    Returns raw (unweighted) losses. Caller applies weights independently.
 
     Args:
         z_idx: Index of the source location on the grid (excluded from residual).
     """
     x_pde = x_res.clone().detach().requires_grad_(True)
-    logd = logd_net(x_pde)
+    d = d_net(x_pde)
     u_hat, _ = u_net(x_pde, z_tensor)
-    residual = _alpha_flux_residual(x_pde, logd, u_hat, alpha, mu)
+    residual = _alpha_flux_residual(x_pde, d, u_hat, alpha, mu)
     # Exclude the source point from residual loss
     n = residual.shape[0]
     res_loss = (torch.sum(residual ** 2) - residual[z_idx] ** 2) / (n - 1)
 
     z_probe = z_tensor.clone().detach().requires_grad_(True)
-    logd_z = logd_net(z_probe)
+    d_z = d_net(z_probe)
     u_z, phi_z = u_net(z_probe, z_tensor)
     du_dphi = torch.autograd.grad(
         u_z,
@@ -202,15 +191,14 @@ def _compute_physics_losses(
         grad_outputs=torch.ones_like(u_z),
         create_graph=True,
     )[0]
-    jump_res = torch.exp(logd_z) * (2.0 * du_dphi) + 1.0
+    jump_res = d_z * (2.0 * du_dphi) + 1.0
     jump_loss = torch.mean(jump_res ** 2)
 
-    phys_loss = res_loss + w_jump * jump_loss
-    return phys_loss, res_loss, jump_loss
+    return res_loss, jump_loss
 
 
 def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
-    """Fit log-D with a physics-informed neural network.
+    """Fit D with a physics-informed neural network.
 
     Args:
         data_bundle: PINNData specifying observations and grids.
@@ -257,17 +245,13 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
 
     if verbose:
         print(f"[PINN] Initialized ⟨D⟩_base: {d_init_base:.3e}")
-    log_target = math.log(d_init_base)
+    
+    d_target = d_init_base
 
-    logd_init = _init_logd_profile(
-        x_res.view(-1),
-        base=d_init_base,
-        scale=cfg.d_profile.d_init_pert_scale,
-        freq=cfg.d_profile.d_init_pert_freq,
-    ).view(-1, 1)
-
-    logd_net = LogDNet(width=cfg.arch.rff_width, use_rff=cfg.arch.use_rff_logd).to(device)
-    u_net = LocalOperator(width=cfg.arch.rff_width, use_rff=cfg.arch.use_rff_geom).to(device)
+    d_min = getattr(cfg.arch, "d_min", D_MIN)
+    rff_scale = getattr(cfg.arch, "rff_scale", 1.0)
+    d_net = DNet(width=cfg.arch.rff_width, use_rff=cfg.arch.use_rff_d, rff_scale=rff_scale, d_min=d_min).to(device)
+    u_net = LocalOperator(width=cfg.arch.rff_width, use_rff=cfg.arch.use_rff_geom, rff_scale=rff_scale).to(device)
 
     history: Dict[str, List[float]] = {
         "iter": [],
@@ -287,33 +271,37 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
     if cfg.train.pretrain_iters > 0:
         optim_pre = torch.optim.Adam(
             [
-                {"params": logd_net.parameters(), "lr": cfg.train.lr_d_pre},
+                {"params": d_net.parameters(), "lr": cfg.train.lr_d_pre},
                 {"params": u_net.parameters(), "lr": cfg.train.lr_lower_pre},
             ]
         )
         for step in range(cfg.train.pretrain_iters + 1):
             optim_pre.zero_grad(set_to_none=True)
-            phys_loss, res_loss, jump_loss = _compute_physics_losses(
-                logd_net,
+            res_loss, jump_loss = _compute_physics_losses(
+                d_net,
                 u_net,
                 x_res,
                 z_tensor,
                 z_idx,
                 cfg.physics.alpha,
                 cfg.physics.mu,
-                cfg.reg.w_jump,
             )
-            logd_pred = logd_net(x_res)
-            anchor_loss = physics.log_scale_anchor(logd_pred, log_target)
-            pre_loss = cfg.reg.w_phys * phys_loss + anchor_loss
+            # w_phys weights residual, w_jump weights jump (independent)
+            phys_loss = cfg.reg.w_phys * res_loss + cfg.reg.w_jump * jump_loss
+            d_pred = d_net(x_res)
+            anchor_loss = physics.scale_anchor(d_pred, d_target)
+            pre_loss = phys_loss + anchor_loss
 
             if verbose and step % cfg.train.log_every == 0:
                 with torch.no_grad():
-                    mean_d = torch.mean(torch.exp(logd_pred)).item()
+                    mean_d = torch.mean(d_pred).item()
                 print(
-                    f"[PINN|pretrain] Iter {step:05d} | Ltot: {pre_loss.item():.3e}\n"
-                    f"  Lphys: {phys_loss.item():.3e} | Lanchor: {anchor_loss.item():.3e}\n"
-                    f"  Lres: {res_loss.item():.3e} | Ljump: {jump_loss.item():.3e}\n"
+                    f"[PINN|pretrain] Iter {step:05d} | Ltot: {pre_loss.item():.3e}\
+"
+                    f"  Lphys: {phys_loss.item():.3e} | Lanchor: {anchor_loss.item():.3e}\
+"
+                    f"  Lres: {res_loss.item():.3e} | Ljump: {jump_loss.item():.3e}\
+"
                     f"  ⟨D⟩: {mean_d:.3e}"
                 )
 
@@ -323,7 +311,7 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
 
     optim_fine = torch.optim.Adam(
         [
-            {"params": logd_net.parameters(), "lr": cfg.train.lr_d_fine},
+            {"params": d_net.parameters(), "lr": cfg.train.lr_d_fine},
             {"params": u_net.parameters(), "lr": cfg.train.lr_lower_fine},
         ]
     )
@@ -370,36 +358,37 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
                 integral_unit,
             )
 
-        phys_loss, res_loss, jump_loss = _compute_physics_losses(
-            logd_net,
+        res_loss, jump_loss = _compute_physics_losses(
+            d_net,
             u_net,
             x_res,
             z_tensor,
             z_idx,
             cfg.physics.alpha,
             cfg.physics.mu,
-            cfg.reg.w_jump,
         )
+        # w_phys weights residual, w_jump weights jump (independent)
+        phys_loss = cfg.reg.w_phys * res_loss + cfg.reg.w_jump * jump_loss
 
         x_reg = x_res.clone().detach().requires_grad_(True)
-        logd_reg = logd_net(x_reg)
+        d_reg = d_net(x_reg)
         if cfg.reg.smoothness_type == "tv":
-            reg_smooth = physics.tv_smoothness_logd(x_reg, logd_reg)
+            reg_smooth = physics.tv_smoothness_d(x_reg, d_reg)
         else:
-            reg_smooth = physics.h1_smoothness_logd(x_reg, logd_reg)
-        # Reuse logd_reg (same x locations) to avoid an extra forward pass.
-        reg_scale = physics.log_scale_anchor(logd_reg, log_target)
+            reg_smooth = physics.h1_smoothness_d(x_reg, d_reg)
+
+        reg_scale = physics.scale_anchor(d_reg, d_target)
 
         total_loss = (
             cfg.reg.w_data * data_loss
-            + cfg.reg.w_phys * phys_loss
+            + phys_loss
             + cfg.reg.wreg_smooth * reg_smooth
             + cfg.reg.wreg_scale * reg_scale
         )
 
         if step % cfg.train.log_every == 0:
             with torch.no_grad():
-                d_vals = torch.exp(logd_reg.detach())
+                d_vals = d_reg.detach()
                 mean_d = torch.mean(d_vals).item()
                 d_snapshot = d_vals.detach().cpu().numpy().reshape(-1)
                 if data_bundle.mode == "field":
@@ -424,12 +413,15 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
                 reg_smooth_eff = cfg.reg.wreg_smooth * reg_smooth
                 reg_scale_eff = cfg.reg.wreg_scale * reg_scale
                 print(
-                    f"[PINN|finetune] Iter {step:05d} | Ltot: {total_loss.item():.3e}\n"
+                    f"[PINN|finetune] Iter {step:05d} | Ltot: {total_loss.item():.3e}\
+"
                     f"  Ldata({loss_name}): {data_loss.item():.3e} | Lphys: {phys_loss.item():.3e} | "
                     f"RegSmooth: {reg_smooth.item():.3e} (eff: {reg_smooth_eff.item():.3e}) | "
-                    f"RegScale: {reg_scale.item():.3e} (eff: {reg_scale_eff.item():.3e})\n"
-                    f"  Lres: {res_loss.item():.3e} | Ljump: {jump_loss.item():.3e}\n"
-                    f"  b₀*: {b0_star.item():.2f} | ∫u: {u_int:.3e} | ⟨D⟩: {mean_d:.3e}"
+                    f"RegScale: {reg_scale.item():.3e} (eff: {reg_scale_eff.item():.3e})\
+"
+                    f"  Lres: {res_loss.item():.3e} | Ljump: {jump_loss.item():.3e}\
+"
+                    f"  b₀*: {b0_star.item():.2f} | ∫û: {integral_unit.item():.3e} | ∫u: {u_int:.3e} | ⟨D⟩: {mean_d:.3e}"
                 )
 
         stop_training = False
@@ -456,11 +448,11 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
                 sched.step()
         else:
             if stop_training and verbose:
-                 print(f"[PINN] Early stopping triggered at step {step}.")
+                print(f"[PINN] Early stopping triggered at step {step}.")
             break
 
     with torch.no_grad():
-        logd_final = logd_net(x_res)
+        d_final = d_net(x_res)
         u_hat_res, _ = u_net(x_res, z_tensor)
         if data_bundle.mode == "field":
             u_hat_field, _ = u_net(x_field, z_tensor)
@@ -474,11 +466,10 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
             integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
             b0_star = varpro.project_b0_ppp(ppp.n_obs, ppp.m_obs, integral_unit)
         u_pred = b0_star * u_hat_res
-        d_pred = torch.exp(logd_final)
+        d_pred = d_final
 
     return PINNResult(
         x_res=x_res.detach().cpu().view(-1),
-        logd=logd_final.detach().cpu().view(-1),
         d_pred=d_pred.detach().cpu().view(-1),
         u_hat_unit=u_hat_res.detach().cpu().view(-1),
         u_pred=u_pred.detach().cpu().view(-1),

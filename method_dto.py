@@ -1,18 +1,8 @@
 """DTO (direct-to-optimization) solver for the 1D alpha-PDE inverse problem.
 
 Defines DTOData/DTOResult, a differentiable tridiagonal solver, and the
-single-level optimization loop for grid-parameterized logD.
+single-level optimization loop for grid-parameterized D.
 """
-
-# NOTE: This file intentionally duplicates some utilities (LogD init helpers)
-# from other method files. This keeps each method self-contained and readable.
-# If you modify shared logic, update all three method files.
-#
-# DTO overview:
-# - Unique: grid-parameterized logD with a differentiable tridiagonal solver.
-# - Loss: data loss via VarPro + smoothness (H1/TV) + log-normal scale anchor.
-# - Optimization: single-level gradient descent on interior logD parameters.
-# - Key knobs: wreg_smooth, wreg_scale, smoothness_type, lr_d_fine.
 
 from __future__ import annotations
 
@@ -22,10 +12,14 @@ from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from config import Config
 from data import PPPData, estimate_ddi_scale
 import physics, varpro
+
+
+D_MIN = 1e-6
 
 
 @dataclass
@@ -55,8 +49,7 @@ class DTOResult:
 
     Fields:
         x_res: Solver grid (1D).
-        logd: log D(x) on x_res (1D).
-        d_pred: D(x) = exp(logd) on x_res (1D).
+        d_pred: D(x) on x_res (1D).
         u_hat_unit: Unit-source response u_hat for b0=1 on x_res (1D).
         u_pred: Predicted field b0* * u_hat_unit on x_res (1D).
         b0_star: Projected source amplitude.
@@ -66,7 +59,6 @@ class DTOResult:
     """
 
     x_res: torch.Tensor
-    logd: torch.Tensor
     d_pred: torch.Tensor
     u_hat_unit: torch.Tensor
     u_pred: torch.Tensor
@@ -74,17 +66,17 @@ class DTOResult:
     history: Dict[str, List[float]]
 
 
-def _init_logd_profile(
+def _init_d_profile(
     x: torch.Tensor,
     base: float,
     scale: float,
     freq: float,
 ) -> torch.Tensor:
-    """Build a sinusoidal log-D initialization on the grid."""
+    """Build a sinusoidal D initialization on the grid."""
     if scale >= 1.0:
         raise ValueError("d_init_pert_scale must be < 1 to keep D_init positive.")
     d_init = base * (1.0 + scale * torch.sin(2.0 * torch.pi * freq * x))
-    return torch.log(d_init)
+    return d_init
 
 
 def _thomas_solve(
@@ -124,26 +116,36 @@ def _thomas_solve(
 
 
 def _build_tridiag_alpha(
-    logd: torch.Tensor,
+    d: torch.Tensor,
     alpha: float,
     mu: float,
     h: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Assemble tridiagonal coefficients for the alpha-PDE discretization."""
-    g = torch.exp((1.0 - alpha) * logd)
-    logd_half = 0.5 * (logd[:-1] + logd[1:])
-    a_half = torch.exp(alpha * logd_half) / h
+    """Assemble tridiagonal coefficients for the alpha-PDE discretization.
+    
+    h is now a vector of step sizes: h[i] = x[i+1] - x[i].
+    """
+    g = d ** (1.0 - alpha)
+    d_half = 0.5 * (d[:-1] + d[1:])
+    a_half = (d_half ** alpha) / h
 
-    diag = -((a_half[1:] + a_half[:-1]) * g[1:-1] / h) - mu
-    lower_full = (a_half[:-1] * g[:-2]) / h
-    upper_full = (a_half[1:] * g[2:]) / h
+    # Interior volumes: vol[i] = (h[i] + h[i+1]) / 2 (indices shifted)
+    # The 'h' vector has length N-1.
+    # a_half has length N-1.
+    # We need volumes for interior nodes 1..N-2.
+    # vol[k] corresponds to node k+1.
+    vol = 0.5 * (h[:-1] + h[1:])
+
+    diag = -((a_half[1:] + a_half[:-1]) * g[1:-1] / vol) - mu
+    lower_full = (a_half[:-1] * g[:-2]) / vol
+    upper_full = (a_half[1:] * g[2:]) / vol
     lower = lower_full[1:]
     upper = upper_full[:-1]
     return lower, diag, upper
 
 
 class DtoAlphaVarPro(nn.Module):
-    """Finite-difference solver with a learnable interior log-D profile."""
+    """Finite-difference solver with a learnable interior D profile."""
 
     def __init__(
         self,
@@ -151,63 +153,86 @@ class DtoAlphaVarPro(nn.Module):
         alpha: float,
         mu: float,
         sources: List[float],
-        logd_init: torch.Tensor,
+        d_init: torch.Tensor,
+        d_min: float = D_MIN,
     ) -> None:
         super().__init__()
         self.x_res = x_res
         self.alpha = float(alpha)
         self.mu = float(mu)
         self.sources = list(sources)
+        self.d_min = d_min
         self.n = int(x_res.numel())
         if self.n < 3:
             raise ValueError("Need n_res >= 3.")
-        self.h = x_res[1] - x_res[0]
-        self.theta_int = nn.Parameter(logd_init[1:-1].clone().detach())
+        
+        # h is now a vector of interval lengths
+        self.h = x_res[1:] - x_res[:-1]
+
+        d_init_shifted = d_init[1:-1] - d_min
+        # Inverse softplus: x = log(exp(y) - 1)
+        self.theta_int = nn.Parameter(
+            torch.where(
+                d_init_shifted > 20,
+                d_init_shifted,
+                torch.log(torch.expm1(d_init_shifted.clamp(min=1e-8)))
+            )
+        )
 
         with torch.no_grad():
             rhs = torch.zeros(self.n - 2, device=self.x_res.device, dtype=self.x_res.dtype)
-            h_val = self.h
+            # vol is needed for RHS scaling
+            vol = 0.5 * (self.h[:-1] + self.h[1:])
+            
             for z in self.sources:
                 z_t = torch.tensor(float(z), device=self.x_res.device, dtype=self.x_res.dtype)
                 # p2h-s1 hat delta: distribute source to the two nearest grid points
-                # using weights w_i = 1 - |x_i - z| / h (if |x_i - z| <= h)
-                # Find bracketing indices using searchsorted
                 idx_right = int(torch.searchsorted(self.x_res, z_t, side="right").item())
                 idx_left = idx_right - 1
-                # Clamp to valid interior range [1, n-2]
-                idx_left = max(1, min(self.n - 2, idx_left))
-                idx_right = max(1, min(self.n - 2, idx_right))
-                if idx_left == idx_right:
-                    # z is exactly on a grid point (or at boundary)
-                    rhs[idx_left - 1] -= 1.0 / h_val
+                
+                # Check bounds
+                if idx_left < 0: idx_left = 0
+                if idx_right >= self.n: idx_right = self.n - 1
+                
+                # We need to map global indices to interior RHS indices (0..N-3).
+                # The source contribution is -b0 * w / vol, effectively smearing the
+                # Dirac delta into a hat function with unit integral over the
+                # Voronoi cells.
+                
+                x_left = self.x_res[idx_left]
+                x_right = self.x_res[idx_right]
+                h_interval = x_right - x_left
+                
+                if h_interval < 1e-12:
+                     # Coincides with node?
+                     # If idx_left is an interior node (1..N-2)
+                     if 1 <= idx_left <= self.n - 2:
+                         rhs[idx_left - 1] -= 1.0 / vol[idx_left - 1]
                 else:
-                    # Distribute between two points using hat function
-                    x_left = self.x_res[idx_left]
-                    x_right = self.x_res[idx_right]
-                    # w_left = 1 - |x_left - z| / h = 1 - (z - x_left) / h
-                    # w_right = 1 - |x_right - z| / h = 1 - (x_right - z) / h
-                    w_left = 1.0 - torch.abs(x_left - z_t) / h_val
-                    w_right = 1.0 - torch.abs(x_right - z_t) / h_val
-                    # Apply to RHS (interior indexing is offset by 1)
-                    rhs[idx_left - 1] -= w_left / h_val
-                    rhs[idx_right - 1] -= w_right / h_val
-        # Unit-source RHS is constant across iterations; cache as a buffer.
+                    w_left = 1.0 - torch.abs(x_left - z_t) / h_interval
+                    w_right = 1.0 - torch.abs(x_right - z_t) / h_interval
+                    
+                    if 1 <= idx_left <= self.n - 2:
+                        rhs[idx_left - 1] -= w_left / vol[idx_left - 1]
+                    if 1 <= idx_right <= self.n - 2:
+                        rhs[idx_right - 1] -= w_right / vol[idx_right - 1]
+                        
         self.register_buffer("rhs_unit", rhs)
 
-    def build_logd_full(self) -> torch.Tensor:
-        """Mirror interior log-D to the boundaries for Dirichlet conditions."""
-        logd = torch.empty(self.n, device=self.x_res.device, dtype=self.x_res.dtype)
-        logd[1:-1] = self.theta_int
-        logd[0] = logd[1]
-        logd[-1] = logd[-2]
-        return logd
+    def build_d_full(self) -> torch.Tensor:
+        """Mirror interior D to the boundaries for Dirichlet conditions."""
+        d = torch.empty(self.n, device=self.x_res.device, dtype=self.x_res.dtype)
+        d[1:-1] = F.softplus(self.theta_int) + self.d_min
+        d[0] = d[1]
+        d[-1] = d[-2]
+        return d
 
-    def solve_unit_u_hat(self, logd_full: torch.Tensor) -> torch.Tensor:
-        """Solve for the unit-source response u_hat given log-D.
+    def solve_unit_u_hat(self, d_full: torch.Tensor) -> torch.Tensor:
+        """Solve for the unit-source response u_hat given D.
 
         Uses a cached unit-source RHS vector to avoid per-iteration rebuilds.
         """
-        lower, diag, upper = _build_tridiag_alpha(logd_full, self.alpha, self.mu, self.h)
+        lower, diag, upper = _build_tridiag_alpha(d_full, self.alpha, self.mu, self.h)
         u_int = _thomas_solve(lower, diag, upper, self.rhs_unit)
         u = torch.zeros(self.n, device=self.x_res.device, dtype=self.x_res.dtype)
         u[1:-1] = u_int
@@ -215,7 +240,7 @@ class DtoAlphaVarPro(nn.Module):
 
 
 def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
-    """Fit log-D with DTO and return the reconstructed fields.
+    """Fit D with DTO and return the reconstructed fields.
 
     Args:
         data_bundle: DTOData specifying observations and grids.
@@ -252,7 +277,6 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
         u_true = None
         domain = cfg.physics.domain
         x_int = torch.linspace(domain[0], domain[1], cfg.grid.n_int, device=device, dtype=dtype)
-        # Precompute interpolation weights for fixed PPP grids.
         interp_int = varpro.precompute_interp_1d(x_res, x_int)
         interp_particles = varpro.precompute_interp_1d(x_res, ppp.x_particles)
 
@@ -271,21 +295,25 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
 
     if verbose:
         print(f"[DTO] Initialized ⟨D⟩_base: {d_init_base:.3e}")
-    log_target = math.log(d_init_base)
+    
+    # We use d_init_base directly for regularization target
+    d_target = d_init_base
 
-    logd_init = _init_logd_profile(
+    d_init = _init_d_profile(
         x_res,
         base=d_init_base,
         scale=cfg.d_profile.d_init_pert_scale,
         freq=cfg.d_profile.d_init_pert_freq,
     )
 
+    d_min = getattr(cfg.arch, "d_min", D_MIN)
     model = DtoAlphaVarPro(
         x_res=x_res,
         alpha=cfg.physics.alpha,
         mu=cfg.physics.mu,
         sources=list(cfg.physics.sources),
-        logd_init=logd_init,
+        d_init=d_init,
+        d_min=d_min,
     ).to(device)
 
     optimizer = torch.optim.Adam([model.theta_int], lr=cfg.train.lr_d_fine)
@@ -313,8 +341,8 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
     for step in range(cfg.train.finetune_iters + 1):
         optimizer.zero_grad(set_to_none=True)
 
-        logd_full = model.build_logd_full()
-        u_hat_unit = model.solve_unit_u_hat(logd_full)
+        d_full = model.build_d_full()
+        u_hat_unit = model.solve_unit_u_hat(d_full)
 
         if data_bundle.mode == "field":
             if x_field.numel() == x_res.numel() and torch.allclose(x_field, x_res):
@@ -345,14 +373,14 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
             )
 
         if cfg.reg.smoothness_type == "tv":
-            reg_smooth = physics.tv_smoothness_logd_discrete(
-                logd_full, h=float(model.h.item())
+            reg_smooth = physics.tv_smoothness_d_discrete(
+                d_full, h=float(model.h[0].item())
             )
         else:
-            reg_smooth = physics.h1_smoothness_logd_discrete(
-                logd_full, h=float(model.h.item())
+            reg_smooth = physics.h1_smoothness_d_discrete(
+                d_full, h=float(model.h[0].item())
             )
-        reg_scale = physics.log_scale_anchor(logd_full, log_target)
+        reg_scale = physics.scale_anchor(d_full, d_target)
         total_loss = (
             data_loss
             + cfg.reg.wreg_smooth * reg_smooth
@@ -361,14 +389,14 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
 
         if step % cfg.train.log_every == 0:
             with torch.no_grad():
-                mean_d = torch.mean(torch.exp(logd_full)).item()
+                mean_d = torch.mean(d_full).item()
                 if data_bundle.mode == "particles":
                     u_hat_int = varpro.interpolate_1d_precomputed(u_hat_unit, *interp_int)
                     integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
                 else:
                     integral_unit = torch.trapezoid(u_hat_unit.view(-1), x_res.view(-1))
                 u_int = (b0_star * integral_unit).item()
-                d_snapshot = torch.exp(logd_full).detach().cpu().numpy()
+                d_snapshot = d_full.detach().cpu().numpy()
             history["iter"].append(step)
             history["total"].append(total_loss.item())
             history["data"].append(data_loss.item())
@@ -387,7 +415,7 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
                     f"  Ldata({loss_name}): {data_loss.item():.3e} | "
                     f"RegSmooth: {reg_smooth.item():.3e} (eff: {reg_smooth_eff.item():.3e}) | "
                     f"RegScale: {reg_scale.item():.3e} (eff: {reg_scale_eff.item():.3e})\n"
-                    f"  b₀*: {b0_star.item():.2f} | ∫u: {u_int:.3e} | ⟨D⟩: {mean_d:.3e}"
+                    f"  b₀*: {b0_star.item():.2f} | ∫û: {integral_unit.item():.3e} | ∫u: {u_int:.3e} | ⟨D⟩: {mean_d:.3e}"
                 )
 
         stop_training = False
@@ -414,12 +442,12 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
                 scheduler.step()
         else:
             if stop_training and verbose:
-                 print(f"[DTO] Early stopping triggered at step {step}.")
+                print(f"[DTO] Early stopping triggered at step {step}.")
             break
 
     with torch.no_grad():
-        logd_full = model.build_logd_full()
-        u_hat_unit = model.solve_unit_u_hat(logd_full)
+        d_full = model.build_d_full()
+        u_hat_unit = model.solve_unit_u_hat(d_full)
         if data_bundle.mode == "field":
             if x_field.numel() == x_res.numel() and torch.allclose(x_field, x_res):
                 u_hat_field = u_hat_unit
@@ -435,11 +463,10 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
             integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
             b0_star = varpro.project_b0_ppp(ppp.n_obs, ppp.m_obs, integral_unit)
         u_pred = b0_star * u_hat_unit
-        d_pred = torch.exp(logd_full)
+        d_pred = d_full
 
     return DTOResult(
         x_res=x_res.detach().cpu(),
-        logd=logd_full.detach().cpu(),
         d_pred=d_pred.detach().cpu(),
         u_hat_unit=u_hat_unit.detach().cpu(),
         u_pred=u_pred.detach().cpu(),

@@ -121,7 +121,12 @@ class TrainConfig:
 
 @dataclass
 class RegConfig:
-    """Weights for data/physics objectives."""
+    """Weights for data/physics objectives.
+
+    Regularization notes:
+    - wreg_smooth: Penalizes fluctuations in log(D) to ensure scale invariance.
+    - wreg_scale: Anchors log(D) to the data-driven initialization estimate.
+    """
 
     w_data: float = 1.0
     w_phys: float = 1.0
@@ -142,8 +147,10 @@ class ArchConfig:
     """Neural architecture options for RFF embeddings."""
 
     use_rff_geom: bool = True
-    use_rff_logd: bool = True
+    use_rff_d: bool = True
+    d_min: float = 1e-6
     rff_width: int = 128
+    rff_scale: float = 1.0  # Frequency multiplier for RFF (higher = sharper features)
     rff_seed: int = 0
 
     def validate(self) -> None:
