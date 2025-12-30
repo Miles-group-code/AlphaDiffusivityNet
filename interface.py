@@ -31,6 +31,9 @@ DEFAULT_SETTINGS = {
     "pretrain_iters": 1000,
     "lr_d": 1e-4,
     "lr_lower": 1e-4,
+    "optimizer": "adam",
+    "lbfgs_lr": 1.0,
+    "lbfgs_max_iter": 20,
     "use_scheduler": True,
 
     # Loss weights
@@ -104,6 +107,9 @@ def show_settings(settings: Optional[Dict[str, Any]] = None) -> None:
         "lr_lower": "Learning rate for u-net (both phases)",
         "lr_lower_pre": "LR for u-net pretrain (overrides lr_lower)",
         "lr_lower_fine": "LR for u-net finetune (overrides lr_lower)",
+        "optimizer": "'adam' or 'lbfgs'",
+        "lbfgs_lr": "LBFGS step size",
+        "lbfgs_max_iter": "LBFGS inner iterations per step",
         "use_scheduler": "Cosine LR decay",
         "w_data": "Data loss weight (pinn only)",
         "w_phys": "Physics loss weight (pinn only)",
@@ -256,7 +262,7 @@ class Problem:
         sde_dt: float = 1e-3,
         seed: int = 42,
         device: str = "cpu",
-        dtype: torch.dtype = torch.float32,
+        dtype: torch.dtype = torch.float64,
         verbose: bool = True,
     ) -> "Problem":
         """Generate a synthetic problem for testing and experimentation.
@@ -594,6 +600,9 @@ def solve(
     lr_lower: Optional[float] = None,
     lr_lower_pre: Optional[float] = None,
     lr_lower_fine: Optional[float] = None,
+    optimizer: Optional[Literal["adam", "lbfgs"]] = None,
+    lbfgs_lr: Optional[float] = None,
+    lbfgs_max_iter: Optional[int] = None,
     w_data: Optional[float] = None,
     w_phys: Optional[float] = None,
     wreg_smooth: Optional[float] = None,
@@ -630,6 +639,9 @@ def solve(
         lr_lower: Learning rate for u(x) / physics network (sets both pretrain + finetune).
         lr_lower_pre: LR for physics network during pretrain (overrides lr_lower).
         lr_lower_fine: LR for physics network during finetune (overrides lr_lower).
+        optimizer: "adam" or "lbfgs" (finetune optimizer).
+        lbfgs_lr: LBFGS step size (default 1.0).
+        lbfgs_max_iter: LBFGS inner iterations per step (default 20).
         w_data: Data loss weight (PINN only).
         w_phys: Physics loss weight (PINN only).
         wreg_smooth: Smoothness penalty on D(x).
@@ -728,6 +740,12 @@ def solve(
         config.train.lr_lower_pre = lr_lower_pre
     if lr_lower_fine is not None:
         config.train.lr_lower_fine = lr_lower_fine
+    if optimizer is not None:
+        config.train.optimizer = optimizer
+    if lbfgs_lr is not None:
+        config.train.lbfgs_lr = lbfgs_lr
+    if lbfgs_max_iter is not None:
+        config.train.lbfgs_max_iter = lbfgs_max_iter
     if w_data is not None:
         config.reg.w_data = w_data
     if w_phys is not None:

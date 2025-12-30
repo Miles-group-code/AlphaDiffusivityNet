@@ -18,6 +18,22 @@ from config import Config
 from data import PPPData, estimate_ddi_scale
 import physics, varpro
 
+# =============================================================================
+# D PARAMETERIZATION: Softplus + offset
+# =============================================================================
+# We use softplus for positivity: D = softplus(raw) + D_min
+#
+# HISTORY:
+# - v3.0.0: Switched from log(D) to softplus + offset
+# - Tried LeakyReLU + clamp(min=0), but clamp killed gradients when raw < 0
+# - Reverted to softplus (v3.0.1): smooth gradients everywhere
+#
+# TRADE-OFF:
+# - Softplus has mild gradient suppression: ∂D/∂raw = sigmoid(raw) ≈ D for small D
+# - But avoids catastrophic gradient death from clamp operations
+# - Combined with DDI initialization and Adam optimizer, works well in practice
+# =============================================================================
+
 D_MIN = 1e-6
 
 
@@ -70,7 +86,11 @@ class BiLOResult:
 
 
 class DNet(nn.Module):
-    """RFF-embedded MLP that parameterizes D(x) with shifted softplus."""
+    """RFF-embedded MLP that parameterizes D(x) with softplus + offset.
+
+    Uses softplus parameterization: D = softplus(raw) + D_min
+    Softplus is smooth, always positive, and has well-behaved gradients everywhere.
+    """
 
     def __init__(
         self, width: int = 128, use_rff: bool = True, rff_scale: float = 1.0, d_min: float = D_MIN
@@ -94,7 +114,11 @@ class DNet(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Evaluate D(x) at given coordinates."""
+        """Evaluate D(x) at given coordinates.
+
+        Uses softplus for positivity: D = softplus(raw) + D_min
+        Softplus has smooth gradients everywhere (no dead regions).
+        """
         x = x.view(-1, 1)
         if self.use_rff:
             feat = torch.sin(2.0 * torch.pi * self.rff_scale * self.embed(x))
@@ -273,15 +297,11 @@ def _calc_physics_loss(
             create_graph=True,
             allow_unused=True,
         )[0]
-        # Scale by d_z to match log-domain sensitivity (nabla_logd = d * nabla_d)
-        # MATH NOTE: We penalize ||d * grad_d||^2 instead of ||grad_d||^2.
-        # Why?
-        # 1. Scale Invariance: Diffusion is a scale parameter. Sensitivity to D=0.001 vs D=0.0011 (10% change)
-        #    should be comparable to D=10 vs D=11. Standard grad_d scales as 1/D, making the penalty
-        #    massive for small D, driving the optimizer to cheat by pushing D -> infinity.
-        # 2. Equivalence: By chain rule, d * (dR/dd) = dR / d(log d). This restores the behavior of
-        #    optimizing in log-space, which is the natural geometry for positive physical constants.
-        jump_rgrad = torch.mean((grad_jump * d_z) ** 2) if grad_jump is not None else torch.tensor(
+        # Scale by d_z to convert D-space gradients to log-domain equivalents.
+        # Clamp the scaling factor to D_MIN to prevent collapse: without clamping,
+        # when D -> 0, the penalty vanishes, creating a positive feedback loop.
+        d_scale_jump = d_z.clamp(min=D_MIN)
+        jump_rgrad = torch.mean((grad_jump * d_scale_jump) ** 2) if grad_jump is not None else torch.tensor(
             0.0, device=x_res.device, dtype=x_res.dtype
         )
         # Zero out the source point in grad_outputs for resgrad
@@ -294,8 +314,9 @@ def _calc_physics_loss(
             create_graph=True,
             allow_unused=True,
         )[0]
-        # Scale by d_pde to match log-domain sensitivity
-        rgrad = torch.mean((grad_res * d_pde) ** 2) if grad_res is not None else torch.tensor(
+        # Scale by d_pde with clamping (same reasoning as jump_rgrad above).
+        d_scale_pde = d_pde.clamp(min=D_MIN)
+        rgrad = torch.mean((grad_res * d_scale_pde) ** 2) if grad_res is not None else torch.tensor(
             0.0, device=x_res.device, dtype=x_res.dtype
         )
     else:
@@ -369,13 +390,41 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
 
     d_min = getattr(cfg.arch, "d_min", D_MIN)
     rff_scale = getattr(cfg.arch, "rff_scale", 1.0)
-    d_net = DNet(width=cfg.arch.rff_width, use_rff=cfg.arch.use_rff_d, rff_scale=rff_scale, d_min=d_min).to(device)
-    local_op = LocalOperator(width=cfg.arch.rff_width, use_rff=cfg.arch.use_rff_geom, rff_scale=rff_scale).to(device)
+    d_net = DNet(
+        width=cfg.arch.rff_width,
+        use_rff=cfg.arch.use_rff_d,
+        rff_scale=rff_scale,
+        d_min=d_min,
+    ).to(device=device, dtype=dtype)
+    local_op = LocalOperator(
+        width=cfg.arch.rff_width,
+        use_rff=cfg.arch.use_rff_geom,
+        rff_scale=rff_scale,
+    ).to(device=device, dtype=dtype)
 
     x_int = torch.linspace(
         domain[0], domain[1], cfg.grid.n_int, device=device, dtype=dtype
     ).view(-1, 1)
 
+    # =========================================================================
+    # TRAINING HISTORY
+    # =========================================================================
+    # BiLO tracks both upper-level (data) and lower-level (physics) losses.
+    # Keys:
+    #   iter         - iteration number (finetune phase only)
+    #   upper        - upper-level loss (data + regularization on D)
+    #   data         - data fidelity loss (MSE, RLE, or PPP NLL)
+    #   reg_smooth   - smoothness penalty on D (unweighted)
+    #   reg_scale    - scale anchor penalty on D (unweighted)
+    #   lower        - lower-level loss (physics constraints on local_op)
+    #   res          - PDE residual loss (unweighted)
+    #   jump         - jump condition loss at source (unweighted)
+    #   rgrad        - residual gradient penalty ∂(res)/∂(D) (unweighted)
+    #   jump_rgrad   - jump gradient penalty ∂(jump)/∂(D) (unweighted)
+    #   b0_star      - projected source amplitude via VarPro
+    #   mean_d       - spatial average of D(x)
+    #   d_snap_iters - iterations where D snapshots were saved
+    #   d_snapshots  - list of D(x) arrays at those iterations
     history: Dict[str, List[float]] = {
         "iter": [],
         "upper": [],
@@ -393,7 +442,17 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
         "d_snapshots": [],
     }
 
-    # Pretraining (still sequential for supervised warmup)
+    # =========================================================================
+    # PRETRAIN PHASE
+    # =========================================================================
+    # BiLO pretraining has two goals:
+    #   1. Train d_net to output the initialization profile (anchoring)
+    #   2. Train local_op to satisfy physics for that initial D (supervised)
+    #
+    # This gives the local_op a "warm start" so it can already solve the PDE
+    # before we start updating D based on data. Without this, the local_op
+    # would produce garbage u(x) values and the upper-level gradients would
+    # be meaningless.
     if cfg.train.pretrain_iters > 0:
         # For initialization, we train d_net to match the perturbed profile d_init_profile
         # And train local_op to match the FDM solution for that perturbed profile.
@@ -486,30 +545,63 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
             f"  ⟨D⟩: {mean_d:.3e}"
         )
 
-    # Fine-tuning: Simultaneous Optimization.
+    # =========================================================================
+    # FINETUNE PHASE: Bilevel Optimization
+    # =========================================================================
+    # BiLO uses bilevel optimization where:
+    #   - Upper level: Update d_net to minimize data loss + regularization
+    #   - Lower level: Update local_op to satisfy physics for current D
+    #
+    # The key insight is that these two objectives are decoupled:
+    #   - d_net gradients come from data loss (how well does u match observations?)
+    #   - local_op gradients come from physics loss (how well does u satisfy PDE?)
+    #
+    # This avoids the conflicting gradients problem in standard PINN where
+    # both networks are updated jointly on a single composite loss.
     d_params = _trainable_params(d_net)
     local_op_params = _trainable_params(local_op)
 
-    optimizer = torch.optim.Adam([
-        {"params": d_params, "lr": cfg.train.lr_d_fine},
-        {"params": local_op_params, "lr": cfg.train.lr_lower_fine},
-    ])
-
+    # Optimizer setup: Adam (default) or LBFGS
+    use_lbfgs = cfg.train.optimizer == "lbfgs"
+    optimizer = None
     scheduler = None
-    if cfg.train.use_scheduler and cfg.train.finetune_iters > 0:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=cfg.train.finetune_iters,
-            eta_min=min(cfg.train.lr_d_fine, cfg.train.lr_lower_fine) * 0.1,
-        )
 
+    if use_lbfgs:
+        optimizer = torch.optim.LBFGS(
+            list(d_params) + list(local_op_params),
+            lr=cfg.train.lbfgs_lr,
+            max_iter=cfg.train.lbfgs_max_iter,
+            history_size=10,
+            line_search_fn="strong_wolfe",
+        )
+    else:
+        optimizer = torch.optim.Adam([
+            {"params": d_params, "lr": cfg.train.lr_d_fine},
+            {"params": local_op_params, "lr": cfg.train.lr_lower_fine},
+        ])
+        if cfg.train.use_scheduler and cfg.train.finetune_iters > 0:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=cfg.train.finetune_iters,
+                eta_min=min(cfg.train.lr_d_fine, cfg.train.lr_lower_fine) * 0.1,
+            )
+
+    # Early stopping state
     best_total: Optional[float] = None
     patience = 0
 
+    # =========================================================================
+    # MAIN BILEVEL TRAINING LOOP
+    # =========================================================================
     for step in range(cfg.train.finetune_iters + 1):
-        optimizer.zero_grad(set_to_none=True)
+        if not use_lbfgs:
+            optimizer.zero_grad(set_to_none=True)
 
-        # 1. Upper Level: Minimize Data Loss (w.r.t d_net)
+        # -----------------------------------------------------------------
+        # UPPER LEVEL: Compute data loss and gradients for d_net
+        # -----------------------------------------------------------------
+        # The upper level asks: "Given the current local_op (frozen),
+        # how should we update D to better fit the observations?"
         b0_star, data_loss, reg_smooth, reg_scale = _calc_data_loss(
             d_net,
             local_op,
@@ -528,18 +620,29 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
             data_loss + cfg.reg.wreg_smooth * reg_smooth + cfg.reg.wreg_scale * reg_scale
         )
 
-        # Compute upper gradients for d_net only (treat local_op as constant).
-        grads_upper = torch.autograd.grad(
-            upper_loss,
-            d_params,
-            create_graph=False,
-            allow_unused=True,
-        )
-        for param, grad in zip(d_params, grads_upper):
-            if grad is not None:
-                param.grad = grad
+        if not use_lbfgs:
+            # Compute upper gradients for d_net only (treat local_op as constant).
+            grads_upper = torch.autograd.grad(
+                upper_loss,
+                d_params,
+                create_graph=False,
+                allow_unused=True,
+            )
+            for param, grad in zip(d_params, grads_upper):
+                if grad is not None:
+                    param.grad = grad
 
-        # 2. Lower Level: Minimize Physics Loss (w.r.t local_op)
+        # -----------------------------------------------------------------
+        # LOWER LEVEL: Compute physics loss and gradients for local_op
+        # -----------------------------------------------------------------
+        # The lower level asks: "Given the current D (frozen), how should
+        # we update local_op so that u(x|D) satisfies the PDE?"
+        #
+        # The physics loss includes:
+        #   - res_loss: PDE residual (how well does L[u] - μu = 0?)
+        #   - jump_loss: Source jump condition at z
+        #   - rgrad: Sensitivity penalty ∂(res)/∂(D) for robustness
+        #   - jump_rgrad: Sensitivity penalty ∂(jump)/∂(D)
         lower_loss, res_loss, jump_loss, rgrad, jump_rgrad = _calc_physics_loss(
             d_net,
             local_op,
@@ -552,18 +655,21 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
             cfg.reg.w_resgrad,
         )
 
-        # Compute lower gradients for local_op only (treat d_net as constant).
-        grads_lower = torch.autograd.grad(
-            lower_loss,
-            local_op_params,
-            create_graph=False,
-            allow_unused=True,
-        )
-        for param, grad in zip(local_op_params, grads_lower):
-            if grad is not None:
-                param.grad = grad
+        if not use_lbfgs:
+            # Compute lower gradients for local_op only (treat d_net as constant).
+            grads_lower = torch.autograd.grad(
+                lower_loss,
+                local_op_params,
+                create_graph=False,
+                allow_unused=True,
+            )
+            for param, grad in zip(local_op_params, grads_lower):
+                if grad is not None:
+                    param.grad = grad
 
-        # Logging
+        # -----------------------------------------------------------------
+        # LOGGING: Record metrics every log_every steps
+        # -----------------------------------------------------------------
         total_loss = upper_loss + lower_loss
         if step % cfg.train.log_every == 0:
             with torch.no_grad():
@@ -609,7 +715,9 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                     f"  b₀*: {b0_star.item():.2f} | ∫û: {integral_unit.item():.3e} | ∫u: {u_int:.3e} | ⟨D⟩: {mean_d:.3e}"
                 )
 
-        # Early Stopping check
+        # -----------------------------------------------------------------
+        # EARLY STOPPING: Stop if loss plateaus after burn-in period
+        # -----------------------------------------------------------------
         stop_training = False
         if step >= cfg.train.early_burnin:
             total_val = total_loss.item()
@@ -627,16 +735,65 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                     if patience >= cfg.train.early_patience:
                         stop_training = True
 
-        # 3. Simultaneous Update
+        # -----------------------------------------------------------------
+        # OPTIMIZER STEP: Update both networks simultaneously
+        # -----------------------------------------------------------------
+        # For Adam: gradients were already computed and assigned above.
+        # For LBFGS: we need a closure that recomputes the bilevel gradients.
+        #
+        # Note: Even though this is "bilevel", we update both networks in
+        # one optimizer step. The bilevel structure is in HOW we compute
+        # gradients (separate losses), not in alternating updates.
         if step < cfg.train.finetune_iters and not stop_training:
-            optimizer.step()
-            if scheduler is not None:
-                scheduler.step()
+            if use_lbfgs:
+                # LBFGS closure must recompute the full bilevel gradient setup
+                def _lbfgs_closure() -> torch.Tensor:
+                    optimizer.zero_grad(set_to_none=True)
+                    # Upper level: data loss -> d_net gradients
+                    _, data_loss, reg_smooth, reg_scale = _calc_data_loss(
+                        d_net, local_op, x_res, x_int, x_field, z_tensor,
+                        data_bundle.mode, u_true, ppp, cfg.data.field_loss,
+                        d_target, cfg.reg.smoothness_type,
+                    )
+                    upper_loss = (
+                        data_loss
+                        + cfg.reg.wreg_smooth * reg_smooth
+                        + cfg.reg.wreg_scale * reg_scale
+                    )
+                    grads_upper = torch.autograd.grad(
+                        upper_loss, d_params, create_graph=False, allow_unused=True,
+                    )
+                    for param, grad in zip(d_params, grads_upper):
+                        if grad is not None:
+                            param.grad = grad
+
+                    # Lower level: physics loss -> local_op gradients
+                    lower_loss, _, _, _, _ = _calc_physics_loss(
+                        d_net, local_op, x_res, z_tensor, z_idx,
+                        cfg.physics.alpha, cfg.physics.mu,
+                        cfg.reg.w_jump, cfg.reg.w_resgrad,
+                    )
+                    grads_lower = torch.autograd.grad(
+                        lower_loss, local_op_params, create_graph=False, allow_unused=True,
+                    )
+                    for param, grad in zip(local_op_params, grads_lower):
+                        if grad is not None:
+                            param.grad = grad
+                    return upper_loss + lower_loss
+                optimizer.step(_lbfgs_closure)
+            else:
+                # Standard Adam step (gradients already assigned)
+                optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
         else:
             if stop_training and verbose:
                 print(f"[BiLO] Early stopping triggered at step {step}.")
             break
 
+    # =========================================================================
+    # FINAL RESULT EXTRACTION
+    # =========================================================================
     with torch.no_grad():
         d_final = d_net(x_res)
         u_hat_res, _ = local_op(x_res, d_final, z_tensor)

@@ -108,6 +108,9 @@ class TrainConfig:
     lr_lower_pre: float = 1e-4
     lr_d_fine: float = 1e-4
     lr_lower_fine: float = 1e-4
+    optimizer: Literal["adam", "lbfgs"] = "adam"
+    lbfgs_lr: float = 0.1
+    lbfgs_max_iter: int = 20
     use_scheduler: bool = True
     early_burnin: int = 2500
     early_patience: int = 500
@@ -116,6 +119,10 @@ class TrainConfig:
 
     def validate(self) -> None:
         """Validate training loop settings."""
+        if self.optimizer not in {"adam", "lbfgs"}:
+            raise ValueError("optimizer must be 'adam' or 'lbfgs'.")
+        if self.lbfgs_max_iter <= 0:
+            raise ValueError("lbfgs_max_iter must be > 0.")
         return
 
 
@@ -164,7 +171,7 @@ class RunConfig:
 
     seed: int = 42
     device: str = "cpu"
-    dtype: str = "float32"
+    dtype: str = "float64"
     outdir: str = "runs"
 
     def validate(self) -> None:

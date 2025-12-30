@@ -20,6 +20,7 @@ def _build_fdm_tridiag(
     alpha: float,
     mu: float,
     x: np.ndarray,
+    eps: float = 1e-12,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Assemble tridiagonal coefficients for the alpha-PDE FDM system.
 
@@ -30,26 +31,35 @@ def _build_fdm_tridiag(
         alpha: Stochastic convention in [0, 1].
         mu: Death rate.
         x: Grid locations (length N).
+        eps: Small constant to avoid division by zero.
 
     Returns:
         (lower, diag, upper) arrays for the interior system (length N-2).
+
+    NOTE: We use the harmonic mean of D^alpha at cell interfaces rather than
+    (arithmetic_mean(D))^alpha. This preserves flux continuity across interfaces
+    when D is discontinuous (e.g., step profiles). For smooth D, both approaches
+    give second-order accuracy, but the harmonic mean is more physically correct
+    for heterogeneous media.
     """
     n = x.size
     if n < 3:
         raise ValueError("Need at least 3 grid points for Dirichlet problem.")
-    
+
     # h[i] = x[i+1] - x[i]
     h = x[1:] - x[:-1]
 
     # Flux form: J = D^alpha * d/dx (D^(1-alpha) * u)
     # Let q = D^(1-alpha) * u. Then J = D^alpha * dq/dx.
     # We discretize q at nodes and J at half-nodes.
-    
+
     g = d ** (1.0 - alpha)
-    d_half = 0.5 * (d[:-1] + d[1:])
-    
-    # Flux coefficient at i+1/2: D_{i+1/2}^alpha / h_i
-    a_half = (d_half ** alpha) / h
+
+    # Harmonic mean of D^alpha at cell interfaces for flux continuity
+    # harmonic_mean(a, b) = 2*a*b / (a + b)
+    d_alpha_left = d[:-1] ** alpha
+    d_alpha_right = d[1:] ** alpha
+    a_half = 2.0 * d_alpha_left * d_alpha_right / (d_alpha_left + d_alpha_right + eps) / h
 
     # Vectorized assembly
     n_int = n - 2
@@ -84,10 +94,12 @@ def _build_delta_rhs(
     sources: Iterable[float],
     b0: float,
 ) -> np.ndarray:
-    """Construct the interior RHS for point sources on a non-uniform grid.
+    """Construct the interior RHS for point sources using hat-delta distribution.
 
-    Each source contributes -b0/vol to the nearest interior node,
-    where vol is the Voronoi volume (average of adjacent steps).
+    Uses the same "p2h-s1 hat delta" discretization as DTO: if the source falls
+    between grid points, its weight is distributed to the two nearest nodes
+    using linear (hat function) interpolation. This ensures consistency between
+    ground truth generation and optimization.
 
     Args:
         x: Grid locations (length N).
@@ -99,20 +111,37 @@ def _build_delta_rhs(
     """
     n = x.size
     h = x[1:] - x[:-1]
-    vol = 0.5 * (h[:-1] + h[1:]) # Length N-2
-    
+    vol = 0.5 * (h[:-1] + h[1:])  # Length N-2
+
     rhs = np.zeros(n - 2, dtype=float)
-    
+
     for z in sources:
-        # Find nearest interior node
-        # Interior nodes are indices 1..N-2 in x
-        idx_global = (np.abs(x - z)).argmin()
-        
-        # Force source to nearest interior node if it falls on boundary (unlikely given assumptions)
-        idx_global = max(1, min(n - 2, idx_global))
-        idx_int = idx_global - 1
-        
-        rhs[idx_int] += -b0 / vol[idx_int]
+        # Find the interval containing z: x[idx_left] <= z < x[idx_right]
+        idx_right = int(np.searchsorted(x, z, side="right"))
+        idx_left = idx_right - 1
+
+        # Clamp to valid range
+        idx_left = max(0, min(n - 2, idx_left))
+        idx_right = max(1, min(n - 1, idx_right))
+
+        x_left = x[idx_left]
+        x_right = x[idx_right]
+        h_interval = x_right - x_left
+
+        if h_interval < 1e-12:
+            # z coincides with a grid node
+            if 1 <= idx_left <= n - 2:
+                rhs[idx_left - 1] += -b0 / vol[idx_left - 1]
+        else:
+            # Distribute using hat function weights
+            w_left = 1.0 - abs(x_left - z) / h_interval
+            w_right = 1.0 - abs(x_right - z) / h_interval
+
+            if 1 <= idx_left <= n - 2:
+                rhs[idx_left - 1] += -b0 * w_left / vol[idx_left - 1]
+            if 1 <= idx_right <= n - 2:
+                rhs[idx_right - 1] += -b0 * w_right / vol[idx_right - 1]
+
     return rhs
 
 

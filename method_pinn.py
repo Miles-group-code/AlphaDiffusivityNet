@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -17,6 +17,22 @@ import torch.nn.functional as F
 from config import Config
 from data import PPPData, estimate_ddi_scale
 import physics, varpro
+
+# =============================================================================
+# D PARAMETERIZATION: Softplus + offset
+# =============================================================================
+# We use softplus for positivity: D = softplus(raw) + D_min
+#
+# HISTORY:
+# - v3.0.0: Switched from log(D) to softplus + offset
+# - Tried LeakyReLU + clamp(min=0), but clamp killed gradients when raw < 0
+# - Reverted to softplus (v3.0.1): smooth gradients everywhere
+#
+# TRADE-OFF:
+# - Softplus has mild gradient suppression: ∂D/∂raw = sigmoid(raw) ≈ D for small D
+# - But avoids catastrophic gradient death from clamp operations
+# - Combined with DDI initialization and Adam optimizer, works well in practice
+# =============================================================================
 
 D_MIN = 1e-6
 
@@ -66,7 +82,11 @@ class PINNResult:
 
 
 class DNet(nn.Module):
-    """RFF-embedded MLP that parameterizes D(x) with shifted softplus."""
+    """RFF-embedded MLP that parameterizes D(x) with softplus + offset.
+
+    Uses softplus parameterization: D = softplus(raw) + D_min
+    Softplus is smooth, always positive, and has well-behaved gradients everywhere.
+    """
 
     def __init__(
         self, width: int = 128, use_rff: bool = True, rff_scale: float = 1.0, d_min: float = D_MIN
@@ -90,7 +110,11 @@ class DNet(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Evaluate D(x) at given coordinates."""
+        """Evaluate D(x) at given coordinates.
+
+        Uses softplus for positivity: D = softplus(raw) + D_min
+        Softplus has smooth gradients everywhere (no dead regions).
+        """
         x = x.view(-1, 1)
         if self.use_rff:
             feat = torch.sin(2.0 * torch.pi * self.rff_scale * self.embed(x))
@@ -250,9 +274,35 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
 
     d_min = getattr(cfg.arch, "d_min", D_MIN)
     rff_scale = getattr(cfg.arch, "rff_scale", 1.0)
-    d_net = DNet(width=cfg.arch.rff_width, use_rff=cfg.arch.use_rff_d, rff_scale=rff_scale, d_min=d_min).to(device)
-    u_net = LocalOperator(width=cfg.arch.rff_width, use_rff=cfg.arch.use_rff_geom, rff_scale=rff_scale).to(device)
+    d_net = DNet(
+        width=cfg.arch.rff_width,
+        use_rff=cfg.arch.use_rff_d,
+        rff_scale=rff_scale,
+        d_min=d_min,
+    ).to(device=device, dtype=dtype)
+    u_net = LocalOperator(
+        width=cfg.arch.rff_width,
+        use_rff=cfg.arch.use_rff_geom,
+        rff_scale=rff_scale,
+    ).to(device=device, dtype=dtype)
 
+    # =========================================================================
+    # TRAINING HISTORY
+    # =========================================================================
+    # We track metrics at each logged iteration for diagnostics and plotting.
+    # Keys:
+    #   iter         - iteration number (finetune phase only)
+    #   total        - total loss (data + physics + regularization)
+    #   data         - data fidelity loss (MSE, RLE, or PPP NLL)
+    #   phys         - weighted physics loss (w_phys*res + w_jump*jump)
+    #   res          - PDE residual loss (unweighted)
+    #   jump         - jump condition loss at source (unweighted)
+    #   reg_smooth   - smoothness penalty on D (H1 or TV, unweighted)
+    #   reg_scale    - scale anchor penalty (unweighted)
+    #   b0_star      - projected source amplitude via VarPro
+    #   mean_d       - spatial average of D(x)
+    #   d_snap_iters - iterations where D snapshots were saved
+    #   d_snapshots  - list of D(x) arrays at those iterations
     history: Dict[str, List[float]] = {
         "iter": [],
         "total": [],
@@ -268,6 +318,15 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
         "d_snapshots": [],
     }
 
+    # =========================================================================
+    # PRETRAIN PHASE (optional)
+    # =========================================================================
+    # The pretrain phase trains the networks on physics constraints only,
+    # without data. This helps the u-network learn to satisfy the PDE before
+    # we try to fit data, preventing the optimizer from finding shortcuts
+    # that fit data but violate physics.
+    #
+    # Loss = physics_loss + anchor_loss (anchor D to initialization)
     if cfg.train.pretrain_iters > 0:
         optim_pre = torch.optim.Adam(
             [
@@ -309,28 +368,61 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
                 pre_loss.backward()
                 optim_pre.step()
 
-    optim_fine = torch.optim.Adam(
-        [
-            {"params": d_net.parameters(), "lr": cfg.train.lr_d_fine},
-            {"params": u_net.parameters(), "lr": cfg.train.lr_lower_fine},
-        ]
-    )
-    sched = None
-    if cfg.train.use_scheduler and cfg.train.finetune_iters > 0:
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optim_fine, T_max=cfg.train.finetune_iters, eta_min=cfg.train.lr_d_fine * 0.1
-        )
+    # =========================================================================
+    # FINETUNE OPTIMIZER SETUP
+    # =========================================================================
+    # The finetune phase jointly optimizes both networks to minimize:
+    #   total_loss = w_data*data_loss + physics_loss + regularization
+    #
+    # Adam is the default, but LBFGS can help in ill-conditioned cases.
+    # Unlike DTO, PINN typically works well with Adam because the physics
+    # loss provides strong gradients (equation error, not output error).
+    use_lbfgs = cfg.train.optimizer == "lbfgs"
+    optimizer = None
+    scheduler = None
 
+    if use_lbfgs:
+        optimizer = torch.optim.LBFGS(
+            list(d_net.parameters()) + list(u_net.parameters()),
+            lr=cfg.train.lbfgs_lr,
+            max_iter=cfg.train.lbfgs_max_iter,
+            history_size=10,              # How many past gradients to remember
+            line_search_fn="strong_wolfe",  # Robust line search for step size
+        )
+    else:
+        optimizer = torch.optim.Adam(
+            [
+                {"params": d_net.parameters(), "lr": cfg.train.lr_d_fine},
+                {"params": u_net.parameters(), "lr": cfg.train.lr_lower_fine},
+            ]
+        )
+        if cfg.train.use_scheduler and cfg.train.finetune_iters > 0:
+            # Cosine annealing: smoothly reduce LR from initial to 10% over training
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=cfg.train.finetune_iters,
+                eta_min=cfg.train.lr_d_fine * 0.1,
+            )
+
+    # Integration grid for PPP mode (finer than solver grid for accurate ∫u)
     x_int = torch.linspace(
         cfg.physics.domain[0], cfg.physics.domain[1], cfg.grid.n_int, device=device, dtype=dtype
     ).view(-1, 1)
 
+    # Early stopping state
     best_total: Optional[float] = None
     patience = 0
 
-    for step in range(cfg.train.finetune_iters + 1):
-        optim_fine.zero_grad(set_to_none=True)
-
+    # =========================================================================
+    # LOSS COMPUTATION (shared by logging and LBFGS closure)
+    # =========================================================================
+    # This inner function computes all loss components in one forward pass.
+    # PINN loss structure:
+    #   total = w_data*data_loss + w_phys*res_loss + w_jump*jump_loss
+    #         + wreg_smooth*smoothness + wreg_scale*scale_anchor
+    #
+    # Returns: (total, data, phys, res, jump, reg_smooth, reg_scale, b0_star, d_reg, integral_unit)
+    def _compute_losses() -> Tuple[torch.Tensor, ...]:
         integral_unit = None
         if data_bundle.mode == "field":
             u_hat_field, _ = u_net(x_field, z_tensor)
@@ -345,7 +437,6 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
                 b0_star,
                 field_loss=cfg.data.field_loss,
             )
-            integral_unit = None
         else:
             u_hat_int, _ = u_net(x_int, z_tensor)
             integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
@@ -385,7 +476,51 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
             + cfg.reg.wreg_smooth * reg_smooth
             + cfg.reg.wreg_scale * reg_scale
         )
+        return (
+            total_loss,
+            data_loss,
+            phys_loss,
+            res_loss,
+            jump_loss,
+            reg_smooth,
+            reg_scale,
+            b0_star,
+            d_reg,
+            integral_unit,
+        )
 
+    # =========================================================================
+    # MAIN FINETUNE LOOP
+    # =========================================================================
+    # PINN jointly trains d_net and u_net to minimize the composite loss:
+    #   total = w_data*data_loss + physics_loss + regularization
+    #
+    # Unlike BiLO's bilevel approach, PINN trains both networks simultaneously
+    # with gradients flowing through both. This is simpler but can lead to
+    # conflicts between fitting data and satisfying physics.
+    for step in range(cfg.train.finetune_iters + 1):
+        # For Adam: zero gradients before forward pass
+        # For LBFGS: gradients are zeroed inside the closure
+        if not use_lbfgs:
+            optimizer.zero_grad(set_to_none=True)
+
+        # Forward pass: compute all losses
+        (
+            total_loss,
+            data_loss,
+            phys_loss,
+            res_loss,
+            jump_loss,
+            reg_smooth,
+            reg_scale,
+            b0_star,
+            d_reg,
+            integral_unit,
+        ) = _compute_losses()
+
+        # ---------------------------------------------------------------------
+        # LOGGING: Record metrics every log_every steps
+        # ---------------------------------------------------------------------
         if step % cfg.train.log_every == 0:
             with torch.no_grad():
                 d_vals = d_reg.detach()
@@ -424,6 +559,9 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
                     f"  b₀*: {b0_star.item():.2f} | ∫û: {integral_unit.item():.3e} | ∫u: {u_int:.3e} | ⟨D⟩: {mean_d:.3e}"
                 )
 
+        # ---------------------------------------------------------------------
+        # EARLY STOPPING: Stop if loss plateaus after burn-in period
+        # ---------------------------------------------------------------------
         stop_training = False
         if step >= cfg.train.early_burnin:
             total_val = total_loss.item()
@@ -441,16 +579,32 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
                     if patience >= cfg.train.early_patience:
                         stop_training = True
 
+        # ---------------------------------------------------------------------
+        # OPTIMIZER STEP: Update network parameters
+        # ---------------------------------------------------------------------
         if step < cfg.train.finetune_iters and not stop_training:
-            total_loss.backward()
-            optim_fine.step()
-            if sched is not None:
-                sched.step()
+            if use_lbfgs:
+                # LBFGS closure: recomputes loss (may be called multiple times)
+                def _lbfgs_closure() -> torch.Tensor:
+                    optimizer.zero_grad(set_to_none=True)
+                    loss_value = _compute_losses()[0]
+                    loss_value.backward()
+                    return loss_value
+                optimizer.step(_lbfgs_closure)
+            else:
+                # Standard Adam step
+                total_loss.backward()
+                optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
         else:
             if stop_training and verbose:
                 print(f"[PINN] Early stopping triggered at step {step}.")
             break
 
+    # =========================================================================
+    # FINAL RESULT EXTRACTION
+    # =========================================================================
     with torch.no_grad():
         d_final = d_net(x_res)
         u_hat_res, _ = u_net(x_res, z_tensor)

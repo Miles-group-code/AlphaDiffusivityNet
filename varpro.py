@@ -170,7 +170,38 @@ def ppp_nll(
     integral_u_hat: torch.Tensor,
     clamp_min: float = 1e-12,
 ) -> torch.Tensor:
-    """Compute the negative log-likelihood for PPP observations."""
-    intensity_obs = torch.clamp(b0_star * u_hat_obs, min=clamp_min)
-    nll = b0_star * float(m_obs) * integral_u_hat - torch.sum(torch.log(intensity_obs))
+    """Compute the PPP negative log-likelihood using a numerically stable form.
+
+    Theory
+    ------
+    For a Poisson Point Process with intensity λ(x) = b₀·û(x), the NLL is:
+        NLL = ∫λ(x)dx - Σᵢ log(λ(xᵢ))
+
+    After VarPro projects out the optimal b₀* = n_obs / (m_obs · ∫û), the first
+    term becomes constant: b₀* · m_obs · ∫û = n_obs. Expanding the log:
+        NLL = n_obs - Σᵢ[log(b₀*) + log(û(xᵢ))]
+            = n_obs - n_obs·log(n_obs/(m_obs·∫û)) - Σᵢ log(û(xᵢ))
+
+    The D-dependent terms (up to additive constants) are:
+        NLL_reduced = n_obs · log(∫û) - Σᵢ log(û(xᵢ))
+
+    Numerical stability
+    -------------------
+    The naive form [b₀*·m·∫û - Σlog(b₀*·û)] subtracts two large numbers
+    (~n_obs each), causing catastrophic cancellation in float32. The reduced
+    form avoids this by computing only the D-dependent terms directly.
+
+    Returns NLL/m_obs for per-snapshot scaling (consistent with original API).
+    """
+    # Reconstruct n_obs from b0_star. This is data (constant w.r.t. D), so detach.
+    # n_obs = b0_star * m_obs * integral_u_hat
+    n_obs = (b0_star * float(m_obs) * integral_u_hat).detach()
+
+    # Reduced NLL: n_obs · log(∫û) - Σᵢ log(û(xᵢ))
+    # Clamp to avoid log(0)
+    log_integral = torch.log(torch.clamp(integral_u_hat, min=clamp_min))
+    log_u_hat = torch.log(torch.clamp(u_hat_obs, min=clamp_min))
+
+    nll = n_obs * log_integral - torch.sum(log_u_hat)
+
     return nll / float(m_obs)
