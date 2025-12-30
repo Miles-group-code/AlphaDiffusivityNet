@@ -15,8 +15,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import Config
-from data import PPPData, estimate_ddi_scale
+from data import PPPData
 import physics, varpro
+from scale_estimation import estimate_ddi_scale, fit_constant_d
 
 # =============================================================================
 # D PARAMETERIZATION: Softplus + offset
@@ -255,9 +256,12 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
     # Since z is exactly on the aligned grid, find the single index to exclude from residual.
     z_idx = int(torch.argmin(torch.abs(x_res - z_tensor)).item())
 
-    d_init_base = cfg.d_profile.d_init_base
+    x_int = torch.linspace(
+        cfg.physics.domain[0], cfg.physics.domain[1], cfg.grid.n_int, device=device, dtype=dtype
+    ).view(-1, 1)
+
     if cfg.d_profile.use_ddi:
-        d_init_base = estimate_ddi_scale(
+        d_ddi = estimate_ddi_scale(
             mu=cfg.physics.mu,
             z=cfg.physics.sources[0],
             x_particles=ppp.x_particles if ppp is not None else None,
@@ -266,11 +270,32 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
             d_min=cfg.d_profile.ddi_d_min,
             d_max=cfg.d_profile.ddi_d_max,
         )
+    else:
+        d_ddi = 1.0
+
+    if cfg.train.scalar_fit_iters > 0:
+        d_scale = fit_constant_d(
+            x=x_res.view(-1),
+            alpha=cfg.physics.alpha,
+            mu=cfg.physics.mu,
+            sources=cfg.physics.sources,
+            u_true=u_true if u_true is not None else None,
+            ppp=ppp if ppp is not None else None,
+            x_field=x_field.view(-1) if u_true is not None else None,
+            x_int=x_int.view(-1) if ppp is not None else None,
+            d_init=d_ddi,
+            max_iters=cfg.train.scalar_fit_iters,
+            field_loss=cfg.data.field_loss,
+            verbose=verbose,
+        )
+    else:
+        d_scale = d_ddi
 
     if verbose:
-        print(f"[PINN] Initialized ⟨D⟩_base: {d_init_base:.3e}")
+        print(f"[PINN] DDI scale: {d_ddi:.3e}")
+        print(f"[PINN] Scalar fit scale: {d_scale:.3e}")
     
-    d_target = d_init_base
+    d_target = d_scale
 
     d_min = getattr(cfg.arch, "d_min", D_MIN)
     rff_scale = getattr(cfg.arch, "rff_scale", 1.0)
@@ -403,11 +428,6 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
                 T_max=cfg.train.finetune_iters,
                 eta_min=cfg.train.lr_d_fine * 0.1,
             )
-
-    # Integration grid for PPP mode (finer than solver grid for accurate ∫u)
-    x_int = torch.linspace(
-        cfg.physics.domain[0], cfg.physics.domain[1], cfg.grid.n_int, device=device, dtype=dtype
-    ).view(-1, 1)
 
     # Early stopping state
     best_total: Optional[float] = None

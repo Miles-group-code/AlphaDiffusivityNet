@@ -15,8 +15,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import Config
-from data import PPPData, estimate_ddi_scale
+from data import PPPData
 import physics, varpro
+from scale_estimation import estimate_ddi_scale, fit_constant_d
 
 
 # =============================================================================
@@ -99,7 +100,7 @@ def _init_d_profile(
 ) -> torch.Tensor:
     """Build a sinusoidal D initialization on the grid."""
     if scale >= 1.0:
-        raise ValueError("d_init_pert_scale must be < 1 to keep D_init positive.")
+        raise ValueError("pert_scale must be < 1 to keep D_init positive.")
     d_init = base * (1.0 + scale * torch.sin(2.0 * torch.pi * freq * x))
     return d_init
 
@@ -322,10 +323,9 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
         # because we will integrate directly on x_res.
         interp_particles = varpro.precompute_interp_1d(x_res, ppp.x_particles)
 
-    d_init_base = cfg.d_profile.d_init_base
     if cfg.d_profile.use_ddi:
         z0 = cfg.physics.sources[0]
-        d_init_base = estimate_ddi_scale(
+        d_ddi = estimate_ddi_scale(
             mu=cfg.physics.mu,
             z=z0,
             x_particles=ppp.x_particles if ppp is not None else None,
@@ -334,19 +334,41 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
             d_min=cfg.d_profile.ddi_d_min,
             d_max=cfg.d_profile.ddi_d_max,
         )
+    else:
+        d_ddi = 1.0
+
+    if cfg.train.scalar_fit_iters > 0:
+        d_scale = fit_constant_d(
+            x=x_res,
+            alpha=cfg.physics.alpha,
+            mu=cfg.physics.mu,
+            sources=cfg.physics.sources,
+            u_true=u_true if u_true is not None else None,
+            ppp=ppp if ppp is not None else None,
+            x_field=x_field if u_true is not None else None,
+            d_init=d_ddi,
+            max_iters=cfg.train.scalar_fit_iters,
+            field_loss=cfg.data.field_loss,
+            verbose=verbose,
+        )
+    else:
+        d_scale = d_ddi
 
     if verbose:
-        print(f"[DTO] Initialized ⟨D⟩_base: {d_init_base:.3e}")
-    
-    # We use d_init_base directly for regularization target
-    d_target = d_init_base
+        print(f"[DTO] DDI scale: {d_ddi:.3e}")
+        print(f"[DTO] Scalar fit scale: {d_scale:.3e}")
 
-    d_init = _init_d_profile(
-        x_res,
-        base=d_init_base,
-        scale=cfg.d_profile.d_init_pert_scale,
-        freq=cfg.d_profile.d_init_pert_freq,
-    )
+    d_target = d_scale
+
+    if cfg.d_profile.pert_scale > 0.0:
+        d_init = _init_d_profile(
+            x_res,
+            base=d_scale,
+            scale=cfg.d_profile.pert_scale,
+            freq=cfg.d_profile.pert_freq,
+        )
+    else:
+        d_init = d_scale * torch.ones_like(x_res)
 
     d_min = getattr(cfg.arch, "d_min", D_MIN)
     model = DtoAlphaVarPro(

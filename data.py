@@ -2,7 +2,7 @@
 
 Key structures:
 - PPPData: particle positions and number of observations.
-- estimate_ddi_scale(): data-driven diffusion scale initializer.
+- estimate_ddi_scale(): data-driven diffusion scale initializer (re-exported from scale_estimation).
 - sample_ppp_from_field(): PPP sampling from a field intensity.
 - simulate_particles_alpha(): alpha-SDE simulation with births/deaths.
 """
@@ -14,6 +14,17 @@ from typing import Callable
 
 import numpy as np
 import torch
+
+# Re-export estimate_ddi_scale for backward compatibility
+# (it was originally in this module before being moved to scale_estimation.py)
+from scale_estimation import estimate_ddi_scale
+
+__all__ = [
+    "PPPData",
+    "estimate_ddi_scale",
+    "sample_ppp_from_field",
+    "simulate_particles_alpha",
+]
 
 
 @dataclass
@@ -27,42 +38,6 @@ class PPPData:
     def n_obs(self) -> int:
         """Total number of particles across all observations."""
         return int(self.x_particles.numel())
-
-
-def estimate_ddi_scale(
-    mu: float,
-    z: float,
-    x_particles: torch.Tensor | None = None,
-    u_field: torch.Tensor | None = None,
-    x_grid: torch.Tensor | None = None,
-    d_min: float = 1e-4,
-    d_max: float = 10.0,
-) -> float:
-    """Estimate a diffusion scale from particles or field data.
-
-    Data-driven initialization (DDI) uses the mean absolute deviation from the
-    source location to set a plausible D scale: D ~ mu * MAD^2. This provides
-    a stable starting point when D and b0 are only weakly identifiable.
-    """
-    if x_particles is not None and x_particles.numel() > 0:
-        mad = torch.mean(torch.abs(x_particles - z)).item()
-        d_est = mu * (mad ** 2)
-    elif u_field is not None:
-        if x_grid is None:
-            x_grid = torch.linspace(
-                0.0, 1.0, u_field.numel(), device=u_field.device, dtype=u_field.dtype
-            )
-        x_flat = x_grid.view(-1)
-        u_flat = u_field.view(-1)
-        mass = torch.trapezoid(u_flat, x_flat).item()
-        mad = (
-            torch.trapezoid(torch.abs(x_flat - z) * u_flat, x_flat).item()
-            / (mass + 1e-9)
-        )
-        d_est = mu * (mad ** 2)
-    else:
-        d_est = 1.0
-    return float(np.clip(d_est, d_min, d_max))
 
 
 def sample_ppp_from_field(

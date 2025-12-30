@@ -52,9 +52,9 @@ DEFAULT_SETTINGS = {
 
     # Initialization
     "use_ddi": True,
-    "d_init_base": 1.0,
-    "d_init_scale": 0.25,
-    "d_init_freq": 2.0,
+    "scalar_fit_iters": 500,
+    "pert_scale": 0.1,
+    "pert_freq": 2.0,
 
     # Architecture
     "use_rff": True,
@@ -119,10 +119,10 @@ def show_settings(settings: Optional[Dict[str, Any]] = None) -> None:
         "w_jump": "Jump condition (pinn/bilo)",
         "w_resgrad": "Residual gradient (bilo only)",
         "field_loss": "'mse' or 'rle'",
-        "use_ddi": "Data-driven D init",
-        "d_init_base": "Base value for initial D",
-        "d_init_scale": "Init perturbation amplitude",
-        "d_init_freq": "Init perturbation frequency",
+        "use_ddi": "DDI seed for scalar fit",
+        "scalar_fit_iters": "Scalar-fit iterations (constant D)",
+        "pert_scale": "Init perturbation amplitude",
+        "pert_freq": "Init perturbation frequency",
         "use_rff": "Fourier features (pinn/bilo)",
         "rff_scale": "RFF freq multiplier (higher=sharper)",
         "n_res": "Solver grid points",
@@ -612,9 +612,9 @@ def solve(
     smoothness_type: Optional[Literal["h1", "tv"]] = None,
     field_loss: Optional[Literal["mse", "rle"]] = None,
     use_ddi: Optional[bool] = None,
-    d_init_base: Optional[float] = None,
-    d_init_scale: Optional[float] = None,
-    d_init_freq: Optional[float] = None,
+    scalar_fit_iters: Optional[int] = None,
+    pert_scale: Optional[float] = None,
+    pert_freq: Optional[float] = None,
     use_scheduler: Optional[bool] = None,
     use_rff: Optional[bool] = None,
     rff_scale: Optional[float] = None,
@@ -650,10 +650,10 @@ def solve(
         w_resgrad: Residual gradient penalty (BiLO).
         smoothness_type: Smoothness penalty selector ("h1" or "tv").
         field_loss: "mse" or "rle" for field observations.
-        use_ddi: Enable data-driven D scale initialization.
-        d_init_base: Base value for initial D(x).
-        d_init_scale: Amplitude of initial D(x) wiggles.
-        d_init_freq: Frequency of initial D(x) wiggles.
+        use_ddi: Enable DDI seed for scalar fit.
+        scalar_fit_iters: Iterations for constant-D scalar fit.
+        pert_scale: Amplitude of initial D(x) wiggles.
+        pert_freq: Frequency of initial D(x) wiggles.
         use_scheduler: Enable cosine LR scheduling.
         use_rff: Enable random Fourier features in networks.
         rff_scale: RFF frequency multiplier (higher values allow sharper features).
@@ -764,12 +764,12 @@ def solve(
         config.data.field_loss = field_loss
     if use_ddi is not None:
         config.d_profile.use_ddi = use_ddi
-    if d_init_base is not None:
-        config.d_profile.d_init_base = d_init_base
-    if d_init_scale is not None:
-        config.d_profile.d_init_pert_scale = d_init_scale
-    if d_init_freq is not None:
-        config.d_profile.d_init_pert_freq = d_init_freq
+    if scalar_fit_iters is not None:
+        config.train.scalar_fit_iters = scalar_fit_iters
+    if pert_scale is not None:
+        config.d_profile.pert_scale = pert_scale
+    if pert_freq is not None:
+        config.d_profile.pert_freq = pert_freq
     if use_scheduler is not None:
         config.train.use_scheduler = use_scheduler
     if use_rff is not None:

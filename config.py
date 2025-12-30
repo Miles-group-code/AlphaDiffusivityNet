@@ -51,19 +51,32 @@ class PhysicsConfig:
 
 @dataclass
 class DProfileConfig:
-    """Initialization and data-driven scaling settings for D(x)."""
+    """Initialization and data-driven scaling settings for D(x).
 
-    d_init_base: float = 1.0
-    d_init_pert_scale: float = 0.25
-    d_init_pert_freq: float = 2.0
-    use_ddi: bool = True
-    ddi_d_min: float = 1e-4
-    ddi_d_max: float = 10.0
+    The pert_scale and pert_freq parameters control the initial "wiggles" in D(x):
+        D_init(x) = d_scale * (1 + pert_scale * sin(2π * pert_freq * x))
+
+    These wiggles serve different purposes for different methods:
+    - BiLO/PINN: Needed during pretrain so the LocalOperator learns ∇D sensitivity.
+      Without wiggles, the operator may become "blind" to D variations.
+    - DTO: Does NOT need wiggles since there's no neural operator to train. Consider
+      setting pert_scale=0 for DTO to start from a constant initialization.
+
+    NOTE: d_init_base was removed in favor of automatic scale estimation via
+    scale_estimation.fit_constant_d(). The scalar fit finds the optimal constant D
+    directly from the data, eliminating the need for manual scale tuning.
+    """
+
+    pert_scale: float = 0.1  # Relative amplitude of initial wiggles
+    pert_freq: float = 2.0   # Number of oscillations across the domain
+    use_ddi: bool = True     # Use DDI as starting point for scalar fit
+    ddi_d_min: float = 1e-4  # Lower clamp for DDI estimate
+    ddi_d_max: float = 10.0  # Upper clamp for DDI estimate
 
     def validate(self) -> None:
         """Validate diffusion profile settings."""
-        if self.d_init_pert_scale >= 1.0:
-            raise ValueError("d_init_pert_scale must be < 1 to keep D_init positive.")
+        if self.pert_scale >= 1.0:
+            raise ValueError("pert_scale must be < 1 to keep D_init positive.")
         if self.ddi_d_min > self.ddi_d_max:
             raise ValueError("ddi_d_min must be <= ddi_d_max.")
 
@@ -102,6 +115,7 @@ class GridConfig:
 class TrainConfig:
     """Optimizer and training loop parameters."""
 
+    scalar_fit_iters: int = 500
     pretrain_iters: int = 1000
     finetune_iters: int = 10000
     lr_d_pre: float = 1e-4
@@ -119,6 +133,8 @@ class TrainConfig:
 
     def validate(self) -> None:
         """Validate training loop settings."""
+        if self.scalar_fit_iters < 0:
+            raise ValueError("scalar_fit_iters must be >= 0.")
         if self.optimizer not in {"adam", "lbfgs"}:
             raise ValueError("optimizer must be 'adam' or 'lbfgs'.")
         if self.lbfgs_max_iter <= 0:
@@ -252,6 +268,16 @@ class Config:
     @classmethod
     def from_nested_dict(cls, data: Dict[str, Any]) -> "Config":
         """Build a Config from nested configuration sections."""
+        d_profile_data = dict(data.get("d_profile", {}))
+        d_profile_aliases = {
+            "d_init_pert_scale": "pert_scale",
+            "d_init_pert_freq": "pert_freq",
+        }
+        for old_key, new_key in d_profile_aliases.items():
+            if old_key in d_profile_data and new_key not in d_profile_data:
+                d_profile_data[new_key] = d_profile_data.pop(old_key)
+        d_profile_data.pop("d_init_base", None)
+
         reg_data = dict(data.get("reg", {}))
         reg_aliases = {
             "w_jump": "w_jump",
@@ -270,7 +296,7 @@ class Config:
                 reg_data[new_key] = reg_data.pop(old_key)
         return cls(
             physics=PhysicsConfig(**data.get("physics", {})),
-            d_profile=DProfileConfig(**data.get("d_profile", {})),
+            d_profile=DProfileConfig(**d_profile_data),
             data=DataConfig(**data.get("data", {})),
             grid=GridConfig(**data.get("grid", {})),
             train=TrainConfig(**data.get("train", {})),

@@ -218,6 +218,235 @@ def fdm_solve_alpha_dirichlet(
     return u
 
 
+def _thomas_solve_torch(
+    lower: torch.Tensor,
+    diag: torch.Tensor,
+    upper: torch.Tensor,
+    rhs: torch.Tensor,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """Solve a tridiagonal system using the Thomas algorithm (torch version).
+
+    This is the differentiable version of _thomas_solve for use in scalar fit
+    and other gradient-based optimization. Uses list-based accumulation instead
+    of in-place tensor operations to preserve autograd gradients.
+
+    NOTE: In-place operations like `tensor[i] = value` break autograd because
+    they overwrite the computation graph. By appending to lists and stacking
+    at the end, we create a proper differentiable computation graph.
+
+    Args:
+        lower: Sub-diagonal elements (length n-1).
+        diag: Diagonal elements (length n).
+        upper: Super-diagonal elements (length n-1).
+        rhs: Right-hand side vector (length n).
+        eps: Small constant for numerical stability.
+
+    Returns:
+        Solution vector x such that Ax = rhs.
+    """
+    n = diag.shape[0]
+    if n == 0:
+        return torch.empty(0, device=diag.device, dtype=diag.dtype)
+    if n == 1:
+        return rhs / (diag + eps)
+
+    # Forward elimination: compute modified coefficients
+    c_prime = []
+    d_prime = []
+
+    den0 = diag[0]
+    c_prime.append(upper[0] / (den0 + eps))
+    d_prime.append(rhs[0] / (den0 + eps))
+
+    for i in range(1, n - 1):
+        den = diag[i] - lower[i - 1] * c_prime[i - 1]
+        c_prime.append(upper[i] / (den + eps))
+        d_prime.append((rhs[i] - lower[i - 1] * d_prime[i - 1]) / (den + eps))
+
+    den_last = diag[n - 1] - lower[n - 2] * c_prime[n - 2]
+    d_prime.append((rhs[n - 1] - lower[n - 2] * d_prime[n - 2]) / (den_last + eps))
+
+    # Back substitution: solve for x from the end
+    x_list = [None] * n
+    x_list[n - 1] = d_prime[n - 1]
+    for i in range(n - 2, -1, -1):
+        x_list[i] = d_prime[i] - c_prime[i] * x_list[i + 1]
+    return torch.stack(x_list, dim=0)
+
+
+def _build_tridiag_alpha_torch(
+    d: torch.Tensor,
+    alpha: float,
+    mu: float,
+    x: torch.Tensor,
+    eps: float = 1e-12,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Assemble tridiagonal coefficients for the alpha-PDE (torch version).
+
+    This is the differentiable version of _build_fdm_tridiag. Uses vectorized
+    operations throughout for efficient gradient computation.
+
+    The flux form of the PDE is: div(D^alpha * grad(D^(1-alpha) * u)) - mu*u = -delta(z)
+
+    We use the harmonic mean of D^alpha at cell interfaces for flux continuity
+    when D is discontinuous (same as the NumPy version).
+
+    Args:
+        d: Diffusion values on the grid (length N).
+        alpha: Stochastic convention in [0, 1].
+        mu: Death rate.
+        x: Grid locations (length N).
+        eps: Small constant to avoid division by zero.
+
+    Returns:
+        (lower, diag, upper) arrays for the interior system (length N-2).
+    """
+    n = x.numel()
+    if n < 3:
+        raise ValueError("Need at least 3 grid points for Dirichlet problem.")
+
+    # Step sizes between grid points
+    h = x[1:] - x[:-1]
+
+    # g = D^(1-alpha) appears in the flux form transformation q = g*u
+    g = d ** (1.0 - alpha)
+
+    # Harmonic mean of D^alpha at cell interfaces for flux continuity
+    d_alpha_left = d[:-1] ** alpha
+    d_alpha_right = d[1:] ** alpha
+    a_half = 2.0 * d_alpha_left * d_alpha_right / (d_alpha_left + d_alpha_right + eps) / h
+
+    # Voronoi volumes for interior nodes
+    vol = 0.5 * (h[:-1] + h[1:])
+
+    # Vectorized assembly of tridiagonal coefficients
+    # These formulas come from finite-volume discretization of the flux-form PDE
+    diag = -((a_half[1:] + a_half[:-1]) * g[1:-1] / vol) - mu
+    lower_full = (a_half[:-1] * g[:-2]) / vol
+    upper_full = (a_half[1:] * g[2:]) / vol
+
+    # Trim to get proper sub/super-diagonal dimensions
+    lower = lower_full[1:]
+    upper = upper_full[:-1]
+    return lower, diag, upper
+
+
+def _build_delta_rhs_torch(
+    x: torch.Tensor,
+    sources: Iterable[float],
+    b0: float,
+) -> torch.Tensor:
+    """Construct the interior RHS for point sources (torch version).
+
+    Uses the same "p2h-s1 hat delta" discretization as the NumPy version:
+    if the source falls between grid points, its weight is distributed to
+    the two nearest nodes using linear (hat function) interpolation.
+
+    NOTE: The RHS construction is not differentiable w.r.t. source locations
+    since we use discrete indexing. This is fine because sources are fixed.
+
+    Args:
+        x: Grid locations (length N).
+        sources: Source locations (assumed strictly inside the domain).
+        b0: Source amplitude.
+
+    Returns:
+        RHS vector for interior nodes (length N-2).
+    """
+    n = x.numel()
+    if n < 3:
+        raise ValueError("Need at least 3 grid points for Dirichlet problem.")
+
+    h = x[1:] - x[:-1]
+    vol = 0.5 * (h[:-1] + h[1:])  # Voronoi volumes for interior nodes
+    rhs = torch.zeros(n - 2, device=x.device, dtype=x.dtype)
+
+    b0_value = float(b0)
+    for z in sources:
+        # Find the interval containing z: x[idx_left] <= z < x[idx_right]
+        z_t = torch.tensor(float(z), device=x.device, dtype=x.dtype)
+        idx_right = int(torch.searchsorted(x, z_t, right=True).item())
+        idx_left = idx_right - 1
+
+        # Clamp to valid range
+        if idx_left < 0:
+            idx_left = 0
+        if idx_right >= n:
+            idx_right = n - 1
+
+        x_left = x[idx_left]
+        x_right = x[idx_right]
+        h_interval = x_right - x_left
+
+        if abs(float(h_interval.item())) < 1e-12:
+            # z coincides with a grid node
+            if 1 <= idx_left <= n - 2:
+                rhs[idx_left - 1] -= b0_value / vol[idx_left - 1]
+            continue
+
+        # Distribute source using hat function weights
+        w_left = 1.0 - torch.abs(x_left - z_t) / h_interval
+        w_right = 1.0 - torch.abs(x_right - z_t) / h_interval
+
+        if 1 <= idx_left <= n - 2:
+            rhs[idx_left - 1] -= b0_value * w_left / vol[idx_left - 1]
+        if 1 <= idx_right <= n - 2:
+            rhs[idx_right - 1] -= b0_value * w_right / vol[idx_right - 1]
+    return rhs
+
+
+def fdm_solve_alpha_dirichlet_torch(
+    d: torch.Tensor,
+    alpha: float,
+    mu: float,
+    x: torch.Tensor,
+    b0: float,
+    sources: Iterable[float],
+) -> torch.Tensor:
+    """Differentiable torch FDM solve for the steady 1D alpha-PDE.
+
+    Solves: div(D^alpha * grad(D^(1-alpha) * u)) - mu*u = -b0*delta(z)
+    with homogeneous Dirichlet boundary conditions u(x_min) = u(x_max) = 0.
+
+    This is the core function used by scalar fit (scale_estimation.fit_constant_d)
+    to find the optimal constant D by gradient descent. The output u supports
+    backpropagation to the input d via the differentiable Thomas algorithm.
+
+    Uses the same flux-form discretization as fdm_solve_alpha_dirichlet (NumPy),
+    but with list-based accumulation to preserve autograd gradients.
+
+    Args:
+        d: Diffusion values on the grid (length N), requires_grad=True for optimization.
+        alpha: Stochastic convention in [0, 1].
+        mu: Death rate.
+        x: Grid locations (length N).
+        b0: Source amplitude.
+        sources: Source locations (assumed strictly inside the domain).
+
+    Returns:
+        u(x) on the grid with boundary values set to zero (length N).
+    """
+    d = d.view(-1)
+    x = x.view(-1)
+    if d.numel() != x.numel():
+        raise ValueError("d and x must have the same length.")
+    if torch.any(d <= 0).item():
+        raise ValueError("D must be strictly positive.")
+
+    # Build the tridiagonal system Au = rhs
+    lower, diag, upper = _build_tridiag_alpha_torch(d, alpha, mu, x)
+    rhs = _build_delta_rhs_torch(x, sources, b0)
+
+    # Solve via Thomas algorithm (differentiable)
+    u_int = _thomas_solve_torch(lower, diag, upper, rhs)
+
+    # Reconstruct full solution with boundary conditions
+    u = torch.zeros_like(x)
+    u[1:-1] = u_int
+    return u
+
+
 def h1_smoothness_d(x: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
     """Compute H1 seminorm regularization using autograd gradients."""
     if not x.requires_grad:

@@ -74,7 +74,7 @@ The physics and domain settings are fully configurable via the `Problem` interfa
     *   **`h1`**: Penalizes the gradient of $\log D$ ($\int (\nabla \log D)^2$).
     *   **`tv`**: Total Variation, penalizes the L1 norm of the gradient ($\int |\nabla \log D|$). Good for piecewise-constant profiles.
 *   **Scale Anchor**:
-    *   **`wreg_scale`**: Penalizes deviation of the mean log-diffusivity from a prior (usually derived via DDI), preventing amplitude-diffusivity ambiguity.
+    *   **`wreg_scale`**: Penalizes deviation of the mean log-diffusivity from a prior (derived via scalar fit seeded by DDI), preventing amplitude-diffusivity ambiguity.
 
 ### Variable Projection (VarPro)
 All methods use **Variable Projection** to handle the unknown source amplitude $b_0$. Instead of optimizing $b_0$ via gradient descent, we compute its optimal value $b_0^*$ in closed form at every step:
@@ -82,8 +82,8 @@ All methods use **Variable Projection** to handle the unknown source amplitude $
 *   For **RLE**: Weighted Least Squares solution.
 *   For **Particles**: $b_0^* = \frac{N_{particles}}{M_{SNAPSHOTS} \int \hat{u}_{unit} dx}$
 
-### Initialization (DDI)
-**Data-Driven Initialization (DDI)** estimates the scalar scale of $D$ directly from the observed data spread (mean absolute deviation) before training starts. This prevents the solver from starting in a "dead zone" where gradients are vanishingly small.
+### Scale Estimation (DDI + Scalar Fit)
+**DDI** provides a fast heuristic scale estimate from data spread, then a **constant-D scalar fit** refines the scale by minimizing the actual data loss via a differentiable FDM solve. The resulting scale anchors regularization and stabilizes training.
 
 ### Optimizer Selection
 You can switch the finetune optimizer for any method via `solve(..., optimizer=...)`:
@@ -138,7 +138,8 @@ from interface import get_default_settings, solve
 settings = get_default_settings()
 settings["wreg_smooth"] = 1e-4
 settings["lr_d"] = 2e-3
-settings["use_ddi"] = True      # Enable Data-Driven Initialization
+settings["use_ddi"] = True      # Seed scalar fit with DDI
+settings["scalar_fit_iters"] = 500
 
 solution = solve(problem, method="pinn", **settings)
 ```
@@ -154,7 +155,8 @@ solution = solve(problem, method="pinn", **settings)
 *   `config.py`: Configuration dataclasses and validation.
 *   `physics.py`: Core physics definitions, finite-difference solvers, and regularization terms. Shared across all methods.
 *   `varpro.py`: Variable projection logic for amplitude estimation ($b_0$).
-*   `data.py`: Synthetic data generation (fields, particle simulations) and DDI.
+*   `data.py`: Synthetic data generation (fields, particle simulations).
+*   `scale_estimation.py`: DDI + scalar-fit scale estimation.
 *   **Methods**:
     *   `method_dto.py`: Discretize-Then-Optimize implementation.
     *   `method_pinn.py`: PINN implementation.
