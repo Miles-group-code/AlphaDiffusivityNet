@@ -224,19 +224,51 @@ def _calc_data_loss(
     field_loss: str,
     d_target: float,
     smoothness_type: str,
+    b0_fixed_value: Optional[float] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute data and regularization terms for the upper-level objective."""
+    """Compute data and regularization terms for the upper-level objective.
+
+    Args:
+        d_net: DNet module for D(x) prediction.
+        local_op: LocalOperator module for u(x) prediction given D.
+        x_res: Solver grid for regularization computation.
+        x_int: Integration grid for PPP mode.
+        x_field: Observation grid for field mode.
+        z_tensor: Source location tensor.
+        mode: "field" or "particles".
+        u_true: Observed field data (field mode only).
+        ppp: PPP particle data (particles mode only).
+        field_loss: Loss type for field mode ("mse" or "rle").
+        d_target: Target scale for scale anchor regularization.
+        smoothness_type: "h1" or "tv" for smoothness regularization.
+        b0_fixed_value: If set, use this fixed b0 instead of VarPro projection.
+
+    Returns:
+        Tuple of (b0_star, data_loss, reg_smooth, reg_scale).
+    """
     d_int = d_net(x_int)
     u_hat_int, _ = local_op(x_int, d_int, z_tensor)
 
     if mode == "field":
         d_field = d_net(x_field)
         u_hat_field, _ = local_op(x_field, d_field, z_tensor)
-        b0_star = varpro.project_b0_field(u_hat_field, u_true, field_loss=field_loss)
+        # Get b0 via VarPro projection (or use fixed value if set)
+        b0_star = varpro.get_b0_field(
+            u_hat_field,
+            u_true,
+            field_loss=field_loss,
+            b0_fixed_value=b0_fixed_value,
+        )
         data_loss = varpro.field_data_loss(u_hat_field, u_true, b0_star, field_loss=field_loss)
     else:
         integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
-        b0_star = varpro.project_b0_ppp(ppp.n_obs, ppp.m_obs, integral_unit)
+        # Get b0 via VarPro projection (or use fixed value if set)
+        b0_star = varpro.get_b0_ppp(
+            ppp.n_obs,
+            ppp.m_obs,
+            integral_unit,
+            b0_fixed_value=b0_fixed_value,
+        )
         d_data = d_net(ppp.x_particles)
         u_hat_data, _ = local_op(ppp.x_particles, d_data, z_tensor)
         data_loss = varpro.ppp_nll(u_hat_data.view(-1), b0_star, ppp.m_obs, integral_unit)
@@ -247,7 +279,7 @@ def _calc_data_loss(
         reg_smooth = physics.tv_smoothness_d(x_reg, d_reg)
     else:
         reg_smooth = physics.h1_smoothness_d(x_reg, d_reg)
-    
+
     reg_scale = physics.scale_anchor(d_reg, d_target)
     return b0_star, data_loss, reg_smooth, reg_scale
 
@@ -417,13 +449,13 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
     rff_scale = getattr(cfg.arch, "rff_scale", 1.0)
     d_net = DNet(
         width=cfg.arch.rff_width,
-        use_rff=cfg.arch.use_rff_d,
+        use_rff=cfg.arch.use_rff,
         rff_scale=rff_scale,
         d_min=d_min,
     ).to(device=device, dtype=dtype)
     local_op = LocalOperator(
         width=cfg.arch.rff_width,
-        use_rff=cfg.arch.use_rff_geom,
+        use_rff=cfg.arch.use_rff,
         rff_scale=rff_scale,
     ).to(device=device, dtype=dtype)
 
@@ -612,6 +644,13 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
     patience = 0
 
     # =========================================================================
+    # FIXED B0 SETTING
+    # =========================================================================
+    # If b0_fixed_value is set, use it instead of VarPro projection.
+    # This is useful when the source amplitude is known a priori.
+    b0_fixed_value = cfg.data.b0_fixed_value
+
+    # =========================================================================
     # MAIN BILEVEL TRAINING LOOP
     # =========================================================================
     for step in range(cfg.train.finetune_iters + 1):
@@ -636,6 +675,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
             cfg.data.field_loss,
             d_target,
             cfg.reg.smoothness_type,
+            b0_fixed_value=b0_fixed_value,
         )
         upper_loss = (
             data_loss + cfg.reg.wreg_smooth * reg_smooth + cfg.reg.wreg_scale * reg_scale
@@ -775,6 +815,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                         d_net, local_op, x_res, x_int, x_field, z_tensor,
                         data_bundle.mode, u_true, ppp, cfg.data.field_loss,
                         d_target, cfg.reg.smoothness_type,
+                        b0_fixed_value=b0_fixed_value,
                     )
                     upper_loss = (
                         data_loss
@@ -821,13 +862,23 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
         if data_bundle.mode == "field":
             d_field = d_net(x_field)
             u_hat_field, _ = local_op(x_field, d_field, z_tensor)
-            b0_star = varpro.project_b0_field(
-                u_hat_field, u_true, field_loss=cfg.data.field_loss
+            # Get b0 via VarPro projection (or use fixed value if set)
+            b0_star = varpro.get_b0_field(
+                u_hat_field,
+                u_true,
+                field_loss=cfg.data.field_loss,
+                b0_fixed_value=b0_fixed_value,
             )
         else:
             u_hat_int, _ = local_op(x_int, d_net(x_int), z_tensor)
             integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
-            b0_star = varpro.project_b0_ppp(ppp.n_obs, ppp.m_obs, integral_unit)
+            # Get b0 via VarPro projection (or use fixed value if set)
+            b0_star = varpro.get_b0_ppp(
+                ppp.n_obs,
+                ppp.m_obs,
+                integral_unit,
+                b0_fixed_value=b0_fixed_value,
+            )
         u_pred = b0_star * u_hat_res
         d_pred = d_final
 

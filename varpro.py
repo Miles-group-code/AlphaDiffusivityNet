@@ -4,12 +4,18 @@ Includes differentiable interpolation and PPP likelihood helpers used across
 methods, plus optional precomputation helpers for fixed interpolation grids.
 
 Key entry points: interpolate_1d, project_b0_field, field_data_loss,
-project_b0_ppp, ppp_nll.
+project_b0_ppp, ppp_nll, get_b0_field, get_b0_ppp.
+
+Fixed b0 mode:
+    When the source amplitude b0 is known a priori (e.g., from experimental
+    calibration), you can bypass VarPro projection by passing b0_fixed_value
+    to get_b0_field() or get_b0_ppp(). This eliminates the amplitude-diffusivity
+    ambiguity and can improve inference when b0 is well-characterized.
 """
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Optional
 
 import torch
 
@@ -205,3 +211,115 @@ def ppp_nll(
     nll = n_obs * log_integral - torch.sum(log_u_hat)
 
     return nll / float(m_obs)
+
+
+def get_b0_field(
+    u_hat: torch.Tensor,
+    u_true: torch.Tensor,
+    field_loss: Literal["mse", "rle"] = "mse",
+    b0_fixed_value: Optional[float] = None,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Get b0 for field data, either via VarPro projection or fixed value.
+
+    This is the recommended entry point for obtaining b0 in field mode. It
+    handles both the standard VarPro projection case and the fixed b0 case
+    with a unified interface.
+
+    Args:
+        u_hat: Predicted unit-source response (shape [...]).
+        u_true: Observed field data (same shape as u_hat).
+        field_loss: Loss type for VarPro projection ("mse" or "rle").
+            Ignored when b0_fixed_value is set.
+        b0_fixed_value: If set to a positive value, use this fixed b0 instead
+            of VarPro projection. If None (default), compute b0 via VarPro.
+        device: Torch device for the fixed b0 tensor. If None, uses u_hat's device.
+        dtype: Torch dtype for the fixed b0 tensor. If None, uses u_hat's dtype.
+        eps: Small constant for numerical stability in VarPro projection.
+
+    Returns:
+        b0_star: Scalar tensor containing the optimal (or fixed) b0 value.
+            When b0_fixed_value is None, gradients flow through the projection.
+            When b0_fixed_value is set, the tensor is constant (no gradient flow).
+
+    Raises:
+        ValueError: If b0_fixed_value is provided but non-positive.
+
+    Example:
+        # Standard VarPro projection
+        b0_star = get_b0_field(u_hat, u_true, field_loss="mse")
+
+        # Fixed b0 (known from experiment)
+        b0_star = get_b0_field(u_hat, u_true, b0_fixed_value=100.0)
+    """
+    if b0_fixed_value is not None:
+        # Validate fixed value
+        if b0_fixed_value <= 0:
+            raise ValueError(f"b0_fixed_value must be positive, got {b0_fixed_value}")
+
+        # Create fixed b0 tensor (constant - no gradient flow through b0)
+        _device = device if device is not None else u_hat.device
+        _dtype = dtype if dtype is not None else u_hat.dtype
+        return torch.tensor(b0_fixed_value, device=_device, dtype=_dtype)
+    else:
+        # Standard VarPro projection
+        return project_b0_field(u_hat, u_true, field_loss=field_loss, eps=eps)
+
+
+def get_b0_ppp(
+    n_obs: int,
+    m_obs: int,
+    integral_u_hat: torch.Tensor,
+    b0_fixed_value: Optional[float] = None,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+    clamp_min: float = 1e-12,
+) -> torch.Tensor:
+    """Get b0 for PPP data, either via VarPro projection or fixed value.
+
+    This is the recommended entry point for obtaining b0 in particles mode. It
+    handles both the standard VarPro projection case and the fixed b0 case
+    with a unified interface.
+
+    Args:
+        n_obs: Total number of observed particles across all snapshots.
+        m_obs: Number of snapshots.
+        integral_u_hat: Integral of unit-source response (∫u_hat dx).
+        b0_fixed_value: If set to a positive value, use this fixed b0 instead
+            of VarPro projection. If None (default), compute b0 via VarPro.
+        device: Torch device for the fixed b0 tensor. If None, uses
+            integral_u_hat's device.
+        dtype: Torch dtype for the fixed b0 tensor. If None, uses
+            integral_u_hat's dtype.
+        clamp_min: Minimum value for clamping integral_u_hat to avoid division
+            by zero in VarPro projection.
+
+    Returns:
+        b0_star: Scalar tensor containing the optimal (or fixed) b0 value.
+            When b0_fixed_value is None, gradients flow through the projection.
+            When b0_fixed_value is set, the tensor is constant (no gradient flow).
+
+    Raises:
+        ValueError: If b0_fixed_value is provided but non-positive.
+
+    Example:
+        # Standard VarPro projection
+        b0_star = get_b0_ppp(n_obs, m_obs, integral_u_hat)
+
+        # Fixed b0 (known from experiment)
+        b0_star = get_b0_ppp(n_obs, m_obs, integral_u_hat, b0_fixed_value=100.0)
+    """
+    if b0_fixed_value is not None:
+        # Validate fixed value
+        if b0_fixed_value <= 0:
+            raise ValueError(f"b0_fixed_value must be positive, got {b0_fixed_value}")
+
+        # Create fixed b0 tensor (constant - no gradient flow through b0)
+        _device = device if device is not None else integral_u_hat.device
+        _dtype = dtype if dtype is not None else integral_u_hat.dtype
+        return torch.tensor(b0_fixed_value, device=_device, dtype=_dtype)
+    else:
+        # Standard VarPro projection
+        return project_b0_ppp(n_obs, m_obs, integral_u_hat, clamp_min=clamp_min)

@@ -8,13 +8,17 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Dict, Optional
+from typing import Dict, Optional, TYPE_CHECKING
 
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
 
 import physics
+import varpro
+
+if TYPE_CHECKING:
+    from interface import Problem, Solution
 
 
 def _compute_metrics_core(
@@ -130,6 +134,142 @@ def compute_solution_metrics(
     if "integral_u" in base:
         metrics["integral_u"] = base["integral_u"]
     return metrics
+
+
+def compute_loss_comparison(
+    solution: "Solution",
+    problem: "Problem",
+    field_loss: str = "rle",
+    verbose: bool = True,
+) -> Dict[str, float]:
+    """Compare data loss for D_pred vs D_true.
+
+    Computes the data loss (field MSE/RLE or PPP NLL) using:
+    1. The fitted D_pred and b0_star from the solution
+    2. The ground-truth D_true with optimal b0 projection
+
+    This helps assess how much of the remaining loss is due to:
+    - Model error (D_pred != D_true)
+    - Irreducible noise (even D_true has nonzero loss for particles)
+
+    Args:
+        solution: Fitted Solution object with D_pred, b0_star, etc.
+        problem: Problem with D_true and observation data.
+        field_loss: Loss type for field mode ("mse" or "rle").
+        verbose: Print comparison summary.
+
+    Returns:
+        Dictionary with loss_pred, loss_true, and loss_ratio.
+    """
+    if problem.d_true is None:
+        raise ValueError("Problem has no d_true for comparison.")
+
+    # Get grids
+    x_res = solution.x_res.detach().cpu().numpy().reshape(-1)
+    x_obs = problem.x_grid.detach().cpu().numpy().reshape(-1)
+
+    # Get D arrays
+    d_pred = solution._to_numpy(solution.d_pred).reshape(-1)
+    d_true = np.asarray(problem.d_true).reshape(-1)
+
+    # Interpolate D_true to solver grid if needed
+    if d_true.shape != d_pred.shape or not np.allclose(x_obs, x_res):
+        d_true_res = np.interp(x_res, x_obs, d_true)
+    else:
+        d_true_res = d_true
+
+    # Solve FDM with D_pred (unit source)
+    u_hat_pred = physics.fdm_solve_alpha_dirichlet(
+        d_pred, problem.alpha, problem.mu, x_res, 1.0, (problem.source_location,)
+    )
+
+    # Solve FDM with D_true (unit source)
+    u_hat_true = physics.fdm_solve_alpha_dirichlet(
+        d_true_res, problem.alpha, problem.mu, x_res, 1.0, (problem.source_location,)
+    )
+
+    # Convert to torch for VarPro
+    x_res_t = torch.tensor(x_res, dtype=torch.float64)
+    u_hat_pred_t = torch.tensor(u_hat_pred, dtype=torch.float64)
+    u_hat_true_t = torch.tensor(u_hat_true, dtype=torch.float64)
+
+    if problem.mode == "field":
+        # Field mode: use observation field
+        u_obs = problem.u_field.detach().cpu().view(-1)
+        x_field = problem.x_grid.detach().cpu().view(-1)
+
+        # Interpolate u_hat to observation grid if needed
+        if x_field.shape != x_res_t.shape or not torch.allclose(x_field, x_res_t):
+            u_hat_pred_obs = varpro.interpolate_1d(u_hat_pred_t, x_res_t, x_field)
+            u_hat_true_obs = varpro.interpolate_1d(u_hat_true_t, x_res_t, x_field)
+        else:
+            u_hat_pred_obs = u_hat_pred_t
+            u_hat_true_obs = u_hat_true_t
+
+        # Project b0 and compute loss for D_pred
+        b0_pred = varpro.project_b0_field(u_hat_pred_obs, u_obs, field_loss=field_loss)
+        loss_pred = varpro.field_data_loss(u_hat_pred_obs, u_obs, b0_pred, field_loss=field_loss)
+
+        # Project b0 and compute loss for D_true
+        b0_true = varpro.project_b0_field(u_hat_true_obs, u_obs, field_loss=field_loss)
+        loss_true = varpro.field_data_loss(u_hat_true_obs, u_obs, b0_true, field_loss=field_loss)
+
+        loss_pred_val = float(loss_pred.item())
+        loss_true_val = float(loss_true.item())
+        b0_pred_val = float(b0_pred.item())
+        b0_true_val = float(b0_true.item())
+
+    else:
+        # Particles mode: use PPP data
+        ppp = problem.particles
+        x_particles = ppp.x_particles.detach().cpu().view(-1).double()
+
+        # Compute integral on solver grid
+        integral_pred = torch.trapezoid(u_hat_pred_t, x_res_t)
+        integral_true = torch.trapezoid(u_hat_true_t, x_res_t)
+
+        # Interpolate to particle locations
+        u_at_pts_pred = varpro.interpolate_1d(u_hat_pred_t, x_res_t, x_particles)
+        u_at_pts_true = varpro.interpolate_1d(u_hat_true_t, x_res_t, x_particles)
+
+        # Project b0 and compute PPP NLL for D_pred
+        b0_pred = varpro.project_b0_ppp(ppp.n_obs, ppp.m_obs, integral_pred)
+        loss_pred = varpro.ppp_nll(u_at_pts_pred, b0_pred, ppp.m_obs, integral_pred)
+
+        # Project b0 and compute PPP NLL for D_true
+        b0_true = varpro.project_b0_ppp(ppp.n_obs, ppp.m_obs, integral_true)
+        loss_true = varpro.ppp_nll(u_at_pts_true, b0_true, ppp.m_obs, integral_true)
+
+        loss_pred_val = float(loss_pred.item())
+        loss_true_val = float(loss_true.item())
+        b0_pred_val = float(b0_pred.item())
+        b0_true_val = float(b0_true.item())
+
+    # Compute ratio (how much worse is D_pred vs D_true)
+    eps = 1e-12
+    if abs(loss_true_val) > eps:
+        loss_ratio = loss_pred_val / loss_true_val
+    else:
+        loss_ratio = float("inf") if loss_pred_val > eps else 1.0
+
+    result = {
+        "loss_pred": loss_pred_val,
+        "loss_true": loss_true_val,
+        "loss_ratio": loss_ratio,
+        "b0_pred": b0_pred_val,
+        "b0_true": b0_true_val,
+    }
+
+    if verbose:
+        mode_str = f"field ({field_loss})" if problem.mode == "field" else "PPP NLL"
+        print(f"\n[Loss Comparison] Mode: {mode_str}")
+        print(f"  D_pred loss: {loss_pred_val:.6e}  (b0* = {b0_pred_val:.2f})")
+        print(f"  D_true loss: {loss_true_val:.6e}  (b0* = {b0_true_val:.2f})")
+        print(f"  Ratio (pred/true): {loss_ratio:.3f}x")
+        if problem.b_true is not None:
+            print(f"  (True b0 = {problem.b_true:.2f})")
+
+    return result
 
 
 def compute_field_metrics(

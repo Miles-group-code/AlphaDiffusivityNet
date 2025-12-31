@@ -50,6 +50,9 @@ DEFAULT_SETTINGS = {
     # Data
     "field_loss": "rle",
 
+    # Source amplitude (b0) estimation
+    "b0_fixed_value": None,  # If set, use fixed b0 instead of VarPro
+
     # Initialization
     "use_ddi": True,
     "scalar_fit_iters": 500,
@@ -119,6 +122,7 @@ def show_settings(settings: Optional[Dict[str, Any]] = None) -> None:
         "w_jump": "Jump condition (pinn/bilo)",
         "w_resgrad": "Residual gradient (bilo only)",
         "field_loss": "'mse' or 'rle'",
+        "b0_fixed_value": "Fixed b0 (None=VarPro)",
         "use_ddi": "DDI seed for scalar fit",
         "scalar_fit_iters": "Scalar-fit iterations (constant D)",
         "pert_scale": "Init perturbation amplitude",
@@ -611,6 +615,7 @@ def solve(
     w_resgrad: Optional[float] = None,
     smoothness_type: Optional[Literal["h1", "tv"]] = None,
     field_loss: Optional[Literal["mse", "rle"]] = None,
+    b0_fixed_value: Optional[float] = None,
     use_ddi: Optional[bool] = None,
     scalar_fit_iters: Optional[int] = None,
     pert_scale: Optional[float] = None,
@@ -650,6 +655,8 @@ def solve(
         w_resgrad: Residual gradient penalty (BiLO).
         smoothness_type: Smoothness penalty selector ("h1" or "tv").
         field_loss: "mse" or "rle" for field observations.
+        b0_fixed_value: If set to a positive value, use this fixed source amplitude
+            instead of VarPro projection. Useful when b0 is known a priori.
         use_ddi: Enable DDI seed for scalar fit.
         scalar_fit_iters: Iterations for constant-D scalar fit.
         pert_scale: Amplitude of initial D(x) wiggles.
@@ -762,6 +769,8 @@ def solve(
         config.reg.smoothness_type = smoothness_type
     if field_loss is not None:
         config.data.field_loss = field_loss
+    if b0_fixed_value is not None:
+        config.data.b0_fixed_value = b0_fixed_value
     if use_ddi is not None:
         config.d_profile.use_ddi = use_ddi
     if scalar_fit_iters is not None:
@@ -773,8 +782,7 @@ def solve(
     if use_scheduler is not None:
         config.train.use_scheduler = use_scheduler
     if use_rff is not None:
-        config.arch.use_rff_geom = use_rff
-        config.arch.use_rff_d = use_rff
+        config.arch.use_rff = use_rff
     if rff_scale is not None:
         config.arch.rff_scale = rff_scale
     if early_burnin is not None:

@@ -83,11 +83,24 @@ class DProfileConfig:
 
 @dataclass
 class DataConfig:
-    """Data-generation configuration for field or particle modes."""
+    """Data-generation configuration for field or particle modes.
+
+    Attributes:
+        mode: Observation type - "field" for dense u(x) measurements or "particles"
+            for Poisson Point Process snapshots.
+        field_loss: Loss function for field data - "mse" or "rle" (relative log error).
+        m_obs: Number of particle snapshots (particles mode only).
+        b0_fixed_value: If set to a positive value, use this fixed source amplitude
+            instead of estimating via VarPro projection. If None (default), b0 is
+            estimated via Variable Projection at each iteration. This is useful when
+            the source amplitude is known a priori (e.g., from experimental
+            calibration), eliminating the amplitude-diffusivity ambiguity.
+    """
 
     mode: str = "field"  # "field" or "particles"
     field_loss: str = "rle"  # "mse" or "rle"
     m_obs: int = 250
+    b0_fixed_value: float | None = None  # If set, use fixed b0 instead of VarPro
 
     def validate(self) -> None:
         """Normalize and validate data settings."""
@@ -97,6 +110,9 @@ class DataConfig:
             raise ValueError(f"mode must be 'field' or 'particles', got {self.mode}")
         if self.field_loss not in {"mse", "rle"}:
             raise ValueError(f"field_loss must be 'mse' or 'rle', got {self.field_loss}")
+        # Validate b0_fixed_value if provided
+        if self.b0_fixed_value is not None and self.b0_fixed_value <= 0:
+            raise ValueError(f"b0_fixed_value must be positive, got {self.b0_fixed_value}")
 
 
 @dataclass
@@ -123,7 +139,7 @@ class TrainConfig:
     lr_d_fine: float = 1e-4
     lr_lower_fine: float = 1e-4
     optimizer: Literal["adam", "lbfgs"] = "adam"
-    lbfgs_lr: float = 0.1
+    lbfgs_lr: float = 1.0
     lbfgs_max_iter: int = 20
     use_scheduler: bool = True
     early_burnin: int = 2500
@@ -169,8 +185,7 @@ class RegConfig:
 class ArchConfig:
     """Neural architecture options for RFF embeddings."""
 
-    use_rff_geom: bool = True
-    use_rff_d: bool = True
+    use_rff: bool = True  # Enable Random Fourier Features for all networks
     d_min: float = 1e-6
     rff_width: int = 128
     rff_scale: float = 1.0  # Frequency multiplier for RFF (higher = sharper features)

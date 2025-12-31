@@ -301,13 +301,13 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
     rff_scale = getattr(cfg.arch, "rff_scale", 1.0)
     d_net = DNet(
         width=cfg.arch.rff_width,
-        use_rff=cfg.arch.use_rff_d,
+        use_rff=cfg.arch.use_rff,
         rff_scale=rff_scale,
         d_min=d_min,
     ).to(device=device, dtype=dtype)
     u_net = LocalOperator(
         width=cfg.arch.rff_width,
-        use_rff=cfg.arch.use_rff_geom,
+        use_rff=cfg.arch.use_rff,
         rff_scale=rff_scale,
     ).to(device=device, dtype=dtype)
 
@@ -434,6 +434,13 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
     patience = 0
 
     # =========================================================================
+    # FIXED B0 SETTING
+    # =========================================================================
+    # If b0_fixed_value is set, use it instead of VarPro projection.
+    # This is useful when the source amplitude is known a priori.
+    b0_fixed_value = cfg.data.b0_fixed_value
+
+    # =========================================================================
     # LOSS COMPUTATION (shared by logging and LBFGS closure)
     # =========================================================================
     # This inner function computes all loss components in one forward pass.
@@ -446,10 +453,12 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
         integral_unit = None
         if data_bundle.mode == "field":
             u_hat_field, _ = u_net(x_field, z_tensor)
-            b0_star = varpro.project_b0_field(
+            # Get b0 via VarPro projection (or use fixed value if set)
+            b0_star = varpro.get_b0_field(
                 u_hat_field,
                 u_true,
                 field_loss=cfg.data.field_loss,
+                b0_fixed_value=b0_fixed_value,
             )
             data_loss = varpro.field_data_loss(
                 u_hat_field,
@@ -460,7 +469,13 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
         else:
             u_hat_int, _ = u_net(x_int, z_tensor)
             integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
-            b0_star = varpro.project_b0_ppp(ppp.n_obs, ppp.m_obs, integral_unit)
+            # Get b0 via VarPro projection (or use fixed value if set)
+            b0_star = varpro.get_b0_ppp(
+                ppp.n_obs,
+                ppp.m_obs,
+                integral_unit,
+                b0_fixed_value=b0_fixed_value,
+            )
             u_hat_obs, _ = u_net(ppp.x_particles, z_tensor)
             data_loss = varpro.ppp_nll(
                 u_hat_obs.view(-1),
@@ -630,15 +645,23 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
         u_hat_res, _ = u_net(x_res, z_tensor)
         if data_bundle.mode == "field":
             u_hat_field, _ = u_net(x_field, z_tensor)
-            b0_star = varpro.project_b0_field(
+            # Get b0 via VarPro projection (or use fixed value if set)
+            b0_star = varpro.get_b0_field(
                 u_hat_field,
                 u_true,
                 field_loss=cfg.data.field_loss,
+                b0_fixed_value=b0_fixed_value,
             )
         else:
             u_hat_int, _ = u_net(x_int, z_tensor)
             integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
-            b0_star = varpro.project_b0_ppp(ppp.n_obs, ppp.m_obs, integral_unit)
+            # Get b0 via VarPro projection (or use fixed value if set)
+            b0_star = varpro.get_b0_ppp(
+                ppp.n_obs,
+                ppp.m_obs,
+                integral_unit,
+                b0_fixed_value=b0_fixed_value,
+            )
         u_pred = b0_star * u_hat_res
         d_pred = d_final
 

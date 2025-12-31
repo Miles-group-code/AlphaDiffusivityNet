@@ -82,6 +82,8 @@ All methods use **Variable Projection** to handle the unknown source amplitude $
 *   For **RLE**: Weighted Least Squares solution.
 *   For **Particles**: $b_0^* = \frac{N_{particles}}{M_{SNAPSHOTS} \int \hat{u}_{unit} dx}$
 
+**Fixed b0 mode:** When the source amplitude is known a priori (e.g., from experimental calibration), you can bypass VarPro by setting `b0_fixed_value` in `solve()`. This eliminates the amplitude-diffusivity ambiguity.
+
 ### Scale Estimation (DDI + Scalar Fit)
 **DDI** provides a fast heuristic scale estimate from data spread, then a **constant-D scalar fit** refines the scale by minimizing the actual data loss via a differentiable FDM solve. The resulting scale anchors regularization and stabilizes training.
 

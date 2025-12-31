@@ -445,6 +445,13 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
     patience = 0
 
     # =========================================================================
+    # FIXED B0 SETTING
+    # =========================================================================
+    # If b0_fixed_value is set, use it instead of VarPro projection.
+    # This is useful when the source amplitude is known a priori.
+    b0_fixed_value = cfg.data.b0_fixed_value
+
+    # =========================================================================
     # LOSS COMPUTATION (shared by logging and LBFGS closure)
     # =========================================================================
     # This inner function computes all loss components in one forward pass.
@@ -454,7 +461,7 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
     # Returns: (d_full, u_hat_unit, b0_star, data_loss, reg_smooth, reg_scale, total_loss)
     #   - d_full: Full D(x) array on solver grid (with boundary mirroring)
     #   - u_hat_unit: Unit-source solution (b0=1) from Thomas algorithm
-    #   - b0_star: Optimal amplitude from VarPro projection
+    #   - b0_star: Optimal amplitude from VarPro projection (or fixed value if fix_b0=True)
     #   - data_loss: Data fidelity (MSE/RLE for field, NLL for particles)
     #   - reg_smooth: Smoothness penalty (H1 or TV on log D)
     #   - reg_scale: Scale anchor penalty (deviation from d_target)
@@ -468,10 +475,12 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
                 u_hat_field = u_hat_unit
             else:
                 u_hat_field = varpro.interpolate_1d(u_hat_unit, x_res, x_field)
-            b0_star = varpro.project_b0_field(
+            # Get b0 via VarPro projection (or use fixed value if set)
+            b0_star = varpro.get_b0_field(
                 u_hat_field,
                 u_true,
                 field_loss=cfg.data.field_loss,
+                b0_fixed_value=b0_fixed_value,
             )
             data_loss = varpro.field_data_loss(
                 u_hat_field,
@@ -482,7 +491,13 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
         else:
             # Integrate directly on x_res to avoid aliasing errors from grid mismatch
             integral_unit = torch.trapezoid(u_hat_unit.view(-1), x_res.view(-1))
-            b0_star = varpro.project_b0_ppp(ppp.n_obs, ppp.m_obs, integral_unit)
+            # Get b0 via VarPro projection (or use fixed value if set)
+            b0_star = varpro.get_b0_ppp(
+                ppp.n_obs,
+                ppp.m_obs,
+                integral_unit,
+                b0_fixed_value=b0_fixed_value,
+            )
             u_hat_obs = varpro.interpolate_1d_precomputed(u_hat_unit, *interp_particles)
             data_loss = varpro.ppp_nll(
                 u_hat_obs,
@@ -641,15 +656,23 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
                 u_hat_field = u_hat_unit
             else:
                 u_hat_field = varpro.interpolate_1d(u_hat_unit, x_res, x_field)
-            b0_star = varpro.project_b0_field(
+            # Get b0 via VarPro projection (or use fixed value if set)
+            b0_star = varpro.get_b0_field(
                 u_hat_field,
                 u_true,
                 field_loss=cfg.data.field_loss,
+                b0_fixed_value=b0_fixed_value,
             )
         else:
             # Consistent integration on x_res
             integral_unit = torch.trapezoid(u_hat_unit.view(-1), x_res.view(-1))
-            b0_star = varpro.project_b0_ppp(ppp.n_obs, ppp.m_obs, integral_unit)
+            # Get b0 via VarPro projection (or use fixed value if set)
+            b0_star = varpro.get_b0_ppp(
+                ppp.n_obs,
+                ppp.m_obs,
+                integral_unit,
+                b0_fixed_value=b0_fixed_value,
+            )
         u_pred = b0_star * u_hat_unit
         d_pred = d_full
 
