@@ -178,14 +178,28 @@ def compute_loss_comparison(
     else:
         d_true_res = d_true
 
+    bc_type = getattr(problem, "bc_type", "dirichlet")
+
     # Solve FDM with D_pred (unit source)
-    u_hat_pred = physics.fdm_solve_alpha_dirichlet(
-        d_pred, problem.alpha, problem.mu, x_res, 1.0, (problem.source_location,)
+    u_hat_pred = physics.fdm_solve_alpha(
+        d_pred,
+        problem.alpha,
+        problem.mu,
+        x_res,
+        1.0,
+        (problem.source_location,),
+        bc_type=bc_type,
     )
 
     # Solve FDM with D_true (unit source)
-    u_hat_true = physics.fdm_solve_alpha_dirichlet(
-        d_true_res, problem.alpha, problem.mu, x_res, 1.0, (problem.source_location,)
+    u_hat_true = physics.fdm_solve_alpha(
+        d_true_res,
+        problem.alpha,
+        problem.mu,
+        x_res,
+        1.0,
+        (problem.source_location,),
+        bc_type=bc_type,
     )
 
     # Convert to torch for VarPro
@@ -433,7 +447,7 @@ def plot_training_history(
 
     # Define component groups
     upper_components = ["data", "reg_smooth", "reg_scale"]
-    lower_components = ["phys", "res", "jump", "rgrad", "jump_rgrad"]
+    lower_components = ["phys", "res", "jump", "bc", "rgrad", "jump_rgrad"]
     all_components = upper_components + lower_components
 
     def _finite(values: list[float] | np.ndarray) -> np.ndarray:
@@ -690,6 +704,7 @@ def plot_bilo_neighborhood_check(
     z: float,
     alpha: float,
     mu: float,
+    bc_type: str = "dirichlet",
     delta_d: float = 0.05,
     outdir: str | None = None,
     filename: str = "bilo_neighborhood_check.png",
@@ -710,11 +725,11 @@ def plot_bilo_neighborhood_check(
     d_base_np = d_base.detach().cpu().numpy().reshape(-1)
     d_perturbed_np = d_perturbed.detach().cpu().numpy().reshape(-1)
 
-    u_fdm_base = physics.fdm_solve_alpha_dirichlet(
-        d_base_np, alpha, mu, x_np, 1.0, [float(z)]
+    u_fdm_base = physics.fdm_solve_alpha(
+        d_base_np, alpha, mu, x_np, 1.0, [float(z)], bc_type=bc_type
     )
-    u_fdm_perturbed = physics.fdm_solve_alpha_dirichlet(
-        d_perturbed_np, alpha, mu, x_np, 1.0, [float(z)]
+    u_fdm_perturbed = physics.fdm_solve_alpha(
+        d_perturbed_np, alpha, mu, x_np, 1.0, [float(z)], bc_type=bc_type
     )
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))

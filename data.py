@@ -172,12 +172,14 @@ def simulate_particles_alpha(
     m_obs: int = 1,
     device: torch.device | None = None,
     dtype: torch.dtype | None = None,
+    bc_type: str = "dirichlet",
 ) -> PPPData:
     """Simulate particles under alpha diffusion with births and deaths.
 
     Uses Euler-Maruyama for the SDE dX = alpha * D'(X) dt + sqrt(2 D(X)) dW,
     with births at z and deaths as a Bernoulli survival per time step. The
-    domain is [0, 1]; particles outside are discarded (absorbing boundary).
+    domain is [0, 1]; boundaries can be absorbing (Dirichlet) or reflecting
+    (Neumann) depending on bc_type.
 
     Args:
         d_func: Callable returning D(x) for positions x.
@@ -192,6 +194,7 @@ def simulate_particles_alpha(
         m_obs: Number of independent snapshots to simulate.
         device: Torch device for output tensor.
         dtype: Torch dtype for output tensor.
+        bc_type: Boundary condition type ("dirichlet" or "neumann").
 
     Returns:
         PPPData with concatenated particle positions and m_obs snapshots.
@@ -200,6 +203,9 @@ def simulate_particles_alpha(
         device = torch.device("cpu")
     if dtype is None:
         dtype = torch.float32
+    bc = bc_type.strip().lower()
+    if bc not in {"dirichlet", "neumann"}:
+        raise ValueError(f"Unsupported bc_type '{bc_type}'.")
 
     n_steps = int(round(tmax / dt))
     all_positions = []
@@ -213,7 +219,13 @@ def simulate_particles_alpha(
                 drift = alpha * dprime_vals * dt
                 diffusion = np.sqrt(2.0 * d_vals * dt) * noise
                 particles = particles + drift + diffusion
-                particles = particles[(particles >= 0.0) & (particles <= 1.0)]
+                if bc == "neumann":
+                    # Reflect across boundaries by folding into [0, 2] then mirroring.
+                    particles = np.mod(particles, 2.0)
+                    particles = np.where(particles > 1.0, 2.0 - particles, particles)
+                else:
+                    # Dirichlet: absorb particles that leave the domain.
+                    particles = particles[(particles >= 0.0) & (particles <= 1.0)]
 
             n_births = rng.poisson(birth_rate * dt)
             if n_births > 0:

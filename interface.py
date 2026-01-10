@@ -41,6 +41,7 @@ DEFAULT_SETTINGS = {
     "w_phys": 1.0,
     "w_jump": 1.0,
     "w_resgrad": 0.01,
+    "w_bc": 1.0,
 
     # Regularization
     "wreg_smooth": 1e-7,  # Smoothness on D
@@ -121,6 +122,7 @@ def show_settings(settings: Optional[Dict[str, Any]] = None) -> None:
         "smoothness_type": "'h1' or 'tv'",
         "w_jump": "Jump condition (pinn/bilo)",
         "w_resgrad": "Residual gradient (bilo only)",
+        "w_bc": "Boundary condition loss (neumann only)",
         "field_loss": "'mse' or 'rle'",
         "b0_fixed_value": "Fixed b0 (None=VarPro)",
         "use_ddi": "DDI seed for scalar fit",
@@ -231,7 +233,7 @@ class Problem:
         mode: "field" or "particles".
         u_field: Observed u(x) on x_grid (field mode).
         particles: PPPData with particle positions (particles mode).
-        alpha/mu/source_location/b_true: Physics parameters.
+        alpha/mu/source_location/b_true/bc_type: Physics parameters.
         d_true/u_true: Optional ground-truth arrays for synthetic problems.
         Solver grid is configured in solve() via config.grid.n_res.
     """
@@ -244,6 +246,7 @@ class Problem:
     mu: float = 5.0
     source_location: float = 0.5
     b_true: float = 100.0
+    bc_type: str = "dirichlet"
     d_true: Optional[np.ndarray] = None
     u_true: Optional[np.ndarray] = None
 
@@ -261,6 +264,7 @@ class Problem:
         source_location: float = 0.5,
         n_obs: int = 201,
         domain: tuple[float, float] = (0.0, 1.0),
+        bc_type: str = "dirichlet",
         use_pde_sampling: bool = False,
         sde_tmax: float = 100.0,
         sde_dt: float = 1e-3,
@@ -286,6 +290,7 @@ class Problem:
             source_location: Location of the point source.
             n_obs: Number of observation grid points (field) or PPP sampling grid.
             domain: Spatial domain bounds.
+            bc_type: Boundary condition type ("dirichlet" or "neumann").
             use_pde_sampling: Sample particles from PDE field instead of SDE (particles only).
             sde_tmax: SDE simulation horizon.
             sde_dt: SDE simulation time step.
@@ -304,6 +309,10 @@ class Problem:
 
         if n_obs < 3:
             raise ValueError("n_obs must be >= 3.")
+        bc = bc_type.strip().lower()
+        if bc not in {"dirichlet", "neumann"}:
+            raise ValueError(f"Unsupported bc_type '{bc_type}'.")
+
         x_grid = torch.linspace(domain[0], domain[1], n_obs, device=device, dtype=dtype)
         x_field_np = x_grid.detach().cpu().numpy()
 
@@ -314,13 +323,14 @@ class Problem:
         )
 
         d_true = np.asarray(d_callable(x_field_np))
-        u_true = physics.fdm_solve_alpha_dirichlet(
+        u_true = physics.fdm_solve_alpha(
             d_true,
             alpha,
             mu,
             x_field_np,
             b_true,
             (source_location,),
+            bc_type=bc,
         )
 
         u_obs = u_true if mode == "field" or use_pde_sampling else None
@@ -356,6 +366,7 @@ class Problem:
                     m_obs=m_obs_safe,
                     device=device,
                     dtype=dtype,
+                    bc_type=bc,
                 )
 
         if verbose:
@@ -380,6 +391,7 @@ class Problem:
             mu=mu,
             source_location=source_location,
             b_true=b_true,
+            bc_type=bc,
             d_true=d_true,
             u_true=u_true,
         )
@@ -393,6 +405,7 @@ class Problem:
         mu: float,
         source_location: float,
         b_true: Optional[float] = None,
+        bc_type: str = "dirichlet",
     ) -> "Problem":
         """Create a problem from external observations.
 
@@ -403,7 +416,11 @@ class Problem:
             mu: Death rate in the PDE.
             source_location: Location of the point source.
             b_true: Optional true source strength for reference.
+            bc_type: Boundary condition type ("dirichlet" or "neumann").
         """
+        bc = bc_type.strip().lower()
+        if bc not in {"dirichlet", "neumann"}:
+            raise ValueError(f"Unsupported bc_type '{bc_type}'.")
         if isinstance(observations, PPPData):
             return cls(
                 x_grid=x_grid,
@@ -413,6 +430,7 @@ class Problem:
                 mu=mu,
                 source_location=source_location,
                 b_true=b_true if b_true is not None else 100.0,
+                bc_type=bc,
             )
         u_field = observations.view(-1, 1) if observations.ndim == 1 else observations
         return cls(
@@ -423,6 +441,7 @@ class Problem:
             mu=mu,
             source_location=source_location,
             b_true=b_true if b_true is not None else 100.0,
+            bc_type=bc,
         )
 
 
@@ -476,13 +495,14 @@ class Solution:
         u_np = self._to_numpy(self.u_pred).reshape(-1)
         u_fdm = None
         if problem is not None and self.method in {"PINN", "BILO"}:
-            u_fdm = physics.fdm_solve_alpha_dirichlet(
+            u_fdm = physics.fdm_solve_alpha(
                 d_np,
                 problem.alpha,
                 problem.mu,
                 x_res_np,
                 self.b0_star,
                 (problem.source_location,),
+                bc_type=problem.bc_type,
             )
         plot_particles = (
             problem is not None
@@ -613,6 +633,7 @@ def solve(
     wreg_scale: Optional[float] = None,
     w_jump: Optional[float] = None,
     w_resgrad: Optional[float] = None,
+    w_bc: Optional[float] = None,
     smoothness_type: Optional[Literal["h1", "tv"]] = None,
     field_loss: Optional[Literal["mse", "rle"]] = None,
     b0_fixed_value: Optional[float] = None,
@@ -653,6 +674,7 @@ def solve(
         wreg_scale: Scale anchor weight on D(x).
         w_jump: Jump condition weight (PINN/BiLO).
         w_resgrad: Residual gradient penalty (BiLO).
+        w_bc: Boundary condition penalty (Neumann only).
         smoothness_type: Smoothness penalty selector ("h1" or "tv").
         field_loss: "mse" or "rle" for field observations.
         b0_fixed_value: If set to a positive value, use this fixed source amplitude
@@ -724,6 +746,8 @@ def solve(
     config.physics.mu = problem.mu
     config.physics.sources = (problem.source_location,)
     config.physics.b_true = problem.b_true
+    config.physics.domain = domain
+    config.physics.bc_type = problem.bc_type
     config.data.mode = problem.mode
     config.run.device = str(x_res.device)
     config.run.dtype = x_res.dtype
@@ -765,6 +789,8 @@ def solve(
         config.reg.w_jump = w_jump
     if w_resgrad is not None:
         config.reg.w_resgrad = w_resgrad
+    if w_bc is not None:
+        config.reg.w_bc = w_bc
     if smoothness_type is not None:
         config.reg.smoothness_type = smoothness_type
     if field_loss is not None:
@@ -811,6 +837,7 @@ def solve(
         _warn_irrelevant("w_phys", w_phys, "'w_phys' is ignored for DTO.")
         _warn_irrelevant("w_jump", w_jump, "'w_jump' is ignored for DTO.")
         _warn_irrelevant("w_resgrad", w_resgrad, "'w_resgrad' is ignored for DTO.")
+        _warn_irrelevant("w_bc", w_bc, "'w_bc' is ignored for DTO.")
         _warn_irrelevant("use_rff", use_rff, "'use_rff' is ignored for DTO.")
         _warn_irrelevant("rff_scale", rff_scale, "'rff_scale' is ignored for DTO.")
     elif method_lower == "pinn":
@@ -880,6 +907,7 @@ def solve(
         "jump": config.reg.w_jump,
         "rgrad": config.reg.w_resgrad,
         "jump_rgrad": config.reg.w_resgrad,
+        "bc": config.reg.w_bc,
     }
 
     return Solution(

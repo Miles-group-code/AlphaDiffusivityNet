@@ -18,21 +18,17 @@ from config import Config
 from data import PPPData
 import physics, varpro
 from scale_estimation import estimate_ddi_scale, fit_constant_d
+from training_logger import (
+    TrainingHistory,
+    format_pinn_progress,
+    format_pinn_pretrain_progress,
+)
 
 # =============================================================================
 # D PARAMETERIZATION: Softplus + offset
 # =============================================================================
 # We use softplus for positivity: D = softplus(raw) + D_min
-#
-# HISTORY:
-# - v3.0.0: Switched from log(D) to softplus + offset
-# - Tried LeakyReLU + clamp(min=0), but clamp killed gradients when raw < 0
-# - Reverted to softplus (v3.0.1): smooth gradients everywhere
-#
-# TRADE-OFF:
-# - Softplus has mild gradient suppression: ∂D/∂raw = sigmoid(raw) ≈ D for small D
-# - But avoids catastrophic gradient death from clamp operations
-# - Combined with DDI initialization and Adam optimizer, works well in practice
+# Softplus has mild gradient suppression but avoids catastrophic gradient death.
 # =============================================================================
 
 D_MIN = 1e-6
@@ -52,7 +48,7 @@ class PINNData:
 
     mode: str  # "field" or "particles"
     x_res: torch.Tensor
-    x_field: Optional[torch.Tensor] = None  # Field observation grid (field mode)
+    x_field: Optional[torch.Tensor] = None
     u_true: Optional[torch.Tensor] = None
     ppp: Optional[PPPData] = None
 
@@ -62,16 +58,6 @@ class PINNResult:
     """Outputs and training history for PINN fitting.
 
     Returned tensors are detached and on CPU for convenience.
-
-    Fields:
-        x_res: Solver grid (1D).
-        d_pred: D(x) on x_res (1D).
-        u_hat_unit: Unit-source response u_hat for b0=1 on x_res (1D).
-        u_pred: Predicted field b0* * u_hat_unit on x_res (1D).
-        b0_star: Projected source amplitude.
-        history: Loss curves and diagnostics recorded every log_every steps.
-            Typical keys: iter, total, data, phys, res, jump, reg_smooth,
-            reg_scale, b0_star, mean_d, d_snap_iters, d_snapshots.
     """
 
     x_res: torch.Tensor
@@ -83,11 +69,7 @@ class PINNResult:
 
 
 class DNet(nn.Module):
-    """RFF-embedded MLP that parameterizes D(x) with softplus + offset.
-
-    Uses softplus parameterization: D = softplus(raw) + D_min
-    Softplus is smooth, always positive, and has well-behaved gradients everywhere.
-    """
+    """RFF-embedded MLP that parameterizes D(x) with softplus + offset."""
 
     def __init__(
         self, width: int = 128, use_rff: bool = True, rff_scale: float = 1.0, d_min: float = D_MIN
@@ -100,8 +82,6 @@ class DNet(nn.Module):
         if use_rff:
             for param in self.embed.parameters():
                 param.requires_grad = False
-        # SiLU (Swish) activation: avoids Tanh's low-frequency bias and
-        # saturation issues while maintaining smooth gradients for PDE learning.
         self.net = nn.Sequential(
             nn.Linear(width, width),
             nn.SiLU(),
@@ -111,11 +91,6 @@ class DNet(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Evaluate D(x) at given coordinates.
-
-        Uses softplus for positivity: D = softplus(raw) + D_min
-        Softplus has smooth gradients everywhere (no dead regions).
-        """
         x = x.view(-1, 1)
         if self.use_rff:
             feat = torch.sin(2.0 * torch.pi * self.rff_scale * self.embed(x))
@@ -128,12 +103,19 @@ class DNet(nn.Module):
 class LocalOperator(nn.Module):
     """Local operator network for the unit response u_hat(x)."""
 
-    def __init__(self, width: int = 128, use_rff: bool = True, rff_scale: float = 1.0) -> None:
+    def __init__(
+        self,
+        width: int = 128,
+        use_rff: bool = True,
+        rff_scale: float = 1.0,
+        bc_type: str = "dirichlet",
+    ) -> None:
         super().__init__()
-        # NOTE: Unlike BiLO, the PINN u-network does NOT condition on D.
-        # This is standard PINN practice: u_net and d_net are trained jointly.
         self.use_rff = use_rff
         self.rff_scale = rff_scale
+        self.bc_type = bc_type.strip().lower()
+        if self.bc_type not in {"dirichlet", "neumann"}:
+            raise ValueError(f"Unsupported bc_type '{bc_type}'.")
         self.geom_layer = nn.Linear(2, width)
         if use_rff:
             self.geom_layer.weight.requires_grad = False
@@ -141,11 +123,9 @@ class LocalOperator(nn.Module):
                 self.geom_layer.bias.requires_grad = False
         self.hidden = nn.ModuleList([nn.Linear(width, width) for _ in range(3)])
         self.output = nn.Linear(width, 1)
-        # SiLU (Swish) avoids Tanh's low-frequency bias and saturation.
         self.activation = F.silu
 
     def forward(self, x: torch.Tensor, z_known: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Evaluate u_hat and return the |x-z| feature for jump constraints."""
         x = x.view(-1, 1)
         phi_z = torch.abs(x - z_known)
         if phi_z.is_leaf and not phi_z.requires_grad:
@@ -159,9 +139,11 @@ class LocalOperator(nn.Module):
         for layer in self.hidden:
             h = self.activation(layer(h))
         u_raw = self.output(h)
-        # Hard enforcement of homogeneous Dirichlet BCs: u(0) = u(1) = 0.
-        # This ansatz ensures the network output is always valid at boundaries.
-        u = F.softplus(u_raw) * x * (1.0 - x)
+        u_pos = F.softplus(u_raw)
+        if self.bc_type == "dirichlet":
+            u = u_pos * x * (1.0 - x)
+        else:
+            u = u_pos
         return u, phi_z
 
 
@@ -183,6 +165,30 @@ def _alpha_flux_residual(
     return J_x - mu * u
 
 
+def _compute_bc_loss_neumann(
+    u_net: nn.Module,
+    z_tensor: torch.Tensor,
+    domain: Tuple[float, float],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Penalize boundary derivatives for Neumann BCs: u'(x_min)=u'(x_max)=0."""
+    x0 = torch.tensor([[domain[0]]], device=device, dtype=dtype, requires_grad=True)
+    x1 = torch.tensor([[domain[1]]], device=device, dtype=dtype, requires_grad=True)
+
+    u0, _ = u_net(x0, z_tensor)
+    u1, _ = u_net(x1, z_tensor)
+
+    u0_x = torch.autograd.grad(
+        u0, x0, grad_outputs=torch.ones_like(u0), create_graph=True
+    )[0]
+    u1_x = torch.autograd.grad(
+        u1, x1, grad_outputs=torch.ones_like(u1), create_graph=True
+    )[0]
+
+    return torch.mean(u0_x ** 2 + u1_x ** 2)
+
+
 def _compute_physics_losses(
     d_net: nn.Module,
     u_net: nn.Module,
@@ -191,19 +197,14 @@ def _compute_physics_losses(
     z_idx: int,
     alpha: float,
     mu: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute PDE residual and jump losses for the PINN objective.
-
-    Returns raw (unweighted) losses. Caller applies weights independently.
-
-    Args:
-        z_idx: Index of the source location on the grid (excluded from residual).
-    """
+    bc_type: str,
+    domain: Tuple[float, float],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute PDE residual, jump, and boundary-condition losses for PINN."""
     x_pde = x_res.clone().detach().requires_grad_(True)
     d = d_net(x_pde)
     u_hat, _ = u_net(x_pde, z_tensor)
     residual = _alpha_flux_residual(x_pde, d, u_hat, alpha, mu)
-    # Exclude the source point from residual loss
     n = residual.shape[0]
     res_loss = (torch.sum(residual ** 2) - residual[z_idx] ** 2) / (n - 1)
 
@@ -211,15 +212,18 @@ def _compute_physics_losses(
     d_z = d_net(z_probe)
     u_z, phi_z = u_net(z_probe, z_tensor)
     du_dphi = torch.autograd.grad(
-        u_z,
-        phi_z,
-        grad_outputs=torch.ones_like(u_z),
-        create_graph=True,
+        u_z, phi_z, grad_outputs=torch.ones_like(u_z), create_graph=True
     )[0]
     jump_res = d_z * (2.0 * du_dphi) + 1.0
     jump_loss = torch.mean(jump_res ** 2)
 
-    return res_loss, jump_loss
+    bc_loss = torch.tensor(0.0, device=x_res.device, dtype=x_res.dtype)
+    if bc_type == "neumann":
+        bc_loss = _compute_bc_loss_neumann(
+            u_net, z_tensor, domain, x_res.device, x_res.dtype
+        )
+
+    return res_loss, jump_loss, bc_loss
 
 
 def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
@@ -233,16 +237,79 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
     Returns:
         PINNResult with predictions on the solver grid (x_res) and training history.
     """
+    # =========================================================================
+    # CONFIG EXTRACTION
+    # =========================================================================
     device = cfg.run.torch_device
     dtype = cfg.run.torch_dtype
-    if len(cfg.physics.sources) != 1:
+
+    # Physics
+    alpha = cfg.physics.alpha
+    mu = cfg.physics.mu
+    sources = cfg.physics.sources
+    domain = cfg.physics.domain
+    bc_type = cfg.physics.bc_type.lower()
+
+    # Data
+    mode = data_bundle.mode
+    field_loss_type = cfg.data.field_loss
+    b0_fixed_value = cfg.data.b0_fixed_value
+
+    # D profile initialization
+    use_ddi = cfg.d_profile.use_ddi
+    ddi_d_min, ddi_d_max = cfg.d_profile.ddi_d_min, cfg.d_profile.ddi_d_max
+
+    # Regularization
+    w_data = cfg.reg.w_data
+    w_phys = cfg.reg.w_phys
+    w_jump = cfg.reg.w_jump
+    w_bc = cfg.reg.w_bc
+    wreg_smooth, wreg_scale = cfg.reg.wreg_smooth, cfg.reg.wreg_scale
+    smoothness_type = cfg.reg.smoothness_type
+
+    # Training
+    pretrain_iters = cfg.train.pretrain_iters
+    finetune_iters = cfg.train.finetune_iters
+    lr_d_pre, lr_lower_pre = cfg.train.lr_d_pre, cfg.train.lr_lower_pre
+    lr_d_fine, lr_lower_fine = cfg.train.lr_d_fine, cfg.train.lr_lower_fine
+    use_lbfgs = cfg.train.optimizer == "lbfgs"
+    lbfgs_lr, lbfgs_max_iter = cfg.train.lbfgs_lr, cfg.train.lbfgs_max_iter
+    use_scheduler = cfg.train.use_scheduler
+    log_every = cfg.train.log_every
+    scalar_fit_iters = cfg.train.scalar_fit_iters
+
+    # Early stopping
+    early_burnin = cfg.train.early_burnin
+    early_patience = cfg.train.early_patience
+    early_tol = cfg.train.early_tol
+
+    # Architecture
+    d_min = getattr(cfg.arch, "d_min", D_MIN)
+    rff_scale = getattr(cfg.arch, "rff_scale", 1.0)
+    rff_width = cfg.arch.rff_width
+    use_rff = cfg.arch.use_rff
+
+    # Grid
+    n_int = cfg.grid.n_int
+
+    # =========================================================================
+    # INPUT VALIDATION
+    # =========================================================================
+    if len(sources) != 1:
         raise NotImplementedError("PINN currently supports a single source.")
 
+    if bc_type == "neumann" and alpha != 1.0:
+        print(f"[WARN] Neumann BCs with alpha={alpha} may be non-identifiable.")
+
+    # =========================================================================
+    # DATA PREPARATION
+    # =========================================================================
     x_res = data_bundle.x_res.to(device=device, dtype=dtype).view(-1, 1)
     x_field = x_res
     if data_bundle.x_field is not None:
         x_field = data_bundle.x_field.to(device=device, dtype=dtype).view(-1, 1)
-    if data_bundle.mode == "field":
+
+    if mode == "field":
         u_true = data_bundle.u_true.to(device=device, dtype=dtype).view(-1, 1)
         ppp = None
     else:
@@ -252,40 +319,41 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
         )
         u_true = None
 
-    z_tensor = torch.tensor(cfg.physics.sources[0], device=device, dtype=dtype).view(1, 1)
-    # Since z is exactly on the aligned grid, find the single index to exclude from residual.
+    z_tensor = torch.tensor(sources[0], device=device, dtype=dtype).view(1, 1)
     z_idx = int(torch.argmin(torch.abs(x_res - z_tensor)).item())
 
-    x_int = torch.linspace(
-        cfg.physics.domain[0], cfg.physics.domain[1], cfg.grid.n_int, device=device, dtype=dtype
-    ).view(-1, 1)
+    x_int = torch.linspace(domain[0], domain[1], n_int, device=device, dtype=dtype).view(-1, 1)
 
-    if cfg.d_profile.use_ddi:
+    # =========================================================================
+    # SCALE ESTIMATION
+    # =========================================================================
+    if use_ddi:
         d_ddi = estimate_ddi_scale(
-            mu=cfg.physics.mu,
-            z=cfg.physics.sources[0],
+            mu=mu,
+            z=sources[0],
             x_particles=ppp.x_particles if ppp is not None else None,
             u_field=u_true if u_true is not None else None,
             x_grid=x_field.view(-1),
-            d_min=cfg.d_profile.ddi_d_min,
-            d_max=cfg.d_profile.ddi_d_max,
+            d_min=ddi_d_min,
+            d_max=ddi_d_max,
         )
     else:
         d_ddi = 1.0
 
-    if cfg.train.scalar_fit_iters > 0:
+    if scalar_fit_iters > 0:
         d_scale = fit_constant_d(
             x=x_res.view(-1),
-            alpha=cfg.physics.alpha,
-            mu=cfg.physics.mu,
-            sources=cfg.physics.sources,
+            alpha=alpha,
+            mu=mu,
+            sources=sources,
             u_true=u_true if u_true is not None else None,
             ppp=ppp if ppp is not None else None,
             x_field=x_field.view(-1) if u_true is not None else None,
             x_int=x_int.view(-1) if ppp is not None else None,
             d_init=d_ddi,
-            max_iters=cfg.train.scalar_fit_iters,
-            field_loss=cfg.data.field_loss,
+            max_iters=scalar_fit_iters,
+            field_loss=field_loss_type,
+            bc_type=bc_type,
             verbose=verbose,
         )
     else:
@@ -294,139 +362,84 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
     if verbose:
         print(f"[PINN] DDI scale: {d_ddi:.3e}")
         print(f"[PINN] Scalar fit scale: {d_scale:.3e}")
-    
+
     d_target = d_scale
 
-    d_min = getattr(cfg.arch, "d_min", D_MIN)
-    rff_scale = getattr(cfg.arch, "rff_scale", 1.0)
+    # =========================================================================
+    # MODEL INITIALIZATION
+    # =========================================================================
     d_net = DNet(
-        width=cfg.arch.rff_width,
-        use_rff=cfg.arch.use_rff,
-        rff_scale=rff_scale,
-        d_min=d_min,
+        width=rff_width, use_rff=use_rff, rff_scale=rff_scale, d_min=d_min
     ).to(device=device, dtype=dtype)
     u_net = LocalOperator(
-        width=cfg.arch.rff_width,
-        use_rff=cfg.arch.use_rff,
-        rff_scale=rff_scale,
+        width=rff_width, use_rff=use_rff, rff_scale=rff_scale, bc_type=bc_type
     ).to(device=device, dtype=dtype)
 
     # =========================================================================
     # TRAINING HISTORY
     # =========================================================================
-    # We track metrics at each logged iteration for diagnostics and plotting.
-    # Keys:
-    #   iter         - iteration number (finetune phase only)
-    #   total        - total loss (data + physics + regularization)
-    #   data         - data fidelity loss (MSE, RLE, or PPP NLL)
-    #   phys         - weighted physics loss (w_phys*res + w_jump*jump)
-    #   res          - PDE residual loss (unweighted)
-    #   jump         - jump condition loss at source (unweighted)
-    #   reg_smooth   - smoothness penalty on D (H1 or TV, unweighted)
-    #   reg_scale    - scale anchor penalty (unweighted)
-    #   b0_star      - projected source amplitude via VarPro
-    #   mean_d       - spatial average of D(x)
-    #   d_snap_iters - iterations where D snapshots were saved
-    #   d_snapshots  - list of D(x) arrays at those iterations
-    history: Dict[str, List[float]] = {
-        "iter": [],
-        "total": [],
-        "data": [],
-        "phys": [],
-        "res": [],
-        "jump": [],
-        "reg_smooth": [],
-        "reg_scale": [],
-        "b0_star": [],
-        "mean_d": [],
-        "d_snap_iters": [],
-        "d_snapshots": [],
-    }
+    history = TrainingHistory.for_pinn()
 
     # =========================================================================
-    # PRETRAIN PHASE (optional)
+    # PRETRAIN PHASE
     # =========================================================================
-    # The pretrain phase trains the networks on physics constraints only,
-    # without data. This helps the u-network learn to satisfy the PDE before
-    # we try to fit data, preventing the optimizer from finding shortcuts
-    # that fit data but violate physics.
-    #
-    # Loss = physics_loss + anchor_loss (anchor D to initialization)
-    if cfg.train.pretrain_iters > 0:
-        optim_pre = torch.optim.Adam(
-            [
-                {"params": d_net.parameters(), "lr": cfg.train.lr_d_pre},
-                {"params": u_net.parameters(), "lr": cfg.train.lr_lower_pre},
-            ]
-        )
-        for step in range(cfg.train.pretrain_iters + 1):
+    if pretrain_iters > 0:
+        optim_pre = torch.optim.Adam([
+            {"params": d_net.parameters(), "lr": lr_d_pre},
+            {"params": u_net.parameters(), "lr": lr_lower_pre},
+        ])
+        for step in range(pretrain_iters + 1):
             optim_pre.zero_grad(set_to_none=True)
-            res_loss, jump_loss = _compute_physics_losses(
-                d_net,
-                u_net,
-                x_res,
-                z_tensor,
-                z_idx,
-                cfg.physics.alpha,
-                cfg.physics.mu,
+            res_loss, jump_loss, bc_loss = _compute_physics_losses(
+                d_net, u_net, x_res, z_tensor, z_idx, alpha, mu, bc_type, domain
             )
-            # w_phys weights residual, w_jump weights jump (independent)
-            phys_loss = cfg.reg.w_phys * res_loss + cfg.reg.w_jump * jump_loss
+            phys_loss = w_phys * res_loss + w_jump * jump_loss
+            if bc_type == "neumann":
+                phys_loss = phys_loss + w_bc * bc_loss
             d_pred = d_net(x_res)
             anchor_loss = physics.scale_anchor(d_pred, d_target)
             pre_loss = phys_loss + anchor_loss
 
-            if verbose and step % cfg.train.log_every == 0:
+            if verbose and step % log_every == 0:
                 with torch.no_grad():
                     mean_d = torch.mean(d_pred).item()
-                print(
-                    f"[PINN|pretrain] Iter {step:05d} | Ltot: {pre_loss.item():.3e}\
-"
-                    f"  Lphys: {phys_loss.item():.3e} | Lanchor: {anchor_loss.item():.3e}\
-"
-                    f"  Lres: {res_loss.item():.3e} | Ljump: {jump_loss.item():.3e}\
-"
-                    f"  ⟨D⟩: {mean_d:.3e}"
-                )
+                print(format_pinn_pretrain_progress(
+                    step=step,
+                    total=pre_loss.item(),
+                    phys=phys_loss.item(),
+                    anchor=anchor_loss.item(),
+                    res=res_loss.item(),
+                    jump=jump_loss.item(),
+                    bc=bc_loss.item(),
+                    mean_d=mean_d,
+                    bc_type=bc_type,
+                ))
 
-            if step < cfg.train.pretrain_iters:
+            if step < pretrain_iters:
                 pre_loss.backward()
                 optim_pre.step()
 
     # =========================================================================
     # FINETUNE OPTIMIZER SETUP
     # =========================================================================
-    # The finetune phase jointly optimizes both networks to minimize:
-    #   total_loss = w_data*data_loss + physics_loss + regularization
-    #
-    # Adam is the default, but LBFGS can help in ill-conditioned cases.
-    # Unlike DTO, PINN typically works well with Adam because the physics
-    # loss provides strong gradients (equation error, not output error).
-    use_lbfgs = cfg.train.optimizer == "lbfgs"
-    optimizer = None
-    scheduler = None
-
     if use_lbfgs:
         optimizer = torch.optim.LBFGS(
             list(d_net.parameters()) + list(u_net.parameters()),
-            lr=cfg.train.lbfgs_lr,
-            max_iter=cfg.train.lbfgs_max_iter,
-            history_size=10,              # How many past gradients to remember
-            line_search_fn="strong_wolfe",  # Robust line search for step size
+            lr=lbfgs_lr,
+            max_iter=lbfgs_max_iter,
+            history_size=10,
+            line_search_fn="strong_wolfe",
         )
+        scheduler = None
     else:
-        optimizer = torch.optim.Adam(
-            [
-                {"params": d_net.parameters(), "lr": cfg.train.lr_d_fine},
-                {"params": u_net.parameters(), "lr": cfg.train.lr_lower_fine},
-            ]
-        )
-        if cfg.train.use_scheduler and cfg.train.finetune_iters > 0:
-            # Cosine annealing: smoothly reduce LR from initial to 10% over training
+        optimizer = torch.optim.Adam([
+            {"params": d_net.parameters(), "lr": lr_d_fine},
+            {"params": u_net.parameters(), "lr": lr_lower_fine},
+        ])
+        scheduler = None
+        if use_scheduler and finetune_iters > 0:
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=cfg.train.finetune_iters,
-                eta_min=cfg.train.lr_d_fine * 0.1,
+                optimizer, T_max=finetune_iters, eta_min=lr_d_fine * 0.1
             )
 
     # Early stopping state
@@ -434,71 +447,37 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
     patience = 0
 
     # =========================================================================
-    # FIXED B0 SETTING
+    # LOSS COMPUTATION
     # =========================================================================
-    # If b0_fixed_value is set, use it instead of VarPro projection.
-    # This is useful when the source amplitude is known a priori.
-    b0_fixed_value = cfg.data.b0_fixed_value
-
-    # =========================================================================
-    # LOSS COMPUTATION (shared by logging and LBFGS closure)
-    # =========================================================================
-    # This inner function computes all loss components in one forward pass.
-    # PINN loss structure:
-    #   total = w_data*data_loss + w_phys*res_loss + w_jump*jump_loss
-    #         + wreg_smooth*smoothness + wreg_scale*scale_anchor
-    #
-    # Returns: (total, data, phys, res, jump, reg_smooth, reg_scale, b0_star, d_reg, integral_unit)
     def _compute_losses() -> Tuple[torch.Tensor, ...]:
         integral_unit = None
-        if data_bundle.mode == "field":
+        if mode == "field":
             u_hat_field, _ = u_net(x_field, z_tensor)
-            # Get b0 via VarPro projection (or use fixed value if set)
             b0_star = varpro.get_b0_field(
-                u_hat_field,
-                u_true,
-                field_loss=cfg.data.field_loss,
-                b0_fixed_value=b0_fixed_value,
+                u_hat_field, u_true, field_loss=field_loss_type, b0_fixed_value=b0_fixed_value
             )
             data_loss = varpro.field_data_loss(
-                u_hat_field,
-                u_true,
-                b0_star,
-                field_loss=cfg.data.field_loss,
+                u_hat_field, u_true, b0_star, field_loss=field_loss_type
             )
         else:
             u_hat_int, _ = u_net(x_int, z_tensor)
             integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
-            # Get b0 via VarPro projection (or use fixed value if set)
             b0_star = varpro.get_b0_ppp(
-                ppp.n_obs,
-                ppp.m_obs,
-                integral_unit,
-                b0_fixed_value=b0_fixed_value,
+                ppp.n_obs, ppp.m_obs, integral_unit, b0_fixed_value=b0_fixed_value
             )
             u_hat_obs, _ = u_net(ppp.x_particles, z_tensor)
-            data_loss = varpro.ppp_nll(
-                u_hat_obs.view(-1),
-                b0_star,
-                ppp.m_obs,
-                integral_unit,
-            )
+            data_loss = varpro.ppp_nll(u_hat_obs.view(-1), b0_star, ppp.m_obs, integral_unit)
 
-        res_loss, jump_loss = _compute_physics_losses(
-            d_net,
-            u_net,
-            x_res,
-            z_tensor,
-            z_idx,
-            cfg.physics.alpha,
-            cfg.physics.mu,
+        res_loss, jump_loss, bc_loss = _compute_physics_losses(
+            d_net, u_net, x_res, z_tensor, z_idx, alpha, mu, bc_type, domain
         )
-        # w_phys weights residual, w_jump weights jump (independent)
-        phys_loss = cfg.reg.w_phys * res_loss + cfg.reg.w_jump * jump_loss
+        phys_loss = w_phys * res_loss + w_jump * jump_loss
+        if bc_type == "neumann":
+            phys_loss = phys_loss + w_bc * bc_loss
 
         x_reg = x_res.clone().detach().requires_grad_(True)
         d_reg = d_net(x_reg)
-        if cfg.reg.smoothness_type == "tv":
+        if smoothness_type == "tv":
             reg_smooth = physics.tv_smoothness_d(x_reg, d_reg)
         else:
             reg_smooth = physics.h1_smoothness_d(x_reg, d_reg)
@@ -506,99 +485,83 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
         reg_scale = physics.scale_anchor(d_reg, d_target)
 
         total_loss = (
-            cfg.reg.w_data * data_loss
+            w_data * data_loss
             + phys_loss
-            + cfg.reg.wreg_smooth * reg_smooth
-            + cfg.reg.wreg_scale * reg_scale
+            + wreg_smooth * reg_smooth
+            + wreg_scale * reg_scale
         )
         return (
-            total_loss,
-            data_loss,
-            phys_loss,
-            res_loss,
-            jump_loss,
-            reg_smooth,
-            reg_scale,
-            b0_star,
-            d_reg,
-            integral_unit,
+            total_loss, data_loss, phys_loss, res_loss, jump_loss, bc_loss,
+            reg_smooth, reg_scale, b0_star, d_reg, integral_unit
         )
 
     # =========================================================================
     # MAIN FINETUNE LOOP
     # =========================================================================
-    # PINN jointly trains d_net and u_net to minimize the composite loss:
-    #   total = w_data*data_loss + physics_loss + regularization
-    #
-    # Unlike BiLO's bilevel approach, PINN trains both networks simultaneously
-    # with gradients flowing through both. This is simpler but can lead to
-    # conflicts between fitting data and satisfying physics.
-    for step in range(cfg.train.finetune_iters + 1):
-        # For Adam: zero gradients before forward pass
-        # For LBFGS: gradients are zeroed inside the closure
+    for step in range(finetune_iters + 1):
         if not use_lbfgs:
             optimizer.zero_grad(set_to_none=True)
 
-        # Forward pass: compute all losses
+        # Forward pass
         (
-            total_loss,
-            data_loss,
-            phys_loss,
-            res_loss,
-            jump_loss,
-            reg_smooth,
-            reg_scale,
-            b0_star,
-            d_reg,
-            integral_unit,
+            total_loss, data_loss, phys_loss, res_loss, jump_loss, bc_loss,
+            reg_smooth, reg_scale, b0_star, d_reg, integral_unit
         ) = _compute_losses()
 
-        # ---------------------------------------------------------------------
-        # LOGGING: Record metrics every log_every steps
-        # ---------------------------------------------------------------------
-        if step % cfg.train.log_every == 0:
+        # -----------------------------------------------------------------
+        # LOGGING
+        # -----------------------------------------------------------------
+        if step % log_every == 0:
             with torch.no_grad():
                 d_vals = d_reg.detach()
                 mean_d = torch.mean(d_vals).item()
                 d_snapshot = d_vals.detach().cpu().numpy().reshape(-1)
-                if data_bundle.mode == "field":
-                    # Integral is only needed for logging in field mode.
+                if mode == "field":
                     u_hat_res, _ = u_net(x_res, z_tensor)
                     integral_unit = torch.trapezoid(u_hat_res.view(-1), x_res.view(-1))
-                u_int = (b0_star * integral_unit).item() if integral_unit is not None else 0.0
-            history["iter"].append(step)
-            history["total"].append(total_loss.item())
-            history["data"].append(data_loss.item())
-            history["phys"].append(phys_loss.item())
-            history["res"].append(res_loss.item())
-            history["jump"].append(jump_loss.item())
-            history["reg_smooth"].append(reg_smooth.item())
-            history["reg_scale"].append(reg_scale.item())
-            history["b0_star"].append(b0_star.item())
-            history["mean_d"].append(mean_d)
-            history["d_snap_iters"].append(step)
-            history["d_snapshots"].append(d_snapshot)
-            if verbose:
-                loss_name = cfg.data.field_loss if data_bundle.mode == "field" else "ppp"
-                reg_smooth_eff = cfg.reg.wreg_smooth * reg_smooth
-                reg_scale_eff = cfg.reg.wreg_scale * reg_scale
-                print(
-                    f"[PINN|finetune] Iter {step:05d} | Ltot: {total_loss.item():.3e}\
-"
-                    f"  Ldata({loss_name}): {data_loss.item():.3e} | Lphys: {phys_loss.item():.3e} | "
-                    f"RegSmooth: {reg_smooth.item():.3e} (eff: {reg_smooth_eff.item():.3e}) | "
-                    f"RegScale: {reg_scale.item():.3e} (eff: {reg_scale_eff.item():.3e})\
-"
-                    f"  Lres: {res_loss.item():.3e} | Ljump: {jump_loss.item():.3e}\
-"
-                    f"  b₀*: {b0_star.item():.2f} | ∫û: {integral_unit.item():.3e} | ∫u: {u_int:.3e} | ⟨D⟩: {mean_d:.3e}"
-                )
 
-        # ---------------------------------------------------------------------
-        # EARLY STOPPING: Stop if loss plateaus after burn-in period
-        # ---------------------------------------------------------------------
+            history.log(
+                step=step,
+                total=total_loss.item(),
+                data=data_loss.item(),
+                phys=phys_loss.item(),
+                res=res_loss.item(),
+                jump=jump_loss.item(),
+                bc=bc_loss.item(),
+                reg_smooth=reg_smooth.item(),
+                reg_scale=reg_scale.item(),
+                b0_star=b0_star.item(),
+                mean_d=mean_d,
+            )
+            history.log_snapshot(step, d_snapshot)
+
+            if verbose:
+                loss_name = field_loss_type if mode == "field" else "ppp"
+                print(format_pinn_progress(
+                    step=step,
+                    phase="finetune",
+                    total=total_loss.item(),
+                    data=data_loss.item(),
+                    phys=phys_loss.item(),
+                    res=res_loss.item(),
+                    jump=jump_loss.item(),
+                    bc=bc_loss.item(),
+                    reg_smooth=reg_smooth.item(),
+                    reg_scale=reg_scale.item(),
+                    wreg_smooth=wreg_smooth,
+                    wreg_scale=wreg_scale,
+                    b0_star=b0_star.item(),
+                    integral_unit=integral_unit.item(),
+                    mean_d=mean_d,
+                    loss_name=loss_name,
+                    bc_type=bc_type,
+                ))
+
+        # -----------------------------------------------------------------
+        # EARLY STOPPING
+        # -----------------------------------------------------------------
         stop_training = False
-        if step >= cfg.train.early_burnin:
+        if step >= early_burnin:
             total_val = total_loss.item()
             if best_total is None:
                 best_total = total_val
@@ -606,20 +569,19 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
             else:
                 denom = max(abs(best_total), 1e-12)
                 improvement = (best_total - total_val) / denom
-                if improvement > cfg.train.early_tol:
+                if improvement > early_tol:
                     best_total = total_val
                     patience = 0
                 else:
                     patience += 1
-                    if patience >= cfg.train.early_patience:
+                    if patience >= early_patience:
                         stop_training = True
 
-        # ---------------------------------------------------------------------
-        # OPTIMIZER STEP: Update network parameters
-        # ---------------------------------------------------------------------
-        if step < cfg.train.finetune_iters and not stop_training:
+        # -----------------------------------------------------------------
+        # OPTIMIZER STEP
+        # -----------------------------------------------------------------
+        if step < finetune_iters and not stop_training:
             if use_lbfgs:
-                # LBFGS closure: recomputes loss (may be called multiple times)
                 def _lbfgs_closure() -> torch.Tensor:
                     optimizer.zero_grad(set_to_none=True)
                     loss_value = _compute_losses()[0]
@@ -627,7 +589,6 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
                     return loss_value
                 optimizer.step(_lbfgs_closure)
             else:
-                # Standard Adam step
                 total_loss.backward()
                 optimizer.step()
                 if scheduler is not None:
@@ -643,24 +604,16 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
     with torch.no_grad():
         d_final = d_net(x_res)
         u_hat_res, _ = u_net(x_res, z_tensor)
-        if data_bundle.mode == "field":
+        if mode == "field":
             u_hat_field, _ = u_net(x_field, z_tensor)
-            # Get b0 via VarPro projection (or use fixed value if set)
             b0_star = varpro.get_b0_field(
-                u_hat_field,
-                u_true,
-                field_loss=cfg.data.field_loss,
-                b0_fixed_value=b0_fixed_value,
+                u_hat_field, u_true, field_loss=field_loss_type, b0_fixed_value=b0_fixed_value
             )
         else:
             u_hat_int, _ = u_net(x_int, z_tensor)
             integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
-            # Get b0 via VarPro projection (or use fixed value if set)
             b0_star = varpro.get_b0_ppp(
-                ppp.n_obs,
-                ppp.m_obs,
-                integral_unit,
-                b0_fixed_value=b0_fixed_value,
+                ppp.n_obs, ppp.m_obs, integral_unit, b0_fixed_value=b0_fixed_value
             )
         u_pred = b0_star * u_hat_res
         d_pred = d_final
@@ -671,5 +624,5 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
         u_hat_unit=u_hat_res.detach().cpu().view(-1),
         u_pred=u_pred.detach().cpu().view(-1),
         b0_star=float(b0_star.item()),
-        history=history,
+        history=history.to_dict(),
     )

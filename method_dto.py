@@ -18,6 +18,7 @@ from config import Config
 from data import PPPData
 import physics, varpro
 from scale_estimation import estimate_ddi_scale, fit_constant_d
+from training_logger import TrainingHistory, format_dto_progress
 
 
 # =============================================================================
@@ -28,21 +29,17 @@ from scale_estimation import estimate_ddi_scale, fit_constant_d
 # RATIONALE: Both softplus and logD parameterizations have Jacobians proportional
 # to D itself, which causes catastrophic gradient suppression for small D values:
 #
-#   - logD: D = exp(θ) → ∂D/∂θ = D
-#   - softplus: D = softplus(θ) → ∂D/∂θ = sigmoid(θ) ≈ D (for small D)
+#   - logD: D = exp(theta) -> dD/dtheta = D
+#   - softplus: D = softplus(theta) -> dD/dtheta = sigmoid(theta) ~ D (for small D)
 #
-# When D = 0.01, the gradient w.r.t. θ is suppressed by 100x. Combined with the
+# When D = 0.01, the gradient w.r.t. theta is suppressed by 100x. Combined with the
 # already-flat Output Error landscape (see dto_issues.md), this makes optimization
-# nearly impossible—LBFGS reports param_change → 0 within ~20 steps.
+# nearly impossible--LBFGS reports param_change -> 0 within ~20 steps.
 #
 # SOLUTION: Use direct parameterization with projection:
-#   - Store θ = D - D_min as the parameter
-#   - Forward: D = θ + D_min (∂D/∂θ = 1, no suppression!)
-#   - After step: clamp θ ≥ 0 to enforce D ≥ D_min
-#
-# ALTERNATIVE: If projection causes issues, squared parameterization is smoother:
-#   D = θ² + D_min → ∂D/∂θ = 2θ = 2√(D - D_min)
-# This has √D suppression (milder than D), but direct + projection is preferred.
+#   - Store theta = D - D_min as the parameter
+#   - Forward: D = theta + D_min (dD/dtheta = 1, no suppression!)
+#   - After step: clamp theta >= 0 to enforce D >= D_min
 # =============================================================================
 
 D_MIN = 1e-6
@@ -157,24 +154,15 @@ def _build_tridiag_alpha(
     when D is discontinuous (e.g., step profiles). For smooth D, both approaches
     give second-order accuracy, but the harmonic mean is more physically correct
     for heterogeneous media.
-
-    The flux form of the PDE is: J = D^alpha * grad(D^(1-alpha) * u)
-    At interface i+1/2, we need a_half = D^alpha evaluated at the interface.
-    Harmonic mean ensures: 1/a_half = 0.5 * (1/D_i^alpha + 1/D_{i+1}^alpha)
     """
     g = d ** (1.0 - alpha)
 
     # Harmonic mean of D^alpha at cell interfaces for flux continuity
-    # harmonic_mean(a, b) = 2*a*b / (a + b)
     d_alpha_left = d[:-1] ** alpha
     d_alpha_right = d[1:] ** alpha
     a_half = 2.0 * d_alpha_left * d_alpha_right / (d_alpha_left + d_alpha_right + eps) / h
 
-    # Interior volumes: vol[i] = (h[i] + h[i+1]) / 2 (indices shifted)
-    # The 'h' vector has length N-1.
-    # a_half has length N-1.
-    # We need volumes for interior nodes 1..N-2.
-    # vol[k] corresponds to node k+1.
+    # Interior volumes: vol[i] = (h[i] + h[i+1]) / 2
     vol = 0.5 * (h[:-1] + h[1:])
 
     diag = -((a_half[1:] + a_half[:-1]) * g[1:-1] / vol) - mu
@@ -185,8 +173,50 @@ def _build_tridiag_alpha(
     return lower, diag, upper
 
 
+def _build_tridiag_alpha_neumann(
+    d: torch.Tensor,
+    alpha: float,
+    mu: float,
+    h: torch.Tensor,
+    eps: float = 1e-12,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Assemble Neumann tridiagonal coefficients (full grid, zero flux).
+
+    Uses half-cell control volumes at the boundaries to enforce zero flux,
+    while keeping the interior stencil identical to the Dirichlet scheme.
+    """
+    g = d ** (1.0 - alpha)
+
+    d_alpha_left = d[:-1] ** alpha
+    d_alpha_right = d[1:] ** alpha
+    a_half = 2.0 * d_alpha_left * d_alpha_right / (d_alpha_left + d_alpha_right + eps) / h
+
+    # Volumes: half-cell at boundaries, full-cell in interior
+    vol_0 = h[0] / 2.0
+    vol_int = 0.5 * (h[:-1] + h[1:])
+    vol_n1 = h[-1] / 2.0
+
+    # Diagonal
+    diag_0 = -(a_half[0] * g[0]) / vol_0 - mu
+    diag_int = -((a_half[1:] + a_half[:-1]) * g[1:-1] / vol_int) - mu
+    diag_n1 = -(a_half[-1] * g[-1]) / vol_n1 - mu
+    diag = torch.cat([diag_0.unsqueeze(0), diag_int, diag_n1.unsqueeze(0)])
+
+    # Upper diagonal
+    upper_0 = (a_half[0] * g[1]) / vol_0
+    upper_int = (a_half[1:] * g[2:]) / vol_int
+    upper = torch.cat([upper_0.unsqueeze(0), upper_int])
+
+    # Lower diagonal
+    lower_int = (a_half[:-1] * g[:-2]) / vol_int
+    lower_n1 = (a_half[-1] * g[-2]) / vol_n1
+    lower = torch.cat([lower_int, lower_n1.unsqueeze(0)])
+
+    return lower, diag, upper
+
+
 class DtoAlphaVarPro(nn.Module):
-    """Finite-difference solver with a learnable interior D profile."""
+    """Finite-difference solver with a learnable D profile (Dirichlet/Neumann)."""
 
     def __init__(
         self,
@@ -196,6 +226,7 @@ class DtoAlphaVarPro(nn.Module):
         sources: List[float],
         d_init: torch.Tensor,
         d_min: float = D_MIN,
+        bc_type: str = "dirichlet",
     ) -> None:
         super().__init__()
         self.x_res = x_res
@@ -204,83 +235,106 @@ class DtoAlphaVarPro(nn.Module):
         self.sources = list(sources)
         self.d_min = d_min
         self.n = int(x_res.numel())
+        self.bc_type = bc_type.strip().lower()
         if self.n < 3:
             raise ValueError("Need n_res >= 3.")
-        
-        # h is now a vector of interval lengths
+        if self.bc_type not in {"dirichlet", "neumann"}:
+            raise ValueError(f"Unsupported bc_type '{bc_type}'.")
+
+        # h is a vector of interval lengths
         self.h = x_res[1:] - x_res[:-1]
 
-        # Direct parameterization: θ = D - D_min
-        # Forward pass: D = θ + D_min (Jacobian = 1, no gradient suppression)
-        # Constraint: θ ≥ 0 enforced by projection after each optimizer step
-        self.theta_int = nn.Parameter(d_init[1:-1] - d_min)
+        # Direct parameterization: theta = D - D_min
+        if self.bc_type == "dirichlet":
+            self.theta_int = nn.Parameter(d_init[1:-1] - d_min)
+        else:
+            self.theta_int = nn.Parameter(d_init - d_min)
 
+        # Build RHS for unit source
         with torch.no_grad():
-            rhs = torch.zeros(self.n - 2, device=self.x_res.device, dtype=self.x_res.dtype)
-            # vol is needed for RHS scaling
-            vol = 0.5 * (self.h[:-1] + self.h[1:])
-            
-            for z in self.sources:
-                z_t = torch.tensor(float(z), device=self.x_res.device, dtype=self.x_res.dtype)
-                # p2h-s1 hat delta: distribute source to the two nearest grid points
-                idx_right = int(torch.searchsorted(self.x_res, z_t, side="right").item())
-                idx_left = idx_right - 1
-                
-                # Check bounds
-                if idx_left < 0: idx_left = 0
-                if idx_right >= self.n: idx_right = self.n - 1
-                
-                # We need to map global indices to interior RHS indices (0..N-3).
-                # The source contribution is -b0 * w / vol, effectively smearing the
-                # Dirac delta into a hat function with unit integral over the
-                # Voronoi cells.
-                
-                x_left = self.x_res[idx_left]
-                x_right = self.x_res[idx_right]
-                h_interval = x_right - x_left
-                
-                if h_interval < 1e-12:
-                     # Coincides with node?
-                     # If idx_left is an interior node (1..N-2)
-                     if 1 <= idx_left <= self.n - 2:
-                         rhs[idx_left - 1] -= 1.0 / vol[idx_left - 1]
-                else:
-                    w_left = 1.0 - torch.abs(x_left - z_t) / h_interval
-                    w_right = 1.0 - torch.abs(x_right - z_t) / h_interval
-                    
-                    if 1 <= idx_left <= self.n - 2:
-                        rhs[idx_left - 1] -= w_left / vol[idx_left - 1]
-                    if 1 <= idx_right <= self.n - 2:
-                        rhs[idx_right - 1] -= w_right / vol[idx_right - 1]
-                        
+            if self.bc_type == "dirichlet":
+                rhs = torch.zeros(self.n - 2, device=self.x_res.device, dtype=self.x_res.dtype)
+                vol = 0.5 * (self.h[:-1] + self.h[1:])
+
+                for z in self.sources:
+                    z_t = torch.tensor(float(z), device=self.x_res.device, dtype=self.x_res.dtype)
+                    idx_right = int(torch.searchsorted(self.x_res, z_t, side="right").item())
+                    idx_left = idx_right - 1
+
+                    if idx_left < 0:
+                        idx_left = 0
+                    if idx_right >= self.n:
+                        idx_right = self.n - 1
+
+                    x_left = self.x_res[idx_left]
+                    x_right = self.x_res[idx_right]
+                    h_interval = x_right - x_left
+
+                    if h_interval < 1e-12:
+                        if 1 <= idx_left <= self.n - 2:
+                            rhs[idx_left - 1] -= 1.0 / vol[idx_left - 1]
+                    else:
+                        w_left = 1.0 - torch.abs(x_left - z_t) / h_interval
+                        w_right = 1.0 - torch.abs(x_right - z_t) / h_interval
+
+                        if 1 <= idx_left <= self.n - 2:
+                            rhs[idx_left - 1] -= w_left / vol[idx_left - 1]
+                        if 1 <= idx_right <= self.n - 2:
+                            rhs[idx_right - 1] -= w_right / vol[idx_right - 1]
+            else:
+                rhs = torch.zeros(self.n, device=self.x_res.device, dtype=self.x_res.dtype)
+                vol = torch.empty(self.n, device=self.x_res.device, dtype=self.x_res.dtype)
+                vol[0] = self.h[0] / 2.0
+                vol[-1] = self.h[-1] / 2.0
+                if self.n > 2:
+                    vol[1:-1] = 0.5 * (self.h[:-1] + self.h[1:])
+
+                for z in self.sources:
+                    z_t = torch.tensor(float(z), device=self.x_res.device, dtype=self.x_res.dtype)
+                    idx_right = int(torch.searchsorted(self.x_res, z_t, side="right").item())
+                    idx_left = idx_right - 1
+
+                    if idx_left < 0:
+                        idx_left = 0
+                    if idx_right >= self.n:
+                        idx_right = self.n - 1
+
+                    x_left = self.x_res[idx_left]
+                    x_right = self.x_res[idx_right]
+                    h_interval = x_right - x_left
+
+                    if h_interval < 1e-12:
+                        rhs[idx_left] -= 1.0 / vol[idx_left]
+                    else:
+                        w_left = 1.0 - torch.abs(x_left - z_t) / h_interval
+                        w_right = 1.0 - torch.abs(x_right - z_t) / h_interval
+                        rhs[idx_left] -= w_left / vol[idx_left]
+                        rhs[idx_right] -= w_right / vol[idx_right]
+
         self.register_buffer("rhs_unit", rhs)
 
     def build_d_full(self) -> torch.Tensor:
-        """Build full D array from interior parameters.
-
-        Uses direct parameterization: D = θ + D_min (Jacobian = 1).
-        Boundary values are mirrored from adjacent interior nodes.
-        """
-        d = torch.empty(self.n, device=self.x_res.device, dtype=self.x_res.dtype)
-        # Direct parameterization: no softplus, no gradient suppression
-        d[1:-1] = self.theta_int + self.d_min
-        d[0] = d[1]
-        d[-1] = d[-2]
-        return d
+        """Build full D array from interior parameters."""
+        if self.bc_type == "dirichlet":
+            d = torch.empty(self.n, device=self.x_res.device, dtype=self.x_res.dtype)
+            d[1:-1] = self.theta_int + self.d_min
+            d[0] = d[1]
+            d[-1] = d[-2]
+            return d
+        return self.theta_int + self.d_min
 
     def solve_unit_u_hat(self, d_full: torch.Tensor) -> torch.Tensor:
-        """Solve for the unit-source response u_hat given D.
+        """Solve for the unit-source response u_hat given D."""
+        if self.bc_type == "dirichlet":
+            lower, diag, upper = _build_tridiag_alpha(d_full, self.alpha, self.mu, self.h)
+            u_int = _thomas_solve(lower, diag, upper, self.rhs_unit)
 
-        Uses a cached unit-source RHS vector to avoid per-iteration rebuilds.
-        """
-        lower, diag, upper = _build_tridiag_alpha(d_full, self.alpha, self.mu, self.h)
-        u_int = _thomas_solve(lower, diag, upper, self.rhs_unit)
+            u = torch.zeros(self.n, device=self.x_res.device, dtype=d_full.dtype)
+            u[1:-1] = u_int
+            return u
 
-        # Build full solution with boundary conditions (u=0 at boundaries)
-        u = torch.zeros(self.n, device=self.x_res.device, dtype=d_full.dtype)
-        u[1:-1] = u_int
-
-        return u
+        lower, diag, upper = _build_tridiag_alpha_neumann(d_full, self.alpha, self.mu, self.h)
+        return _thomas_solve(lower, diag, upper, self.rhs_unit)
 
 
 def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
@@ -294,12 +348,60 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
     Returns:
         DTOResult with predictions on the solver grid (x_res) and training history.
     """
+    # =========================================================================
+    # CONFIG EXTRACTION
+    # =========================================================================
+    # Extract all config values upfront for clarity. This makes dependencies
+    # explicit and reduces visual clutter in the core algorithm.
     device = cfg.run.torch_device
     dtype = cfg.run.torch_dtype
 
-    if len(cfg.physics.sources) != 1:
+    # Physics
+    alpha = cfg.physics.alpha
+    mu = cfg.physics.mu
+    sources = cfg.physics.sources
+    bc_type = cfg.physics.bc_type
+
+    # Data
+    mode = data_bundle.mode
+    field_loss_type = cfg.data.field_loss
+    b0_fixed_value = cfg.data.b0_fixed_value
+
+    # D profile initialization
+    use_ddi = cfg.d_profile.use_ddi
+    ddi_d_min, ddi_d_max = cfg.d_profile.ddi_d_min, cfg.d_profile.ddi_d_max
+    pert_scale, pert_freq = cfg.d_profile.pert_scale, cfg.d_profile.pert_freq
+
+    # Regularization
+    wreg_smooth, wreg_scale = cfg.reg.wreg_smooth, cfg.reg.wreg_scale
+    smoothness_type = cfg.reg.smoothness_type
+
+    # Training
+    finetune_iters = cfg.train.finetune_iters
+    lr_d_fine = cfg.train.lr_d_fine
+    use_lbfgs = cfg.train.optimizer == "lbfgs"
+    lbfgs_lr, lbfgs_max_iter = cfg.train.lbfgs_lr, cfg.train.lbfgs_max_iter
+    use_scheduler = cfg.train.use_scheduler
+    log_every = cfg.train.log_every
+    scalar_fit_iters = cfg.train.scalar_fit_iters
+
+    # Early stopping
+    early_burnin = cfg.train.early_burnin
+    early_patience = cfg.train.early_patience
+    early_tol = cfg.train.early_tol
+
+    # Architecture
+    d_min = getattr(cfg.arch, "d_min", D_MIN)
+
+    # =========================================================================
+    # INPUT VALIDATION
+    # =========================================================================
+    if len(sources) != 1:
         raise NotImplementedError("DTO currently supports a single source.")
 
+    # =========================================================================
+    # DATA PREPARATION
+    # =========================================================================
     x_res = data_bundle.x_res.to(device=device, dtype=dtype)
     if x_res.ndim != 1:
         x_res = x_res.view(-1)
@@ -309,46 +411,47 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
         if x_field.ndim != 1:
             x_field = x_field.view(-1)
 
-    if data_bundle.mode == "field":
+    if mode == "field":
         u_true = data_bundle.u_true.to(device=device, dtype=dtype).view(-1)
         ppp = None
-        x_int = None
+        interp_particles = None
     else:
         ppp = PPPData(
             x_particles=data_bundle.ppp.x_particles.to(device=device, dtype=dtype).view(-1),
             m_obs=data_bundle.ppp.m_obs,
         )
         u_true = None
-        # x_int and its interpolation are no longer needed for the integral
-        # because we will integrate directly on x_res.
         interp_particles = varpro.precompute_interp_1d(x_res, ppp.x_particles)
 
-    if cfg.d_profile.use_ddi:
-        z0 = cfg.physics.sources[0]
+    # =========================================================================
+    # SCALE ESTIMATION
+    # =========================================================================
+    if use_ddi:
         d_ddi = estimate_ddi_scale(
-            mu=cfg.physics.mu,
-            z=z0,
+            mu=mu,
+            z=sources[0],
             x_particles=ppp.x_particles if ppp is not None else None,
             u_field=u_true if u_true is not None else None,
             x_grid=x_field,
-            d_min=cfg.d_profile.ddi_d_min,
-            d_max=cfg.d_profile.ddi_d_max,
+            d_min=ddi_d_min,
+            d_max=ddi_d_max,
         )
     else:
         d_ddi = 1.0
 
-    if cfg.train.scalar_fit_iters > 0:
+    if scalar_fit_iters > 0:
         d_scale = fit_constant_d(
             x=x_res,
-            alpha=cfg.physics.alpha,
-            mu=cfg.physics.mu,
-            sources=cfg.physics.sources,
+            alpha=alpha,
+            mu=mu,
+            sources=sources,
             u_true=u_true if u_true is not None else None,
             ppp=ppp if ppp is not None else None,
             x_field=x_field if u_true is not None else None,
             d_init=d_ddi,
-            max_iters=cfg.train.scalar_fit_iters,
-            field_loss=cfg.data.field_loss,
+            max_iters=scalar_fit_iters,
+            field_loss=field_loss_type,
+            bc_type=bc_type,
             verbose=verbose,
         )
     else:
@@ -360,251 +463,164 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
 
     d_target = d_scale
 
-    if cfg.d_profile.pert_scale > 0.0:
-        d_init = _init_d_profile(
-            x_res,
-            base=d_scale,
-            scale=cfg.d_profile.pert_scale,
-            freq=cfg.d_profile.pert_freq,
-        )
+    # =========================================================================
+    # MODEL INITIALIZATION
+    # =========================================================================
+    if pert_scale > 0.0:
+        d_init = _init_d_profile(x_res, base=d_scale, scale=pert_scale, freq=pert_freq)
     else:
         d_init = d_scale * torch.ones_like(x_res)
 
-    d_min = getattr(cfg.arch, "d_min", D_MIN)
     model = DtoAlphaVarPro(
         x_res=x_res,
-        alpha=cfg.physics.alpha,
-        mu=cfg.physics.mu,
-        sources=list(cfg.physics.sources),
+        alpha=alpha,
+        mu=mu,
+        sources=list(sources),
         d_init=d_init,
         d_min=d_min,
+        bc_type=bc_type,
     ).to(device=device, dtype=dtype)
 
     # =========================================================================
     # OPTIMIZER SETUP
     # =========================================================================
-    # DTO supports two optimizers:
-    #   - Adam: First-order, robust to noisy gradients, good default
-    #   - LBFGS: Quasi-Newton, uses curvature info, better for ill-conditioned
-    #            problems like DTO where the loss landscape has flat valleys
-    #
-    # LBFGS is recommended for DTO because:
-    #   1. Few parameters (~n_res grid values) fit in LBFGS memory
-    #   2. The output-error loss landscape is ill-conditioned (see dto_issues.md)
-    #   3. LBFGS can take large steps along flat valleys where Adam stalls
-    use_lbfgs = cfg.train.optimizer == "lbfgs"
-    optimizer = None
-    scheduler = None
-
     if use_lbfgs:
         optimizer = torch.optim.LBFGS(
             [model.theta_int],
-            lr=cfg.train.lbfgs_lr,
-            max_iter=cfg.train.lbfgs_max_iter,
-            history_size=10,              # How many past gradients to remember
-            line_search_fn="strong_wolfe", # Use strong_wolfe to handle curvature
+            lr=lbfgs_lr,
+            max_iter=lbfgs_max_iter,
+            history_size=10,
+            line_search_fn="strong_wolfe",
         )
+        scheduler = None
     else:
-        optimizer = torch.optim.Adam([model.theta_int], lr=cfg.train.lr_d_fine)
-        if cfg.train.use_scheduler and cfg.train.finetune_iters > 0:
-            # Cosine annealing: smoothly reduce LR from initial to 10% over training
+        optimizer = torch.optim.Adam([model.theta_int], lr=lr_d_fine)
+        scheduler = None
+        if use_scheduler and finetune_iters > 0:
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=cfg.train.finetune_iters,
-                eta_min=cfg.train.lr_d_fine * 0.1,
+                optimizer, T_max=finetune_iters, eta_min=lr_d_fine * 0.1
             )
 
     # =========================================================================
     # TRAINING HISTORY
     # =========================================================================
-    # We track metrics at each logged iteration for diagnostics and plotting.
-    # Keys:
-    #   iter         - iteration number
-    #   total        - total loss (data + weighted regularization)
-    #   data         - data fidelity loss (MSE, RLE, or PPP NLL depending on mode)
-    #   reg_smooth   - smoothness penalty on D (H1 or TV, unweighted)
-    #   reg_scale    - scale anchor penalty (deviation from DDI estimate, unweighted)
-    #   b0_star      - projected source amplitude via VarPro
-    #   mean_d       - spatial average of D(x) for monitoring scale drift
-    #   d_snap_iters - iterations where D snapshots were saved
-    #   d_snapshots  - list of D(x) arrays at those iterations (for evolution plots)
-    history: Dict[str, List[float]] = {
-        "iter": [],
-        "total": [],
-        "data": [],
-        "reg_smooth": [],
-        "reg_scale": [],
-        "b0_star": [],
-        "mean_d": [],
-        "d_snap_iters": [],
-        "d_snapshots": [],
-    }
+    history = TrainingHistory.for_dto()
 
-    # Early stopping state: track best loss and patience counter
+    # Early stopping state
     best_total: Optional[float] = None
     patience = 0
 
     # =========================================================================
-    # FIXED B0 SETTING
+    # LOSS COMPUTATION
     # =========================================================================
-    # If b0_fixed_value is set, use it instead of VarPro projection.
-    # This is useful when the source amplitude is known a priori.
-    b0_fixed_value = cfg.data.b0_fixed_value
-
-    # =========================================================================
-    # LOSS COMPUTATION (shared by logging and LBFGS closure)
-    # =========================================================================
-    # This inner function computes all loss components in one forward pass.
-    # It's defined here so LBFGS can call it inside its closure (LBFGS may
-    # evaluate the loss multiple times per step during line search).
-    #
-    # Returns: (d_full, u_hat_unit, b0_star, data_loss, reg_smooth, reg_scale, total_loss)
-    #   - d_full: Full D(x) array on solver grid (with boundary mirroring)
-    #   - u_hat_unit: Unit-source solution (b0=1) from Thomas algorithm
-    #   - b0_star: Optimal amplitude from VarPro projection (or fixed value if fix_b0=True)
-    #   - data_loss: Data fidelity (MSE/RLE for field, NLL for particles)
-    #   - reg_smooth: Smoothness penalty (H1 or TV on log D)
-    #   - reg_scale: Scale anchor penalty (deviation from d_target)
-    #   - total_loss: Weighted sum for optimization
     def _compute_losses() -> Tuple[torch.Tensor, ...]:
         d_full = model.build_d_full()
         u_hat_unit = model.solve_unit_u_hat(d_full)
 
-        if data_bundle.mode == "field":
+        if mode == "field":
             if x_field.numel() == x_res.numel() and torch.allclose(x_field, x_res):
                 u_hat_field = u_hat_unit
             else:
                 u_hat_field = varpro.interpolate_1d(u_hat_unit, x_res, x_field)
-            # Get b0 via VarPro projection (or use fixed value if set)
             b0_star = varpro.get_b0_field(
-                u_hat_field,
-                u_true,
-                field_loss=cfg.data.field_loss,
-                b0_fixed_value=b0_fixed_value,
+                u_hat_field, u_true, field_loss=field_loss_type, b0_fixed_value=b0_fixed_value
             )
             data_loss = varpro.field_data_loss(
-                u_hat_field,
-                u_true,
-                b0_star,
-                field_loss=cfg.data.field_loss,
+                u_hat_field, u_true, b0_star, field_loss=field_loss_type
             )
         else:
-            # Integrate directly on x_res to avoid aliasing errors from grid mismatch
             integral_unit = torch.trapezoid(u_hat_unit.view(-1), x_res.view(-1))
-            # Get b0 via VarPro projection (or use fixed value if set)
             b0_star = varpro.get_b0_ppp(
-                ppp.n_obs,
-                ppp.m_obs,
-                integral_unit,
-                b0_fixed_value=b0_fixed_value,
+                ppp.n_obs, ppp.m_obs, integral_unit, b0_fixed_value=b0_fixed_value
             )
             u_hat_obs = varpro.interpolate_1d_precomputed(u_hat_unit, *interp_particles)
-            data_loss = varpro.ppp_nll(
-                u_hat_obs,
-                b0_star,
-                ppp.m_obs,
-                integral_unit,
-            )
+            data_loss = varpro.ppp_nll(u_hat_obs, b0_star, ppp.m_obs, integral_unit)
 
-        if cfg.reg.smoothness_type == "tv":
-            reg_smooth = physics.tv_smoothness_d_discrete(
-                d_full, h=float(model.h[0].item())
-            )
+        if smoothness_type == "tv":
+            reg_smooth = physics.tv_smoothness_d_discrete(d_full, h=float(model.h[0].item()))
         else:
-            reg_smooth = physics.h1_smoothness_d_discrete(
-                d_full, h=float(model.h[0].item())
-            )
+            reg_smooth = physics.h1_smoothness_d_discrete(d_full, h=float(model.h[0].item()))
+
         reg_scale = physics.scale_anchor(d_full, d_target)
-        total_loss = (
-            data_loss
-            + cfg.reg.wreg_smooth * reg_smooth
-            + cfg.reg.wreg_scale * reg_scale
-        )
+        total_loss = data_loss + wreg_smooth * reg_smooth + wreg_scale * reg_scale
 
         return d_full, u_hat_unit, b0_star, data_loss, reg_smooth, reg_scale, total_loss
 
     # =========================================================================
     # MAIN TRAINING LOOP
     # =========================================================================
-    # DTO uses single-level optimization: we directly optimize the grid values
-    # of D to minimize data loss + regularization. The forward pass solves the
-    # PDE via Thomas algorithm, projects b0 via VarPro, and computes losses.
-    for step in range(cfg.train.finetune_iters + 1):
-        # For Adam: zero gradients before forward pass
-        # For LBFGS: gradients are zeroed inside the closure
+    for step in range(finetune_iters + 1):
         if not use_lbfgs:
             optimizer.zero_grad(set_to_none=True)
 
-        # Forward pass: compute D, solve PDE, project b0, compute losses
+        # Forward pass
         d_full, u_hat_unit, b0_star, data_loss, reg_smooth, reg_scale, total_loss = (
             _compute_losses()
         )
 
-        # ---------------------------------------------------------------------
-        # LOGGING: Record metrics every log_every steps
-        # ---------------------------------------------------------------------
-        if step % cfg.train.log_every == 0:
+        # -----------------------------------------------------------------
+        # LOGGING
+        # -----------------------------------------------------------------
+        if step % log_every == 0:
             with torch.no_grad():
                 mean_d = torch.mean(d_full).item()
                 integral_unit = torch.trapezoid(u_hat_unit.view(-1), x_res.view(-1))
-                u_int = (b0_star * integral_unit).item()
                 d_snapshot = d_full.detach().cpu().numpy()
 
-            # Append to history for later analysis/plotting
-            history["iter"].append(step)
-            history["total"].append(total_loss.item())
-            history["data"].append(data_loss.item())
-            history["reg_smooth"].append(reg_smooth.item())
-            history["reg_scale"].append(reg_scale.item())
-            history["b0_star"].append(b0_star.item())
-            history["mean_d"].append(mean_d)
-            history["d_snap_iters"].append(step)
-            history["d_snapshots"].append(d_snapshot)
-            if verbose:
-                loss_name = cfg.data.field_loss if data_bundle.mode == "field" else "ppp"
-                reg_smooth_eff = cfg.reg.wreg_smooth * reg_smooth
-                reg_scale_eff = cfg.reg.wreg_scale * reg_scale
-                print(
-                    f"[DTO] Iter {step:05d} | Ltot: {total_loss.item():.3e}\n"
-                    f"  Ldata({loss_name}): {data_loss.item():.3e} | "
-                    f"RegSmooth: {reg_smooth.item():.3e} (eff: {reg_smooth_eff.item():.3e}) | "
-                    f"RegScale: {reg_scale.item():.3e} (eff: {reg_scale_eff.item():.3e})\n"
-                    f"  b₀*: {b0_star.item():.2f} | ∫û: {integral_unit.item():.3e} | ∫u: {u_int:.3e} | ⟨D⟩: {mean_d:.3e}"
-                )
+            history.log(
+                step=step,
+                total=total_loss.item(),
+                data=data_loss.item(),
+                reg_smooth=reg_smooth.item(),
+                reg_scale=reg_scale.item(),
+                b0_star=b0_star.item(),
+                mean_d=mean_d,
+            )
+            history.log_snapshot(step, d_snapshot)
 
-        # ---------------------------------------------------------------------
-        # EARLY STOPPING: Stop if loss plateaus after burn-in period
-        # ---------------------------------------------------------------------
-        # We wait until early_burnin steps before checking, then track whether
-        # the loss improves by at least early_tol (relative). If no improvement
-        # for early_patience consecutive checks, we stop training.
+            if verbose:
+                loss_name = field_loss_type if mode == "field" else "ppp"
+                print(format_dto_progress(
+                    step=step,
+                    total=total_loss.item(),
+                    data=data_loss.item(),
+                    reg_smooth=reg_smooth.item(),
+                    reg_scale=reg_scale.item(),
+                    wreg_smooth=wreg_smooth,
+                    wreg_scale=wreg_scale,
+                    b0_star=b0_star.item(),
+                    integral_unit=integral_unit.item(),
+                    mean_d=mean_d,
+                    loss_name=loss_name,
+                ))
+
+        # -----------------------------------------------------------------
+        # EARLY STOPPING
+        # -----------------------------------------------------------------
         stop_training = False
-        if step >= cfg.train.early_burnin:
+        if step >= early_burnin:
             total_val = total_loss.item()
             if best_total is None:
                 best_total = total_val
                 patience = 0
             else:
-                # Compute relative improvement
                 denom = max(abs(best_total), 1e-12)
                 improvement = (best_total - total_val) / denom
-                if improvement > cfg.train.early_tol:
+                if improvement > early_tol:
                     best_total = total_val
                     patience = 0
                 else:
                     patience += 1
-                    if patience >= cfg.train.early_patience:
+                    if patience >= early_patience:
                         stop_training = True
 
-        # ---------------------------------------------------------------------
-        # OPTIMIZER STEP: Update parameters
-        # ---------------------------------------------------------------------
-        if step < cfg.train.finetune_iters and not stop_training:
+        # -----------------------------------------------------------------
+        # OPTIMIZER STEP
+        # -----------------------------------------------------------------
+        if step < finetune_iters and not stop_training:
             if use_lbfgs:
-                # LBFGS requires a closure that recomputes the loss (it may call
-                # this multiple times during line search). The closure must:
-                # 1. Zero gradients, 2. Compute loss, 3. Call backward, 4. Return loss
                 closure_calls = 0
+
                 def _lbfgs_closure() -> torch.Tensor:
                     nonlocal closure_calls
                     closure_calls += 1
@@ -613,27 +629,23 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
                     loss_value.backward()
                     return loss_value.detach()
 
-                # Track whether LBFGS actually updated parameters
                 theta_before = model.theta_int.data.clone()
                 optimizer.step(_lbfgs_closure)
 
-                # PROJECT: Enforce θ ≥ 0 to maintain D ≥ D_min
-                # This is the key fix for gradient suppression—direct parameterization
-                # with projection preserves full gradient magnitude (∂D/∂θ = 1).
+                # Project to enforce D >= D_min
                 with torch.no_grad():
                     model.theta_int.data.clamp_(min=0)
 
-                theta_after = model.theta_int.data
-                param_change = (theta_after - theta_before).abs().max().item()
-                grad_norm = model.theta_int.grad.norm().item() if model.theta_int.grad is not None else 0.0
-                if step % cfg.train.log_every == 0 and verbose:
+                if step % log_every == 0 and verbose:
+                    theta_after = model.theta_int.data
+                    param_change = (theta_after - theta_before).abs().max().item()
+                    grad_norm = model.theta_int.grad.norm().item() if model.theta_int.grad is not None else 0.0
                     print(f"  [LBFGS DEBUG] grad_norm: {grad_norm:.3e} | param_change: {param_change:.3e} | closure_calls: {closure_calls}")
             else:
-                # Standard Adam step: backward then step
                 total_loss.backward()
                 optimizer.step()
 
-                # PROJECT: Enforce θ ≥ 0 to maintain D ≥ D_min
+                # Project to enforce D >= D_min
                 with torch.no_grad():
                     model.theta_int.data.clamp_(min=0)
 
@@ -647,31 +659,21 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
     # =========================================================================
     # FINAL RESULT EXTRACTION
     # =========================================================================
-    # After training, compute final predictions with no gradients needed.
     with torch.no_grad():
         d_full = model.build_d_full()
         u_hat_unit = model.solve_unit_u_hat(d_full)
-        if data_bundle.mode == "field":
+        if mode == "field":
             if x_field.numel() == x_res.numel() and torch.allclose(x_field, x_res):
                 u_hat_field = u_hat_unit
             else:
                 u_hat_field = varpro.interpolate_1d(u_hat_unit, x_res, x_field)
-            # Get b0 via VarPro projection (or use fixed value if set)
             b0_star = varpro.get_b0_field(
-                u_hat_field,
-                u_true,
-                field_loss=cfg.data.field_loss,
-                b0_fixed_value=b0_fixed_value,
+                u_hat_field, u_true, field_loss=field_loss_type, b0_fixed_value=b0_fixed_value
             )
         else:
-            # Consistent integration on x_res
             integral_unit = torch.trapezoid(u_hat_unit.view(-1), x_res.view(-1))
-            # Get b0 via VarPro projection (or use fixed value if set)
             b0_star = varpro.get_b0_ppp(
-                ppp.n_obs,
-                ppp.m_obs,
-                integral_unit,
-                b0_fixed_value=b0_fixed_value,
+                ppp.n_obs, ppp.m_obs, integral_unit, b0_fixed_value=b0_fixed_value
             )
         u_pred = b0_star * u_hat_unit
         d_pred = d_full
@@ -682,5 +684,5 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
         u_hat_unit=u_hat_unit.detach().cpu(),
         u_pred=u_pred.detach().cpu(),
         b0_star=float(b0_star.item()),
-        history=history,
+        history=history.to_dict(),
     )

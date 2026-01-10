@@ -73,6 +73,7 @@ def fit_constant_d(
     max_iters: int = 500,
     lr: float = 0.1,
     field_loss: str = "mse",
+    bc_type: str = "dirichlet",
     verbose: bool = False,
 ) -> float:
     """Fit a constant D by minimizing data loss via differentiable FDM.
@@ -93,6 +94,7 @@ def fit_constant_d(
         max_iters: Optimization iterations.
         lr: Adam learning rate.
         field_loss: "mse" or "rle" (field mode).
+        bc_type: Boundary condition type ("dirichlet" or "neumann").
         verbose: Print optimization progress.
 
     Returns:
@@ -141,8 +143,8 @@ def fit_constant_d(
         optimizer.zero_grad(set_to_none=True)
 
         d_vec = d_const.expand(x.numel())
-        u_hat = physics.fdm_solve_alpha_dirichlet_torch(
-            d_vec, alpha, mu, x, 1.0, sources
+        u_hat = physics.fdm_solve_alpha_torch(
+            d_vec, alpha, mu, x, 1.0, sources, bc_type=bc_type
         )
 
         if u_true is not None:

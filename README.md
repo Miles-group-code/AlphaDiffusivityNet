@@ -53,7 +53,7 @@ The physics and domain settings are fully configurable via the `Problem` interfa
 *   **`mu`**: Degradation rate (controls the exponential decay length scale).
 *   **`d_profile`**: Shape of the ground truth D(x) (e.g., "sinusoidal", "steps").
     *   *Note*: The "steps" profile applies a random phase shift to avoid grid alignment.
-*   **`bc_type`**: Boundary conditions (currently supports `dirichlet`).
+*   **`bc_type`**: Boundary conditions (`dirichlet` or `neumann`). Neumann (zero-flux) BCs are only implemented for `alpha=1` (Fickian); other alpha values will print a warning about non-identifiability.
 *   **`sources`**: Location(s) of the point source(s) $z$.
 *   **`domain`**: Spatial extent $[x_{min}, x_{max}]$ (default $[0, 1]$).
 *   **`b_true`**: (Synthetic) True source amplitude for generating ground truth.
@@ -163,6 +163,7 @@ solution = solve(problem, method="pinn", **settings)
     *   `method_dto.py`: Discretize-Then-Optimize implementation.
     *   `method_pinn.py`: PINN implementation.
     *   `method_bilo.py`: BiLO implementation.
+*   `training_logger.py`: Training history tracking and progress formatters.
 *   `diagnostics.py`: Plotting and metric calculation tools.
 
 ## License

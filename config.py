@@ -35,7 +35,7 @@ class PhysicsConfig:
     domain: Tuple[float, float] = (0.0, 1.0)  # Assumed nondimensionalized to [0, 1]
     sources: Tuple[float, ...] = (0.5,)
     b_true: float = 100.0
-    bc_type: str = "dirichlet"
+    bc_type: str = "dirichlet"  # "dirichlet" (u=0) or "neumann" (zero flux)
 
     def validate(self) -> None:
         """Validate physics parameters for consistency."""
@@ -45,8 +45,11 @@ class PhysicsConfig:
             raise ValueError(f"domain must be (min, max) with min < max, got {self.domain}")
         if any(z <= self.domain[0] or z >= self.domain[1] for z in self.sources):
             raise ValueError(f"source locations must lie strictly within domain, got {self.sources}")
-        if self.bc_type.lower() != "dirichlet":
-            raise ValueError(f"unsupported bc_type '{self.bc_type}' (only dirichlet supported)")
+        self.bc_type = self.bc_type.strip().lower()
+        if self.bc_type not in {"dirichlet", "neumann"}:
+            raise ValueError(
+                f"unsupported bc_type '{self.bc_type}' (use 'dirichlet' or 'neumann')"
+            )
 
 
 @dataclass
@@ -165,11 +168,13 @@ class RegConfig:
     Regularization notes:
     - wreg_smooth: Penalizes fluctuations in log(D) to ensure scale invariance.
     - wreg_scale: Anchors log(D) to the data-driven initialization estimate.
+    - w_bc: Boundary-condition penalty for Neumann BCs (ignored for Dirichlet).
     """
 
     w_data: float = 1.0
     w_phys: float = 1.0
     w_jump: float = 1.0
+    w_bc: float = 1.0
     w_resgrad: float = 0.01
     wreg_smooth: float = 1e-7
     wreg_scale: float = 0.1
@@ -179,6 +184,8 @@ class RegConfig:
         """Validate regularization weights."""
         if self.smoothness_type not in {"h1", "tv"}:
             raise ValueError("smoothness_type must be 'h1' or 'tv'.")
+        if self.w_bc < 0.0:
+            raise ValueError("w_bc must be non-negative.")
 
 
 @dataclass

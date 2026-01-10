@@ -1,6 +1,18 @@
 # Changelog
 
-## [Unreleased]
+## [v4.0.1] - 2026-01-09
+- Added Neumann (zero-flux) boundary condition support via `bc_type="neumann"` in all three
+  methods. Includes `_build_tridiag_alpha_neumann()` in DTO and `_compute_bc_loss_neumann()`
+  in PINN/BiLO. Note: Neumann BCs with α≠1 have non-identifiability (warns at runtime).
+- Extracted training logging utilities into `training_logger.py` module. Provides
+  `TrainingHistory` class with method-specific factories (`.for_dto()`, `.for_pinn()`,
+  `.for_bilo()`) and progress formatters (`format_dto_progress()`, etc.). Reduces
+  boilerplate in method files.
+- Added `b0_fixed_value` option to use a known source amplitude instead of VarPro projection.
+  When set, bypasses Variable Projection and uses the fixed value directly. Useful when
+  the source amplitude is known from experimental calibration, eliminating the
+  amplitude-diffusivity ambiguity. Available in all three methods (DTO, PINN, BiLO).
+- Added `varpro.get_b0_field()` and `varpro.get_b0_ppp()` unified helper functions.
 - Added scalar-fit scale estimation via differentiable FDM (`scale_estimation.py`).
 - Added torch FDM solver (`physics.fdm_solve_alpha_dirichlet_torch`) for autograd use.
 - Updated config/init knobs: `scalar_fit_iters`, `pert_scale`, `pert_freq` (removed `d_init_base`).

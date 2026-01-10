@@ -3,8 +3,8 @@
 Includes flux-form finite-difference assembly, a NumPy Thomas solver for
 ground-truth FDM, and regularizers for D.
 
-Key entry points: fdm_solve_alpha_dirichlet, h1_smoothness_d,
-tv_smoothness_d, scale_anchor.
+Key entry points: fdm_solve_alpha (dispatch), fdm_solve_alpha_dirichlet,
+fdm_solve_alpha_neumann, h1_smoothness_d, tv_smoothness_d, scale_anchor.
 """
 
 from __future__ import annotations
@@ -145,6 +145,99 @@ def _build_delta_rhs(
     return rhs
 
 
+def _build_fdm_tridiag_neumann(
+    d: np.ndarray,
+    alpha: float,
+    mu: float,
+    x: np.ndarray,
+    eps: float = 1e-12,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Assemble tridiagonal coefficients for Neumann BCs (zero flux).
+
+    Unlike Dirichlet, Neumann BCs keep the boundary values as unknowns, so the
+    system size is N rather than N-2. We enforce zero flux by using half-cell
+    control volumes at the boundaries (no outward flux term).
+    """
+    n = x.size
+    if n < 3:
+        raise ValueError("Need at least 3 grid points for Neumann problem.")
+
+    h = x[1:] - x[:-1]
+    g = d ** (1.0 - alpha)
+
+    d_alpha_left = d[:-1] ** alpha
+    d_alpha_right = d[1:] ** alpha
+    a_half = 2.0 * d_alpha_left * d_alpha_right / (d_alpha_left + d_alpha_right + eps) / h
+
+    lower = np.zeros(n - 1, dtype=float)
+    diag = np.zeros(n, dtype=float)
+    upper = np.zeros(n - 1, dtype=float)
+
+    # Left boundary: half control volume, zero outward flux.
+    vol_0 = h[0] / 2.0
+    diag[0] = -(a_half[0] * g[0]) / vol_0 - mu
+    upper[0] = (a_half[0] * g[1]) / vol_0
+
+    # Interior nodes: full control volumes.
+    for i in range(1, n - 1):
+        vol_i = 0.5 * (h[i - 1] + h[i])
+        lower[i - 1] = (a_half[i - 1] * g[i - 1]) / vol_i
+        diag[i] = -(a_half[i] + a_half[i - 1]) * g[i] / vol_i - mu
+        upper[i] = (a_half[i] * g[i + 1]) / vol_i
+
+    # Right boundary: half control volume, zero outward flux.
+    vol_n1 = h[-1] / 2.0
+    lower[n - 2] = (a_half[-1] * g[-2]) / vol_n1
+    diag[n - 1] = -(a_half[-1] * g[-1]) / vol_n1 - mu
+
+    return lower, diag, upper
+
+
+def _build_delta_rhs_neumann(
+    x: np.ndarray,
+    sources: Iterable[float],
+    b0: float,
+) -> np.ndarray:
+    """Construct RHS for point sources with Neumann BCs (full grid).
+
+    Uses the same hat-delta discretization as the Dirichlet version, but the
+    RHS is defined on all grid nodes (length N).
+    """
+    n = x.size
+    if n < 3:
+        raise ValueError("Need at least 3 grid points for Neumann problem.")
+
+    h = x[1:] - x[:-1]
+    vol = np.empty(n, dtype=float)
+    vol[0] = h[0] / 2.0
+    vol[-1] = h[-1] / 2.0
+    if n > 2:
+        vol[1:-1] = 0.5 * (h[:-1] + h[1:])
+
+    rhs = np.zeros(n, dtype=float)
+
+    for z in sources:
+        idx_right = int(np.searchsorted(x, z, side="right"))
+        idx_left = idx_right - 1
+
+        idx_left = max(0, min(n - 1, idx_left))
+        idx_right = max(0, min(n - 1, idx_right))
+
+        x_left = x[idx_left]
+        x_right = x[idx_right]
+        h_interval = x_right - x_left
+
+        if h_interval < 1e-12:
+            rhs[idx_left] += -b0 / vol[idx_left]
+        else:
+            w_left = 1.0 - abs(x_left - z) / h_interval
+            w_right = 1.0 - abs(x_right - z) / h_interval
+            rhs[idx_left] += -b0 * w_left / vol[idx_left]
+            rhs[idx_right] += -b0 * w_right / vol[idx_right]
+
+    return rhs
+
+
 def _thomas_solve(
     lower: np.ndarray,
     diag: np.ndarray,
@@ -216,6 +309,48 @@ def fdm_solve_alpha_dirichlet(
     u = np.zeros_like(x)
     u[1:-1] = u_int
     return u
+
+
+def fdm_solve_alpha_neumann(
+    d: Sequence[float],
+    alpha: float,
+    mu: float,
+    x: Sequence[float],
+    b0: float,
+    sources: Iterable[float],
+) -> np.ndarray:
+    """Solve the steady 1D alpha-PDE with Neumann (zero-flux) BCs.
+
+    For Neumann BCs we solve for all grid nodes; boundary values are not fixed.
+    """
+    d = np.asarray(d, dtype=float).reshape(-1)
+    if np.any(d <= 0):
+        raise ValueError("D must be strictly positive.")
+    x = np.asarray(x, dtype=float).reshape(-1)
+    if x.size != d.size:
+        raise ValueError("d and x must have the same length.")
+
+    lower, diag, upper = _build_fdm_tridiag_neumann(d, alpha, mu, x)
+    rhs = _build_delta_rhs_neumann(x, sources, b0)
+    return _thomas_solve(lower, diag, upper, rhs)
+
+
+def fdm_solve_alpha(
+    d: Sequence[float],
+    alpha: float,
+    mu: float,
+    x: Sequence[float],
+    b0: float,
+    sources: Iterable[float],
+    bc_type: str = "dirichlet",
+) -> np.ndarray:
+    """Dispatch FDM solve for Dirichlet or Neumann boundary conditions."""
+    bc = bc_type.strip().lower()
+    if bc == "dirichlet":
+        return fdm_solve_alpha_dirichlet(d, alpha, mu, x, b0, sources)
+    if bc == "neumann":
+        return fdm_solve_alpha_neumann(d, alpha, mu, x, b0, sources)
+    raise ValueError(f"Unknown bc_type '{bc_type}'.")
 
 
 def _thomas_solve_torch(
@@ -332,6 +467,53 @@ def _build_tridiag_alpha_torch(
     return lower, diag, upper
 
 
+def _build_tridiag_alpha_neumann_torch(
+    d: torch.Tensor,
+    alpha: float,
+    mu: float,
+    x: torch.Tensor,
+    eps: float = 1e-12,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Assemble tridiagonal coefficients for Neumann BCs (torch version).
+
+    Uses half-cell control volumes at the boundaries to enforce zero flux.
+    Vectorized implementation preserves autograd through d.
+    """
+    n = x.numel()
+    if n < 3:
+        raise ValueError("Need at least 3 grid points for Neumann problem.")
+
+    h = x[1:] - x[:-1]
+    g = d ** (1.0 - alpha)
+
+    d_alpha_left = d[:-1] ** alpha
+    d_alpha_right = d[1:] ** alpha
+    a_half = 2.0 * d_alpha_left * d_alpha_right / (d_alpha_left + d_alpha_right + eps) / h
+
+    # Volumes: half-cell at boundaries, full-cell in interior
+    vol_0 = h[0] / 2.0
+    vol_int = 0.5 * (h[:-1] + h[1:])  # length n-2
+    vol_n1 = h[-1] / 2.0
+
+    # Diagonal: boundary + interior + boundary (vectorized)
+    diag_0 = -(a_half[0] * g[0]) / vol_0 - mu
+    diag_int = -((a_half[1:] + a_half[:-1]) * g[1:-1] / vol_int) - mu
+    diag_n1 = -(a_half[-1] * g[-1]) / vol_n1 - mu
+    diag = torch.cat([diag_0.unsqueeze(0), diag_int, diag_n1.unsqueeze(0)])
+
+    # Upper diagonal: left boundary row + interior rows (vectorized)
+    upper_0 = (a_half[0] * g[1]) / vol_0
+    upper_int = (a_half[1:] * g[2:]) / vol_int
+    upper = torch.cat([upper_0.unsqueeze(0), upper_int])
+
+    # Lower diagonal: interior rows + right boundary row (vectorized)
+    lower_int = (a_half[:-1] * g[:-2]) / vol_int
+    lower_n1 = (a_half[-1] * g[-2]) / vol_n1
+    lower = torch.cat([lower_int, lower_n1.unsqueeze(0)])
+
+    return lower, diag, upper
+
+
 def _build_delta_rhs_torch(
     x: torch.Tensor,
     sources: Iterable[float],
@@ -396,6 +578,52 @@ def _build_delta_rhs_torch(
     return rhs
 
 
+def _build_delta_rhs_neumann_torch(
+    x: torch.Tensor,
+    sources: Iterable[float],
+    b0: float,
+) -> torch.Tensor:
+    """Construct the RHS for Neumann BCs (torch version, full grid)."""
+    n = x.numel()
+    if n < 3:
+        raise ValueError("Need at least 3 grid points for Neumann problem.")
+
+    h = x[1:] - x[:-1]
+    vol = torch.empty(n, device=x.device, dtype=x.dtype)
+    vol[0] = h[0] / 2.0
+    vol[-1] = h[-1] / 2.0
+    if n > 2:
+        vol[1:-1] = 0.5 * (h[:-1] + h[1:])
+
+    rhs = torch.zeros(n, device=x.device, dtype=x.dtype)
+
+    b0_value = float(b0)
+    for z in sources:
+        z_t = torch.tensor(float(z), device=x.device, dtype=x.dtype)
+        idx_right = int(torch.searchsorted(x, z_t, right=True).item())
+        idx_left = idx_right - 1
+
+        if idx_left < 0:
+            idx_left = 0
+        if idx_right >= n:
+            idx_right = n - 1
+
+        x_left = x[idx_left]
+        x_right = x[idx_right]
+        h_interval = x_right - x_left
+
+        if abs(float(h_interval.item())) < 1e-12:
+            rhs[idx_left] -= b0_value / vol[idx_left]
+            continue
+
+        w_left = 1.0 - torch.abs(x_left - z_t) / h_interval
+        w_right = 1.0 - torch.abs(x_right - z_t) / h_interval
+        rhs[idx_left] -= b0_value * w_left / vol[idx_left]
+        rhs[idx_right] -= b0_value * w_right / vol[idx_right]
+
+    return rhs
+
+
 def fdm_solve_alpha_dirichlet_torch(
     d: torch.Tensor,
     alpha: float,
@@ -445,6 +673,45 @@ def fdm_solve_alpha_dirichlet_torch(
     u = torch.zeros_like(x)
     u[1:-1] = u_int
     return u
+
+
+def fdm_solve_alpha_neumann_torch(
+    d: torch.Tensor,
+    alpha: float,
+    mu: float,
+    x: torch.Tensor,
+    b0: float,
+    sources: Iterable[float],
+) -> torch.Tensor:
+    """Differentiable torch FDM solve with Neumann (zero-flux) BCs."""
+    d = d.view(-1)
+    x = x.view(-1)
+    if d.numel() != x.numel():
+        raise ValueError("d and x must have the same length.")
+    if torch.any(d <= 0).item():
+        raise ValueError("D must be strictly positive.")
+
+    lower, diag, upper = _build_tridiag_alpha_neumann_torch(d, alpha, mu, x)
+    rhs = _build_delta_rhs_neumann_torch(x, sources, b0)
+    return _thomas_solve_torch(lower, diag, upper, rhs)
+
+
+def fdm_solve_alpha_torch(
+    d: torch.Tensor,
+    alpha: float,
+    mu: float,
+    x: torch.Tensor,
+    b0: float,
+    sources: Iterable[float],
+    bc_type: str = "dirichlet",
+) -> torch.Tensor:
+    """Dispatch torch FDM solve for Dirichlet or Neumann boundary conditions."""
+    bc = bc_type.strip().lower()
+    if bc == "dirichlet":
+        return fdm_solve_alpha_dirichlet_torch(d, alpha, mu, x, b0, sources)
+    if bc == "neumann":
+        return fdm_solve_alpha_neumann_torch(d, alpha, mu, x, b0, sources)
+    raise ValueError(f"Unknown bc_type '{bc_type}'.")
 
 
 def h1_smoothness_d(x: torch.Tensor, d: torch.Tensor) -> torch.Tensor:

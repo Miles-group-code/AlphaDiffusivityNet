@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -18,21 +18,17 @@ from config import Config
 from data import PPPData
 import physics, varpro
 from scale_estimation import estimate_ddi_scale, fit_constant_d
+from training_logger import (
+    TrainingHistory,
+    format_bilo_progress,
+    format_bilo_pretrain_progress,
+)
 
 # =============================================================================
 # D PARAMETERIZATION: Softplus + offset
 # =============================================================================
 # We use softplus for positivity: D = softplus(raw) + D_min
-#
-# HISTORY:
-# - v3.0.0: Switched from log(D) to softplus + offset
-# - Tried LeakyReLU + clamp(min=0), but clamp killed gradients when raw < 0
-# - Reverted to softplus (v3.0.1): smooth gradients everywhere
-#
-# TRADE-OFF:
-# - Softplus has mild gradient suppression: ∂D/∂raw = sigmoid(raw) ≈ D for small D
-# - But avoids catastrophic gradient death from clamp operations
-# - Combined with DDI initialization and Adam optimizer, works well in practice
+# Softplus has mild gradient suppression but avoids catastrophic gradient death.
 # =============================================================================
 
 D_MIN = 1e-6
@@ -52,7 +48,7 @@ class BiLOData:
 
     mode: str  # "field" or "particles"
     x_res: torch.Tensor
-    x_field: Optional[torch.Tensor] = None  # Field observation grid (field mode)
+    x_field: Optional[torch.Tensor] = None
     u_true: Optional[torch.Tensor] = None
     ppp: Optional[PPPData] = None
 
@@ -62,18 +58,6 @@ class BiLOResult:
     """Outputs and training history for BiLO fitting.
 
     Returned tensors are detached and on CPU for convenience.
-
-    Fields:
-        x_res: Solver grid (1D).
-        d_pred: D(x) on x_res (1D).
-        u_hat_unit: Unit-source response u_hat for b0=1 on x_res (1D).
-        u_pred: Predicted field b0* * u_hat_unit on x_res (1D).
-        b0_star: Projected source amplitude.
-        history: Loss curves and diagnostics recorded every log_every steps.
-            Typical keys: iter, upper, data, reg_smooth, reg_scale, lower, res,
-            jump, rgrad, jump_rgrad, b0_star, mean_d, d_snap_iters, d_snapshots.
-        d_net: Trained D network (for reuse or inspection).
-        local_op: Trained local operator network (for reuse or inspection).
     """
 
     x_res: torch.Tensor
@@ -87,11 +71,7 @@ class BiLOResult:
 
 
 class DNet(nn.Module):
-    """RFF-embedded MLP that parameterizes D(x) with softplus + offset.
-
-    Uses softplus parameterization: D = softplus(raw) + D_min
-    Softplus is smooth, always positive, and has well-behaved gradients everywhere.
-    """
+    """RFF-embedded MLP that parameterizes D(x) with softplus + offset."""
 
     def __init__(
         self, width: int = 128, use_rff: bool = True, rff_scale: float = 1.0, d_min: float = D_MIN
@@ -104,8 +84,6 @@ class DNet(nn.Module):
         if use_rff:
             for param in self.embed.parameters():
                 param.requires_grad = False
-        # SiLU (Swish) activation: avoids Tanh's low-frequency bias and
-        # saturation issues while maintaining smooth gradients for PDE learning.
         self.net = nn.Sequential(
             nn.Linear(width, width),
             nn.SiLU(),
@@ -115,11 +93,6 @@ class DNet(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Evaluate D(x) at given coordinates.
-
-        Uses softplus for positivity: D = softplus(raw) + D_min
-        Softplus has smooth gradients everywhere (no dead regions).
-        """
         x = x.view(-1, 1)
         if self.use_rff:
             feat = torch.sin(2.0 * torch.pi * self.rff_scale * self.embed(x))
@@ -130,29 +103,34 @@ class DNet(nn.Module):
 
 
 class LocalOperator(nn.Module):
-    """Local operator network for the unit response u_hat(x)."""
+    """Local operator network for the unit response u_hat(x), conditioned on D."""
 
-    def __init__(self, width: int = 128, use_rff: bool = True, rff_scale: float = 1.0) -> None:
+    def __init__(
+        self,
+        width: int = 128,
+        use_rff: bool = True,
+        rff_scale: float = 1.0,
+        bc_type: str = "dirichlet",
+    ) -> None:
         super().__init__()
         self.use_rff = use_rff
         self.rff_scale = rff_scale
+        self.bc_type = bc_type.strip().lower()
+        if self.bc_type not in {"dirichlet", "neumann"}:
+            raise ValueError(f"Unsupported bc_type '{bc_type}'.")
         self.geom_layer = nn.Linear(2, width)
         if use_rff:
             self.geom_layer.weight.requires_grad = False
             if self.geom_layer.bias is not None:
                 self.geom_layer.bias.requires_grad = False
-        # Condition on D directly.
-        # d_embed is intentionally trainable.
         self.d_embed = nn.Linear(1, width, bias=False)
         self.hidden = nn.ModuleList([nn.Linear(width, width) for _ in range(3)])
         self.output = nn.Linear(width, 1)
-        # SiLU (Swish) avoids Tanh's low-frequency bias and saturation.
         self.activation = F.silu
 
     def forward(
         self, x: torch.Tensor, d: torch.Tensor, z_known: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Evaluate u_hat and return the |x-z| feature for jump constraints."""
         x = x.view(-1, 1)
         d = d.view(-1, 1)
 
@@ -169,23 +147,21 @@ class LocalOperator(nn.Module):
         for layer in self.hidden:
             h = self.activation(layer(h))
         u_raw = self.output(h)
-        # Hard enforcement of homogeneous Dirichlet BCs: u(0) = u(1) = 0.
-        # This ansatz ensures the network output is always valid at boundaries.
-        u = F.softplus(u_raw) * x * (1.0 - x)
+        u_pos = F.softplus(u_raw)
+        if self.bc_type == "dirichlet":
+            u = u_pos * x * (1.0 - x)
+        else:
+            u = u_pos
         return u, phi_z
 
 
 def _init_d_profile(
-    x: torch.Tensor,
-    base: float,
-    scale: float,
-    freq: float,
+    x: torch.Tensor, base: float, scale: float, freq: float
 ) -> torch.Tensor:
     """Build a sinusoidal D initialization on the grid."""
     if scale >= 1.0:
         raise ValueError("pert_scale must be < 1 to keep D_init positive.")
-    d_init = base * (1.0 + scale * torch.sin(2.0 * torch.pi * freq * x))
-    return d_init
+    return base * (1.0 + scale * torch.sin(2.0 * torch.pi * freq * x))
 
 
 def _trainable_params(module: nn.Module) -> List[nn.Parameter]:
@@ -194,11 +170,7 @@ def _trainable_params(module: nn.Module) -> List[nn.Parameter]:
 
 
 def _alpha_flux_residual(
-    x: torch.Tensor,
-    d: torch.Tensor,
-    u: torch.Tensor,
-    alpha: float,
-    mu: float,
+    x: torch.Tensor, d: torch.Tensor, u: torch.Tensor, alpha: float, mu: float
 ) -> torch.Tensor:
     """Flux-form PDE residual L_alpha(u) - mu*u using autograd."""
     if not x.requires_grad:
@@ -209,6 +181,29 @@ def _alpha_flux_residual(
     J = (d ** alpha) * q_x
     J_x = torch.autograd.grad(J, x, grad_outputs=ones, create_graph=True, retain_graph=True)[0]
     return J_x - mu * u
+
+
+def _compute_bc_loss_neumann(
+    d_net: nn.Module,
+    local_op: nn.Module,
+    z_tensor: torch.Tensor,
+    domain: Tuple[float, float],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Penalize boundary derivatives for Neumann BCs: u'(x_min)=u'(x_max)=0."""
+    x0 = torch.tensor([[domain[0]]], device=device, dtype=dtype, requires_grad=True)
+    x1 = torch.tensor([[domain[1]]], device=device, dtype=dtype, requires_grad=True)
+
+    d0 = d_net(x0)
+    d1 = d_net(x1)
+    u0, _ = local_op(x0, d0, z_tensor)
+    u1, _ = local_op(x1, d1, z_tensor)
+
+    u0_x = torch.autograd.grad(u0, x0, grad_outputs=torch.ones_like(u0), create_graph=True)[0]
+    u1_x = torch.autograd.grad(u1, x1, grad_outputs=torch.ones_like(u1), create_graph=True)[0]
+
+    return torch.mean(u0_x ** 2 + u1_x ** 2)
 
 
 def _calc_data_loss(
@@ -226,49 +221,20 @@ def _calc_data_loss(
     smoothness_type: str,
     b0_fixed_value: Optional[float] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute data and regularization terms for the upper-level objective.
-
-    Args:
-        d_net: DNet module for D(x) prediction.
-        local_op: LocalOperator module for u(x) prediction given D.
-        x_res: Solver grid for regularization computation.
-        x_int: Integration grid for PPP mode.
-        x_field: Observation grid for field mode.
-        z_tensor: Source location tensor.
-        mode: "field" or "particles".
-        u_true: Observed field data (field mode only).
-        ppp: PPP particle data (particles mode only).
-        field_loss: Loss type for field mode ("mse" or "rle").
-        d_target: Target scale for scale anchor regularization.
-        smoothness_type: "h1" or "tv" for smoothness regularization.
-        b0_fixed_value: If set, use this fixed b0 instead of VarPro projection.
-
-    Returns:
-        Tuple of (b0_star, data_loss, reg_smooth, reg_scale).
-    """
+    """Compute data and regularization terms for the upper-level objective."""
     d_int = d_net(x_int)
     u_hat_int, _ = local_op(x_int, d_int, z_tensor)
 
     if mode == "field":
         d_field = d_net(x_field)
         u_hat_field, _ = local_op(x_field, d_field, z_tensor)
-        # Get b0 via VarPro projection (or use fixed value if set)
         b0_star = varpro.get_b0_field(
-            u_hat_field,
-            u_true,
-            field_loss=field_loss,
-            b0_fixed_value=b0_fixed_value,
+            u_hat_field, u_true, field_loss=field_loss, b0_fixed_value=b0_fixed_value
         )
         data_loss = varpro.field_data_loss(u_hat_field, u_true, b0_star, field_loss=field_loss)
     else:
         integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
-        # Get b0 via VarPro projection (or use fixed value if set)
-        b0_star = varpro.get_b0_ppp(
-            ppp.n_obs,
-            ppp.m_obs,
-            integral_unit,
-            b0_fixed_value=b0_fixed_value,
-        )
+        b0_star = varpro.get_b0_ppp(ppp.n_obs, ppp.m_obs, integral_unit, b0_fixed_value=b0_fixed_value)
         d_data = d_net(ppp.x_particles)
         u_hat_data, _ = local_op(ppp.x_particles, d_data, z_tensor)
         data_loss = varpro.ppp_nll(u_hat_data.view(-1), b0_star, ppp.m_obs, integral_unit)
@@ -294,17 +260,15 @@ def _calc_physics_loss(
     mu: float,
     w_jump: float,
     w_resgrad: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute PDE residual and jump penalties for the lower-level objective.
-
-    Args:
-        z_idx: Index of the source location on the grid (excluded from residual).
-    """
+    bc_type: str,
+    domain: Tuple[float, float],
+    w_bc: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute PDE residual, jump, and BC penalties for the lower-level objective."""
     x_pde = x_res.clone().detach().requires_grad_(True)
     d_pde = d_net(x_pde)
     u_hat_pde, _ = local_op(x_pde, d_pde, z_tensor)
     residual = _alpha_flux_residual(x_pde, d_pde, u_hat_pde, alpha, mu)
-    # Exclude the source point from residual loss
     n = residual.shape[0]
     res_loss = (torch.sum(residual ** 2) - residual[z_idx] ** 2) / (n - 1)
 
@@ -312,52 +276,37 @@ def _calc_physics_loss(
     d_z = d_net(z_probe)
     u_hat_z, phi_z = local_op(z_probe, d_z, z_tensor)
     du_dphi = torch.autograd.grad(
-        u_hat_z,
-        phi_z,
-        grad_outputs=torch.ones_like(u_hat_z),
-        create_graph=True,
+        u_hat_z, phi_z, grad_outputs=torch.ones_like(u_hat_z), create_graph=True
     )[0]
-    jump_res =  d_z * (2.0 * du_dphi) + 1.0
+    jump_res = d_z * (2.0 * du_dphi) + 1.0
     jump_loss = torch.mean(jump_res ** 2)
 
+    bc_loss = torch.tensor(0.0, device=x_res.device, dtype=x_res.dtype)
+    if bc_type == "neumann":
+        bc_loss = _compute_bc_loss_neumann(d_net, local_op, z_tensor, domain, x_res.device, x_res.dtype)
+
     if w_resgrad > 0.0:
-        # NOTE: grad_outputs=ones is sufficient here because the residual is
-        # evaluated pointwise, so the Jacobian is diagonal in practice.
         grad_jump = torch.autograd.grad(
-            jump_res,
-            d_z,
-            grad_outputs=torch.ones_like(jump_res),
-            create_graph=True,
-            allow_unused=True,
+            jump_res, d_z, grad_outputs=torch.ones_like(jump_res), create_graph=True, allow_unused=True
         )[0]
-        # Scale by d_z to convert D-space gradients to log-domain equivalents.
-        # Clamp the scaling factor to D_MIN to prevent collapse: without clamping,
-        # when D -> 0, the penalty vanishes, creating a positive feedback loop.
         d_scale_jump = d_z.clamp(min=D_MIN)
-        jump_rgrad = torch.mean((grad_jump * d_scale_jump) ** 2) if grad_jump is not None else torch.tensor(
-            0.0, device=x_res.device, dtype=x_res.dtype
-        )
-        # Zero out the source point in grad_outputs for resgrad
+        jump_rgrad = torch.mean((grad_jump * d_scale_jump) ** 2) if grad_jump is not None else torch.tensor(0.0, device=x_res.device, dtype=x_res.dtype)
+
         grad_outputs = torch.ones_like(residual)
         grad_outputs[z_idx] = 0.0
         grad_res = torch.autograd.grad(
-            residual,
-            d_pde,
-            grad_outputs=grad_outputs,
-            create_graph=True,
-            allow_unused=True,
+            residual, d_pde, grad_outputs=grad_outputs, create_graph=True, allow_unused=True
         )[0]
-        # Scale by d_pde with clamping (same reasoning as jump_rgrad above).
         d_scale_pde = d_pde.clamp(min=D_MIN)
-        rgrad = torch.mean((grad_res * d_scale_pde) ** 2) if grad_res is not None else torch.tensor(
-            0.0, device=x_res.device, dtype=x_res.dtype
-        )
+        rgrad = torch.mean((grad_res * d_scale_pde) ** 2) if grad_res is not None else torch.tensor(0.0, device=x_res.device, dtype=x_res.dtype)
     else:
         rgrad = torch.tensor(0.0, device=x_res.device, dtype=x_res.dtype)
         jump_rgrad = torch.tensor(0.0, device=x_res.device, dtype=x_res.dtype)
 
     lower_loss = res_loss + w_jump * jump_loss + w_resgrad * (rgrad + jump_rgrad)
-    return lower_loss, res_loss, jump_loss, rgrad, jump_rgrad
+    if bc_type == "neumann":
+        lower_loss = lower_loss + w_bc * bc_loss
+    return lower_loss, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad
 
 
 def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
@@ -371,18 +320,79 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
     Returns:
         BiLOResult with predictions on the solver grid (x_res) and training history.
     """
+    # =========================================================================
+    # CONFIG EXTRACTION
+    # =========================================================================
     device = cfg.run.torch_device
     dtype = cfg.run.torch_dtype
-    domain = cfg.physics.domain
 
-    if len(cfg.physics.sources) != 1:
+    # Physics
+    alpha = cfg.physics.alpha
+    mu = cfg.physics.mu
+    sources = cfg.physics.sources
+    domain = cfg.physics.domain
+    bc_type = cfg.physics.bc_type.lower()
+
+    # Data
+    mode = data_bundle.mode
+    field_loss_type = cfg.data.field_loss
+    b0_fixed_value = cfg.data.b0_fixed_value
+
+    # D profile initialization
+    use_ddi = cfg.d_profile.use_ddi
+    ddi_d_min, ddi_d_max = cfg.d_profile.ddi_d_min, cfg.d_profile.ddi_d_max
+    pert_scale, pert_freq = cfg.d_profile.pert_scale, cfg.d_profile.pert_freq
+
+    # Regularization
+    w_jump = cfg.reg.w_jump
+    w_resgrad = cfg.reg.w_resgrad
+    w_bc = cfg.reg.w_bc
+    wreg_smooth, wreg_scale = cfg.reg.wreg_smooth, cfg.reg.wreg_scale
+    smoothness_type = cfg.reg.smoothness_type
+
+    # Training
+    pretrain_iters = cfg.train.pretrain_iters
+    finetune_iters = cfg.train.finetune_iters
+    lr_d_pre, lr_lower_pre = cfg.train.lr_d_pre, cfg.train.lr_lower_pre
+    lr_d_fine, lr_lower_fine = cfg.train.lr_d_fine, cfg.train.lr_lower_fine
+    use_lbfgs = cfg.train.optimizer == "lbfgs"
+    lbfgs_lr, lbfgs_max_iter = cfg.train.lbfgs_lr, cfg.train.lbfgs_max_iter
+    use_scheduler = cfg.train.use_scheduler
+    log_every = cfg.train.log_every
+    scalar_fit_iters = cfg.train.scalar_fit_iters
+
+    # Early stopping
+    early_burnin = cfg.train.early_burnin
+    early_patience = cfg.train.early_patience
+    early_tol = cfg.train.early_tol
+
+    # Architecture
+    d_min = getattr(cfg.arch, "d_min", D_MIN)
+    rff_scale = getattr(cfg.arch, "rff_scale", 1.0)
+    rff_width = cfg.arch.rff_width
+    use_rff = cfg.arch.use_rff
+
+    # Grid
+    n_int = cfg.grid.n_int
+
+    # =========================================================================
+    # INPUT VALIDATION
+    # =========================================================================
+    if len(sources) != 1:
         raise NotImplementedError("BiLO currently supports a single source.")
 
+    if bc_type == "neumann" and alpha != 1.0:
+        print(f"[WARN] Neumann BCs with alpha={alpha} may be non-identifiable.")
+
+    # =========================================================================
+    # DATA PREPARATION
+    # =========================================================================
     x_res = data_bundle.x_res.to(device=device, dtype=dtype).view(-1, 1)
     x_field = x_res
     if data_bundle.x_field is not None:
         x_field = data_bundle.x_field.to(device=device, dtype=dtype).view(-1, 1)
-    if data_bundle.mode == "field":
+
+    if mode == "field":
         u_true = data_bundle.u_true.to(device=device, dtype=dtype).view(-1, 1)
         ppp = None
     else:
@@ -392,40 +402,41 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
         )
         u_true = None
 
-    z_tensor = torch.tensor(cfg.physics.sources[0], device=device, dtype=dtype).view(1, 1)
-    # Since z is exactly on the aligned grid, find the single index to exclude from residual.
+    z_tensor = torch.tensor(sources[0], device=device, dtype=dtype).view(1, 1)
     z_idx = int(torch.argmin(torch.abs(x_res - z_tensor)).item())
 
-    x_int = torch.linspace(
-        domain[0], domain[1], cfg.grid.n_int, device=device, dtype=dtype
-    ).view(-1, 1)
+    x_int = torch.linspace(domain[0], domain[1], n_int, device=device, dtype=dtype).view(-1, 1)
 
-    if cfg.d_profile.use_ddi:
+    # =========================================================================
+    # SCALE ESTIMATION
+    # =========================================================================
+    if use_ddi:
         d_ddi = estimate_ddi_scale(
-            mu=cfg.physics.mu,
-            z=cfg.physics.sources[0],
+            mu=mu,
+            z=sources[0],
             x_particles=ppp.x_particles if ppp is not None else None,
             u_field=u_true if u_true is not None else None,
             x_grid=x_field.view(-1),
-            d_min=cfg.d_profile.ddi_d_min,
-            d_max=cfg.d_profile.ddi_d_max,
+            d_min=ddi_d_min,
+            d_max=ddi_d_max,
         )
     else:
         d_ddi = 1.0
 
-    if cfg.train.scalar_fit_iters > 0:
+    if scalar_fit_iters > 0:
         d_scale = fit_constant_d(
             x=x_res.view(-1),
-            alpha=cfg.physics.alpha,
-            mu=cfg.physics.mu,
-            sources=cfg.physics.sources,
+            alpha=alpha,
+            mu=mu,
+            sources=sources,
             u_true=u_true if u_true is not None else None,
             ppp=ppp if ppp is not None else None,
             x_field=x_field.view(-1) if u_true is not None else None,
             x_int=x_int.view(-1) if ppp is not None else None,
             d_init=d_ddi,
-            max_iters=cfg.train.scalar_fit_iters,
-            field_loss=cfg.data.field_loss,
+            max_iters=scalar_fit_iters,
+            field_loss=field_loss_type,
+            bc_type=bc_type,
             verbose=verbose,
         )
     else:
@@ -434,209 +445,127 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
     if verbose:
         print(f"[BiLO] DDI scale: {d_ddi:.3e}")
         print(f"[BiLO] Scalar fit scale: {d_scale:.3e}")
-    
+
     d_target = d_scale
 
-    # Create perturbed initialization profile for pretraining target
-    d_init_profile = _init_d_profile(
-        x_res.view(-1),
-        base=d_scale,
-        scale=cfg.d_profile.pert_scale,
-        freq=cfg.d_profile.pert_freq,
-    ).view(-1, 1)
+    # =========================================================================
+    # MODEL INITIALIZATION
+    # =========================================================================
+    d_init_profile = _init_d_profile(x_res.view(-1), base=d_scale, scale=pert_scale, freq=pert_freq).view(-1, 1)
 
-    d_min = getattr(cfg.arch, "d_min", D_MIN)
-    rff_scale = getattr(cfg.arch, "rff_scale", 1.0)
-    d_net = DNet(
-        width=cfg.arch.rff_width,
-        use_rff=cfg.arch.use_rff,
-        rff_scale=rff_scale,
-        d_min=d_min,
-    ).to(device=device, dtype=dtype)
-    local_op = LocalOperator(
-        width=cfg.arch.rff_width,
-        use_rff=cfg.arch.use_rff,
-        rff_scale=rff_scale,
-    ).to(device=device, dtype=dtype)
+    d_net = DNet(width=rff_width, use_rff=use_rff, rff_scale=rff_scale, d_min=d_min).to(device=device, dtype=dtype)
+    local_op = LocalOperator(width=rff_width, use_rff=use_rff, rff_scale=rff_scale, bc_type=bc_type).to(device=device, dtype=dtype)
 
     # =========================================================================
     # TRAINING HISTORY
     # =========================================================================
-    # BiLO tracks both upper-level (data) and lower-level (physics) losses.
-    # Keys:
-    #   iter         - iteration number (finetune phase only)
-    #   upper        - upper-level loss (data + regularization on D)
-    #   data         - data fidelity loss (MSE, RLE, or PPP NLL)
-    #   reg_smooth   - smoothness penalty on D (unweighted)
-    #   reg_scale    - scale anchor penalty on D (unweighted)
-    #   lower        - lower-level loss (physics constraints on local_op)
-    #   res          - PDE residual loss (unweighted)
-    #   jump         - jump condition loss at source (unweighted)
-    #   rgrad        - residual gradient penalty ∂(res)/∂(D) (unweighted)
-    #   jump_rgrad   - jump gradient penalty ∂(jump)/∂(D) (unweighted)
-    #   b0_star      - projected source amplitude via VarPro
-    #   mean_d       - spatial average of D(x)
-    #   d_snap_iters - iterations where D snapshots were saved
-    #   d_snapshots  - list of D(x) arrays at those iterations
-    history: Dict[str, List[float]] = {
-        "iter": [],
-        "upper": [],
-        "data": [],
-        "reg_smooth": [],
-        "reg_scale": [],
-        "lower": [],
-        "res": [],
-        "jump": [],
-        "rgrad": [],
-        "jump_rgrad": [],
-        "b0_star": [],
-        "mean_d": [],
-        "d_snap_iters": [],
-        "d_snapshots": [],
-    }
+    history = TrainingHistory.for_bilo()
 
     # =========================================================================
     # PRETRAIN PHASE
     # =========================================================================
-    # BiLO pretraining has two goals:
-    #   1. Train d_net to output the initialization profile (anchoring)
-    #   2. Train local_op to satisfy physics for that initial D (supervised)
-    #
-    # This gives the local_op a "warm start" so it can already solve the PDE
-    # before we start updating D based on data. Without this, the local_op
-    # would produce garbage u(x) values and the upper-level gradients would
-    # be meaningless.
-    if cfg.train.pretrain_iters > 0:
-        # For initialization, we train d_net to match the perturbed profile d_init_profile
-        # And train local_op to match the FDM solution for that perturbed profile.
+    if pretrain_iters > 0:
         d_init_np = d_init_profile.detach().cpu().numpy().reshape(-1)
-        u_init_np = physics.fdm_solve_alpha_dirichlet(
-            d_init_np,
-            cfg.physics.alpha,
-            cfg.physics.mu,
-            x_res.view(-1).detach().cpu().numpy(),
-            1.0,
-            cfg.physics.sources,
+        u_init_np = physics.fdm_solve_alpha(
+            d_init_np, alpha, mu, x_res.view(-1).detach().cpu().numpy(),
+            1.0, sources, bc_type=bc_type
         )
         u_init_target = torch.tensor(u_init_np, device=device, dtype=dtype).view(-1, 1)
-        
-        opt_d = torch.optim.Adam(d_net.parameters(), lr=cfg.train.lr_d_pre)
-        opt_l = torch.optim.Adam(local_op.parameters(), lr=cfg.train.lr_lower_pre)
-        
-        for step in range(cfg.train.pretrain_iters):
+
+        opt_d = torch.optim.Adam(d_net.parameters(), lr=lr_d_pre)
+        opt_l = torch.optim.Adam(local_op.parameters(), lr=lr_lower_pre)
+
+        for step in range(pretrain_iters):
             opt_d.zero_grad(set_to_none=True)
-            # Anchor to d_init_profile (perturbed) during pretraining
             d_pred = d_net(x_res)
             anchor_loss = torch.mean((d_pred - d_init_profile) ** 2)
-            
             anchor_loss.backward()
             opt_d.step()
 
             opt_l.zero_grad(set_to_none=True)
-            lower, res_loss, jump_loss, rgrad, jump_rgrad = _calc_physics_loss(
-                d_net,
-                local_op,
-                x_res,
-                z_tensor,
-                z_idx,
-                cfg.physics.alpha,
-                cfg.physics.mu,
-                cfg.reg.w_jump,
-                cfg.reg.w_resgrad,
+            lower, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad = _calc_physics_loss(
+                d_net, local_op, x_res, z_tensor, z_idx, alpha, mu,
+                w_jump, w_resgrad, bc_type, domain, w_bc
             )
             d_curr = d_net(x_res).detach()
             u_pred, _ = local_op(x_res, d_curr, z_tensor)
             loss_sup = torch.mean((u_pred - u_init_target) ** 2)
             (lower + loss_sup).backward()
 
-            if verbose and step % cfg.train.log_every == 0:
+            if verbose and step % log_every == 0:
                 with torch.no_grad():
                     mean_d = torch.mean(d_curr).item()
                     pre_total = (anchor_loss + lower + loss_sup).item()
-                print(
-                    f"[BiLO|pretrain] Iter {step:05d} | Ltot: {pre_total:.3e}\
-"
-                    f"  Lanchor: {anchor_loss.item():.3e} | Llower: {lower.item():.3e} | Lsup: {loss_sup.item():.3e}\
-"
-                    f"  Lres: {res_loss.item():.3e} | Ljump: {jump_loss.item():.3e} | "
-                    f"Lrgrad: {rgrad.item():.3e} | Ljump_rgrad: {jump_rgrad.item():.3e}\
-"
-                    f"  ⟨D⟩: {mean_d:.3e}"
-                )
+                print(format_bilo_pretrain_progress(
+                    step=step,
+                    total=pre_total,
+                    anchor=anchor_loss.item(),
+                    lower=lower.item(),
+                    sup=loss_sup.item(),
+                    res=res_loss.item(),
+                    jump=jump_loss.item(),
+                    bc=bc_loss.item(),
+                    rgrad=rgrad.item(),
+                    jump_rgrad=jump_rgrad.item(),
+                    mean_d=mean_d,
+                    bc_type=bc_type,
+                ))
 
             opt_l.step()
 
-    # Final pretrain log
-    if cfg.train.pretrain_iters > 0 and verbose:
-        with torch.enable_grad():
-            d_pred = d_net(x_res)
-            anchor_loss = torch.mean((d_pred - d_init_profile) ** 2)
-            lower, res_loss, jump_loss, rgrad, jump_rgrad = _calc_physics_loss(
-                d_net,
-                local_op,
-                x_res,
-                z_tensor,
-                z_idx,
-                cfg.physics.alpha,
-                cfg.physics.mu,
-                cfg.reg.w_jump,
-                cfg.reg.w_resgrad,
-            )
-            d_curr = d_net(x_res).detach()
-            u_pred, _ = local_op(x_res, d_curr, z_tensor)
-            loss_sup = torch.mean((u_pred - u_init_target) ** 2)
-            mean_d = torch.mean(d_curr).item()
-            pre_total = (anchor_loss + lower + loss_sup).item()
-        print(
-            f"[BiLO|pretrain] Iter {cfg.train.pretrain_iters:05d} | Ltot: {pre_total:.3e}\
-"
-            f"  Lanchor: {anchor_loss.item():.3e} | Llower: {lower.item():.3e} | Lsup: {loss_sup.item():.3e}\
-"
-            f"  Lres: {res_loss.item():.3e} | Ljump: {jump_loss.item():.3e} | "
-            f"Lrgrad: {rgrad.item():.3e} | Ljump_rgrad: {jump_rgrad.item():.3e}\
-"
-            f"  ⟨D⟩: {mean_d:.3e}"
-        )
+        # Final pretrain log
+        if verbose:
+            with torch.enable_grad():
+                d_pred = d_net(x_res)
+                anchor_loss = torch.mean((d_pred - d_init_profile) ** 2)
+                lower, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad = _calc_physics_loss(
+                    d_net, local_op, x_res, z_tensor, z_idx, alpha, mu,
+                    w_jump, w_resgrad, bc_type, domain, w_bc
+                )
+                d_curr = d_net(x_res).detach()
+                u_pred, _ = local_op(x_res, d_curr, z_tensor)
+                loss_sup = torch.mean((u_pred - u_init_target) ** 2)
+                mean_d = torch.mean(d_curr).item()
+                pre_total = (anchor_loss + lower + loss_sup).item()
+            print(format_bilo_pretrain_progress(
+                step=pretrain_iters,
+                total=pre_total,
+                anchor=anchor_loss.item(),
+                lower=lower.item(),
+                sup=loss_sup.item(),
+                res=res_loss.item(),
+                jump=jump_loss.item(),
+                bc=bc_loss.item(),
+                rgrad=rgrad.item(),
+                jump_rgrad=jump_rgrad.item(),
+                mean_d=mean_d,
+                bc_type=bc_type,
+            ))
 
     # =========================================================================
-    # FINETUNE PHASE: Bilevel Optimization
+    # FINETUNE OPTIMIZER SETUP
     # =========================================================================
-    # BiLO uses bilevel optimization where:
-    #   - Upper level: Update d_net to minimize data loss + regularization
-    #   - Lower level: Update local_op to satisfy physics for current D
-    #
-    # The key insight is that these two objectives are decoupled:
-    #   - d_net gradients come from data loss (how well does u match observations?)
-    #   - local_op gradients come from physics loss (how well does u satisfy PDE?)
-    #
-    # This avoids the conflicting gradients problem in standard PINN where
-    # both networks are updated jointly on a single composite loss.
     d_params = _trainable_params(d_net)
     local_op_params = _trainable_params(local_op)
-
-    # Optimizer setup: Adam (default) or LBFGS
-    use_lbfgs = cfg.train.optimizer == "lbfgs"
-    optimizer = None
-    scheduler = None
 
     if use_lbfgs:
         optimizer = torch.optim.LBFGS(
             list(d_params) + list(local_op_params),
-            lr=cfg.train.lbfgs_lr,
-            max_iter=cfg.train.lbfgs_max_iter,
+            lr=lbfgs_lr,
+            max_iter=lbfgs_max_iter,
             history_size=10,
             line_search_fn="strong_wolfe",
         )
+        scheduler = None
     else:
         optimizer = torch.optim.Adam([
-            {"params": d_params, "lr": cfg.train.lr_d_fine},
-            {"params": local_op_params, "lr": cfg.train.lr_lower_fine},
+            {"params": d_params, "lr": lr_d_fine},
+            {"params": local_op_params, "lr": lr_lower_fine},
         ])
-        if cfg.train.use_scheduler and cfg.train.finetune_iters > 0:
+        scheduler = None
+        if use_scheduler and finetune_iters > 0:
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=cfg.train.finetune_iters,
-                eta_min=min(cfg.train.lr_d_fine, cfg.train.lr_lower_fine) * 0.1,
+                optimizer, T_max=finetune_iters, eta_min=min(lr_d_fine, lr_lower_fine) * 0.1
             )
 
     # Early stopping state
@@ -644,143 +573,102 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
     patience = 0
 
     # =========================================================================
-    # FIXED B0 SETTING
-    # =========================================================================
-    # If b0_fixed_value is set, use it instead of VarPro projection.
-    # This is useful when the source amplitude is known a priori.
-    b0_fixed_value = cfg.data.b0_fixed_value
-
-    # =========================================================================
     # MAIN BILEVEL TRAINING LOOP
     # =========================================================================
-    for step in range(cfg.train.finetune_iters + 1):
+    for step in range(finetune_iters + 1):
         if not use_lbfgs:
             optimizer.zero_grad(set_to_none=True)
 
-        # -----------------------------------------------------------------
-        # UPPER LEVEL: Compute data loss and gradients for d_net
-        # -----------------------------------------------------------------
-        # The upper level asks: "Given the current local_op (frozen),
-        # how should we update D to better fit the observations?"
+        # Upper level: data loss -> d_net gradients
         b0_star, data_loss, reg_smooth, reg_scale = _calc_data_loss(
-            d_net,
-            local_op,
-            x_res,
-            x_int,
-            x_field,
-            z_tensor,
-            data_bundle.mode,
-            u_true,
-            ppp,
-            cfg.data.field_loss,
-            d_target,
-            cfg.reg.smoothness_type,
-            b0_fixed_value=b0_fixed_value,
+            d_net, local_op, x_res, x_int, x_field, z_tensor,
+            mode, u_true, ppp, field_loss_type, d_target, smoothness_type,
+            b0_fixed_value=b0_fixed_value
         )
-        upper_loss = (
-            data_loss + cfg.reg.wreg_smooth * reg_smooth + cfg.reg.wreg_scale * reg_scale
-        )
+        upper_loss = data_loss + wreg_smooth * reg_smooth + wreg_scale * reg_scale
 
         if not use_lbfgs:
-            # Compute upper gradients for d_net only (treat local_op as constant).
-            grads_upper = torch.autograd.grad(
-                upper_loss,
-                d_params,
-                create_graph=False,
-                allow_unused=True,
-            )
+            grads_upper = torch.autograd.grad(upper_loss, d_params, create_graph=False, allow_unused=True)
             for param, grad in zip(d_params, grads_upper):
                 if grad is not None:
                     param.grad = grad
 
-        # -----------------------------------------------------------------
-        # LOWER LEVEL: Compute physics loss and gradients for local_op
-        # -----------------------------------------------------------------
-        # The lower level asks: "Given the current D (frozen), how should
-        # we update local_op so that u(x|D) satisfies the PDE?"
-        #
-        # The physics loss includes:
-        #   - res_loss: PDE residual (how well does L[u] - μu = 0?)
-        #   - jump_loss: Source jump condition at z
-        #   - rgrad: Sensitivity penalty ∂(res)/∂(D) for robustness
-        #   - jump_rgrad: Sensitivity penalty ∂(jump)/∂(D)
-        lower_loss, res_loss, jump_loss, rgrad, jump_rgrad = _calc_physics_loss(
-            d_net,
-            local_op,
-            x_res,
-            z_tensor,
-            z_idx,
-            cfg.physics.alpha,
-            cfg.physics.mu,
-            cfg.reg.w_jump,
-            cfg.reg.w_resgrad,
+        # Lower level: physics loss -> local_op gradients
+        lower_loss, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad = _calc_physics_loss(
+            d_net, local_op, x_res, z_tensor, z_idx, alpha, mu,
+            w_jump, w_resgrad, bc_type, domain, w_bc
         )
 
         if not use_lbfgs:
-            # Compute lower gradients for local_op only (treat d_net as constant).
-            grads_lower = torch.autograd.grad(
-                lower_loss,
-                local_op_params,
-                create_graph=False,
-                allow_unused=True,
-            )
+            grads_lower = torch.autograd.grad(lower_loss, local_op_params, create_graph=False, allow_unused=True)
             for param, grad in zip(local_op_params, grads_lower):
                 if grad is not None:
                     param.grad = grad
 
         # -----------------------------------------------------------------
-        # LOGGING: Record metrics every log_every steps
+        # LOGGING
         # -----------------------------------------------------------------
         total_loss = upper_loss + lower_loss
-        if step % cfg.train.log_every == 0:
+        if step % log_every == 0:
             with torch.no_grad():
                 d_res = d_net(x_res)
                 mean_d = torch.mean(d_res).item()
                 u_hat_res, _ = local_op(x_res, d_res, z_tensor)
-                if data_bundle.mode == "particles":
+                if mode == "particles":
                     d_int = d_net(x_int)
                     u_hat_int, _ = local_op(x_int, d_int, z_tensor)
                     integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
                 else:
                     integral_unit = torch.trapezoid(u_hat_res.view(-1), x_res.view(-1))
-                u_int = (b0_star * integral_unit).item()
                 d_snapshot = d_res.detach().cpu().numpy().reshape(-1)
-            history["iter"].append(step)
-            history["upper"].append(upper_loss.item())
-            history["data"].append(data_loss.item())
-            history["reg_smooth"].append(reg_smooth.item())
-            history["reg_scale"].append(reg_scale.item())
-            history["lower"].append(lower_loss.item())
-            history["res"].append(res_loss.item())
-            history["jump"].append(jump_loss.item())
-            history["rgrad"].append(rgrad.item())
-            history["jump_rgrad"].append(jump_rgrad.item())
-            history["b0_star"].append(b0_star.item())
-            history["mean_d"].append(mean_d)
-            history["d_snap_iters"].append(step)
-            history["d_snapshots"].append(d_snapshot)
+
+            history.log(
+                step=step,
+                upper=upper_loss.item(),
+                data=data_loss.item(),
+                reg_smooth=reg_smooth.item(),
+                reg_scale=reg_scale.item(),
+                lower=lower_loss.item(),
+                res=res_loss.item(),
+                jump=jump_loss.item(),
+                bc=bc_loss.item(),
+                rgrad=rgrad.item(),
+                jump_rgrad=jump_rgrad.item(),
+                b0_star=b0_star.item(),
+                mean_d=mean_d,
+            )
+            history.log_snapshot(step, d_snapshot)
+
             if verbose:
-                loss_name = cfg.data.field_loss if data_bundle.mode == "field" else "ppp"
-                reg_smooth_eff = cfg.reg.wreg_smooth * reg_smooth
-                reg_scale_eff = cfg.reg.wreg_scale * reg_scale
-                print(
-                    f"[BiLO|finetune] Iter {step:05d} | Ltot: {total_loss.item():.3e}\
-"
-                    f"  Upper: {upper_loss.item():.3e} | Ldata({loss_name}): {data_loss.item():.3e} | "
-                    f"RegSmooth: {reg_smooth.item():.3e} (eff: {reg_smooth_eff.item():.3e}) | "
-                    f"RegScale: {reg_scale.item():.3e} (eff: {reg_scale_eff.item():.3e})\
-"
-                    f"  Lower: {lower_loss.item():.3e} | Lres: {res_loss.item():.3e} | Ljump: {jump_loss.item():.3e} | "
-                    f"Lrgrad: {rgrad.item():.3e} | Ljump_rgrad: {jump_rgrad.item():.3e}\
-"
-                    f"  b₀*: {b0_star.item():.2f} | ∫û: {integral_unit.item():.3e} | ∫u: {u_int:.3e} | ⟨D⟩: {mean_d:.3e}"
-                )
+                loss_name = field_loss_type if mode == "field" else "ppp"
+                print(format_bilo_progress(
+                    step=step,
+                    phase="finetune",
+                    total=total_loss.item(),
+                    upper=upper_loss.item(),
+                    data=data_loss.item(),
+                    reg_smooth=reg_smooth.item(),
+                    reg_scale=reg_scale.item(),
+                    lower=lower_loss.item(),
+                    res=res_loss.item(),
+                    jump=jump_loss.item(),
+                    bc=bc_loss.item(),
+                    rgrad=rgrad.item(),
+                    jump_rgrad=jump_rgrad.item(),
+                    wreg_smooth=wreg_smooth,
+                    wreg_scale=wreg_scale,
+                    b0_star=b0_star.item(),
+                    integral_unit=integral_unit.item(),
+                    mean_d=mean_d,
+                    loss_name=loss_name,
+                    bc_type=bc_type,
+                ))
 
         # -----------------------------------------------------------------
-        # EARLY STOPPING: Stop if loss plateaus after burn-in period
+        # EARLY STOPPING
         # -----------------------------------------------------------------
         stop_training = False
-        if step >= cfg.train.early_burnin:
+        if step >= early_burnin:
             total_val = total_loss.item()
             if best_total is None:
                 best_total = total_val
@@ -788,63 +676,43 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
             else:
                 denom = max(abs(best_total), 1e-12)
                 improvement = (best_total - total_val) / denom
-                if improvement > cfg.train.early_tol:
+                if improvement > early_tol:
                     best_total = total_val
                     patience = 0
                 else:
                     patience += 1
-                    if patience >= cfg.train.early_patience:
+                    if patience >= early_patience:
                         stop_training = True
 
         # -----------------------------------------------------------------
-        # OPTIMIZER STEP: Update both networks simultaneously
+        # OPTIMIZER STEP
         # -----------------------------------------------------------------
-        # For Adam: gradients were already computed and assigned above.
-        # For LBFGS: we need a closure that recomputes the bilevel gradients.
-        #
-        # Note: Even though this is "bilevel", we update both networks in
-        # one optimizer step. The bilevel structure is in HOW we compute
-        # gradients (separate losses), not in alternating updates.
-        if step < cfg.train.finetune_iters and not stop_training:
+        if step < finetune_iters and not stop_training:
             if use_lbfgs:
-                # LBFGS closure must recompute the full bilevel gradient setup
                 def _lbfgs_closure() -> torch.Tensor:
                     optimizer.zero_grad(set_to_none=True)
-                    # Upper level: data loss -> d_net gradients
                     _, data_loss, reg_smooth, reg_scale = _calc_data_loss(
                         d_net, local_op, x_res, x_int, x_field, z_tensor,
-                        data_bundle.mode, u_true, ppp, cfg.data.field_loss,
-                        d_target, cfg.reg.smoothness_type,
-                        b0_fixed_value=b0_fixed_value,
+                        mode, u_true, ppp, field_loss_type, d_target, smoothness_type,
+                        b0_fixed_value=b0_fixed_value
                     )
-                    upper_loss = (
-                        data_loss
-                        + cfg.reg.wreg_smooth * reg_smooth
-                        + cfg.reg.wreg_scale * reg_scale
-                    )
-                    grads_upper = torch.autograd.grad(
-                        upper_loss, d_params, create_graph=False, allow_unused=True,
-                    )
+                    upper_loss = data_loss + wreg_smooth * reg_smooth + wreg_scale * reg_scale
+                    grads_upper = torch.autograd.grad(upper_loss, d_params, create_graph=False, allow_unused=True)
                     for param, grad in zip(d_params, grads_upper):
                         if grad is not None:
                             param.grad = grad
 
-                    # Lower level: physics loss -> local_op gradients
-                    lower_loss, _, _, _, _ = _calc_physics_loss(
-                        d_net, local_op, x_res, z_tensor, z_idx,
-                        cfg.physics.alpha, cfg.physics.mu,
-                        cfg.reg.w_jump, cfg.reg.w_resgrad,
+                    lower_loss, _, _, _, _, _ = _calc_physics_loss(
+                        d_net, local_op, x_res, z_tensor, z_idx, alpha, mu,
+                        w_jump, w_resgrad, bc_type, domain, w_bc
                     )
-                    grads_lower = torch.autograd.grad(
-                        lower_loss, local_op_params, create_graph=False, allow_unused=True,
-                    )
+                    grads_lower = torch.autograd.grad(lower_loss, local_op_params, create_graph=False, allow_unused=True)
                     for param, grad in zip(local_op_params, grads_lower):
                         if grad is not None:
                             param.grad = grad
                     return upper_loss + lower_loss
                 optimizer.step(_lbfgs_closure)
             else:
-                # Standard Adam step (gradients already assigned)
                 optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
@@ -859,26 +727,16 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
     with torch.no_grad():
         d_final = d_net(x_res)
         u_hat_res, _ = local_op(x_res, d_final, z_tensor)
-        if data_bundle.mode == "field":
+        if mode == "field":
             d_field = d_net(x_field)
             u_hat_field, _ = local_op(x_field, d_field, z_tensor)
-            # Get b0 via VarPro projection (or use fixed value if set)
             b0_star = varpro.get_b0_field(
-                u_hat_field,
-                u_true,
-                field_loss=cfg.data.field_loss,
-                b0_fixed_value=b0_fixed_value,
+                u_hat_field, u_true, field_loss=field_loss_type, b0_fixed_value=b0_fixed_value
             )
         else:
             u_hat_int, _ = local_op(x_int, d_net(x_int), z_tensor)
             integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
-            # Get b0 via VarPro projection (or use fixed value if set)
-            b0_star = varpro.get_b0_ppp(
-                ppp.n_obs,
-                ppp.m_obs,
-                integral_unit,
-                b0_fixed_value=b0_fixed_value,
-            )
+            b0_star = varpro.get_b0_ppp(ppp.n_obs, ppp.m_obs, integral_unit, b0_fixed_value=b0_fixed_value)
         u_pred = b0_star * u_hat_res
         d_pred = d_final
 
@@ -888,7 +746,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
         u_hat_unit=u_hat_res.detach().cpu().view(-1),
         u_pred=u_pred.detach().cpu().view(-1),
         b0_star=float(b0_star.item()),
-        history=history,
+        history=history.to_dict(),
         d_net=d_net,
         local_op=local_op,
     )
