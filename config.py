@@ -75,6 +75,10 @@ class DProfileConfig:
     use_ddi: bool = True     # Use DDI as starting point for scalar fit
     ddi_d_min: float = 1e-4  # Lower clamp for DDI estimate
     ddi_d_max: float = 10.0  # Upper clamp for DDI estimate
+    
+    # Synthetic problem generation
+    profile_type: Literal["sinusoidal", "steps"] = "sinusoidal"
+    params: Tuple[float, float, float] = (0.1, 0.04, 4.0) # mean, amplitude, frequency
 
     def validate(self) -> None:
         """Validate diffusion profile settings."""
@@ -82,6 +86,10 @@ class DProfileConfig:
             raise ValueError("pert_scale must be < 1 to keep D_init positive.")
         if self.ddi_d_min > self.ddi_d_max:
             raise ValueError("ddi_d_min must be <= ddi_d_max.")
+        if self.profile_type not in {"sinusoidal", "steps"}:
+            raise ValueError("profile_type must be 'sinusoidal' or 'steps'.")
+        if len(self.params) != 3:
+            raise ValueError("params must be a 3-tuple (mean, amplitude, frequency).")
 
 
 @dataclass
@@ -245,6 +253,30 @@ class RunConfig:
 
 
 @dataclass
+class SolverConfig:
+    """Method-specific solver configuration."""
+    method: Literal["dto", "pinn", "bilo"] = "dto"
+
+    def validate(self) -> None:
+        if self.method not in {"dto", "pinn", "bilo"}:
+            raise ValueError(f"Unknown method '{self.method}'")
+
+
+@dataclass
+class WandBConfig:
+    """WandB logging configuration."""
+    enabled: bool = False
+    project: str = "AlphaDiffusivityNet"
+    entity: str | None = None
+    group: str | None = None
+    name: str | None = None
+    tags: Tuple[str, ...] = ()
+
+    def validate(self) -> None:
+        pass
+
+
+@dataclass
 class Config:
     """Top-level configuration object with nested sections."""
 
@@ -255,6 +287,8 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
     reg: RegConfig = field(default_factory=RegConfig)
     arch: ArchConfig = field(default_factory=ArchConfig)
+    solver: SolverConfig = field(default_factory=SolverConfig)
+    wandb: WandBConfig = field(default_factory=WandBConfig)
     run: RunConfig = field(default_factory=RunConfig)
 
     def __post_init__(self) -> None:
@@ -270,6 +304,8 @@ class Config:
         self.train.validate()
         self.reg.validate()
         self.arch.validate()
+        self.solver.validate()
+        self.wandb.validate()
         self.run.validate()
 
     def to_dict(self) -> Dict[str, Any]:
@@ -282,7 +318,7 @@ class Config:
         if not isinstance(data, dict):
             raise TypeError("Config.from_dict expects a dict.")
 
-        nested_keys = {"physics", "d_profile", "data", "grid", "train", "reg", "arch", "run"}
+        nested_keys = {"physics", "d_profile", "data", "grid", "train", "reg", "arch", "solver", "wandb", "run"}
         if any(k in data for k in nested_keys):
             return cls.from_nested_dict(data)
         raise ValueError("Expected nested config dict; legacy flat configs are no longer supported.")
@@ -324,6 +360,8 @@ class Config:
             train=TrainConfig(**data.get("train", {})),
             reg=RegConfig(**reg_data),
             arch=ArchConfig(**data.get("arch", {})),
+            solver=SolverConfig(**data.get("solver", {})),
+            wandb=WandBConfig(**data.get("wandb", {})),
             run=RunConfig(**data.get("run", {})),
         )
 

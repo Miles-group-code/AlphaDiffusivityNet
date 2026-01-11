@@ -33,6 +33,11 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 import numpy as np
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 
 # =============================================================================
 # TRAINING HISTORY
@@ -122,6 +127,16 @@ class TrainingHistory:
         for k, v in kwargs.items():
             if k in self._data:
                 self._data[k].append(v)
+        
+        # Log to wandb if active
+        if wandb is not None and wandb.run is not None:
+            # We filter only what is in _data to be consistent, or just log everything provided?
+            # The docstring says "others are silently ignored" for self._data. 
+            # For wandb, we probably want to log what's being tracked.
+            log_dict = {k: v for k, v in kwargs.items() if k in self._data}
+            if "iter" in log_dict:
+                step = log_dict["iter"]
+                wandb.log(log_dict, step=step)
 
     def log_snapshot(self, step: int, d_snapshot: np.ndarray) -> None:
         """Log a D(x) snapshot for evolution visualization.

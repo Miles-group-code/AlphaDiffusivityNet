@@ -418,7 +418,8 @@ def plot_training_history(
     mean_d_true: float | None = None,
     weights: Dict[str, float] | None = None,
     log_threshold: float = 5.0,
-) -> None:
+    show: bool = True,
+) -> Optional[plt.Figure]:
     """Plot training loss curves and summary statistics.
 
     Loss components are plotted as change from initial value (val - val[0]),
@@ -606,8 +607,12 @@ def plot_training_history(
             filename = f"{name.lower()}_history.png"
         fig.savefig(os.path.join(outdir, filename), dpi=150)
         plt.close(fig)
-    else:
+        return None
+    elif show:
         plt.show()
+        return None
+    else:
+        return fig
 
 
 def plot_d_evolution(
@@ -618,7 +623,8 @@ def plot_d_evolution(
     filename: str | None = None,
     mean_d_true: float | None = None,
     log_threshold: float = 5.0,
-) -> None:
+    show: bool = True,
+) -> Optional[plt.Figure]:
     """Visualize D(x) snapshots across training iterations."""
     snaps = hist.get("d_snapshots", [])
     iters = hist.get("d_snap_iters", [])
@@ -662,8 +668,13 @@ def plot_d_evolution(
         if filename is None:
             filename = f"{name.lower()}_d_evolution.png"
         fig.savefig(os.path.join(outdir, filename), dpi=150)
-    else:
+        plt.close(fig)
+        return None
+    elif show:
         plt.show()
+        return None
+    else:
+        return fig
 
 
 def plot_particle_comparison(
