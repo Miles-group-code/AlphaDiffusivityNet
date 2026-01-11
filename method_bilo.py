@@ -270,7 +270,7 @@ def _calc_physics_loss(
     bc_type: str,
     domain: Tuple[float, float],
     w_bc: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute PDE residual, jump, and BC penalties for the lower-level objective."""
     x_pde = x_res.clone().detach().requires_grad_(True)
     d_pde = d_net(x_pde)
@@ -314,7 +314,7 @@ def _calc_physics_loss(
     lower_loss = res_loss + w_jump * jump_loss + w_resgrad * (rgrad + jump_rgrad)
     if bc_type == "neumann":
         lower_loss = lower_loss + w_bc * (bc_loss) + w_resgrad * bc_grad_loss
-    return lower_loss, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad
+    return lower_loss, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad, bc_grad_loss
 
 
 def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
@@ -491,7 +491,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
             opt_d.step()
 
             opt_l.zero_grad(set_to_none=True)
-            lower, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad = _calc_physics_loss(
+            lower, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad, bc_grad_loss = _calc_physics_loss(
                 d_net, local_op, x_res, z_tensor, z_idx, alpha, mu,
                 w_jump, w_resgrad, bc_type, domain, w_bc
             )
@@ -513,6 +513,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                     res=res_loss.item(),
                     jump=jump_loss.item(),
                     bc=bc_loss.item(),
+                    bc_grad=bc_grad_loss.item(),
                     rgrad=rgrad.item(),
                     jump_rgrad=jump_rgrad.item(),
                     mean_d=mean_d,
@@ -526,7 +527,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
             with torch.enable_grad():
                 d_pred = d_net(x_res)
                 anchor_loss = torch.mean((d_pred - d_init_profile) ** 2)
-                lower, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad = _calc_physics_loss(
+                lower, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad, bc_grad_loss = _calc_physics_loss(
                     d_net, local_op, x_res, z_tensor, z_idx, alpha, mu,
                     w_jump, w_resgrad, bc_type, domain, w_bc
                 )
@@ -544,6 +545,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                 res=res_loss.item(),
                 jump=jump_loss.item(),
                 bc=bc_loss.item(),
+                bc_grad=bc_grad_loss.item(),
                 rgrad=rgrad.item(),
                 jump_rgrad=jump_rgrad.item(),
                 mean_d=mean_d,
@@ -602,7 +604,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                     param.grad = grad
 
         # Lower level: physics loss -> local_op gradients
-        lower_loss, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad = _calc_physics_loss(
+        lower_loss, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad, bc_grad_loss = _calc_physics_loss(
             d_net, local_op, x_res, z_tensor, z_idx, alpha, mu,
             w_jump, w_resgrad, bc_type, domain, w_bc
         )
@@ -640,6 +642,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                 res=res_loss.item(),
                 jump=jump_loss.item(),
                 bc=bc_loss.item(),
+                bc_grad=bc_grad_loss.item(),
                 rgrad=rgrad.item(),
                 jump_rgrad=jump_rgrad.item(),
                 b0_star=b0_star.item(),
@@ -710,7 +713,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                         if grad is not None:
                             param.grad = grad
 
-                    lower_loss, _, _, _, _, _ = _calc_physics_loss(
+                    lower_loss, _, _, _, _, _, _ = _calc_physics_loss(
                         d_net, local_op, x_res, z_tensor, z_idx, alpha, mu,
                         w_jump, w_resgrad, bc_type, domain, w_bc
                     )

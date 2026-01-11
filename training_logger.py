@@ -102,11 +102,11 @@ class TrainingHistory:
 
         Tracked metrics:
             iter, upper, data, reg_smooth, reg_scale, lower, res, jump, bc,
-            rgrad, jump_rgrad, b0_star, mean_d
+            bc_grad, rgrad, jump_rgrad, b0_star, mean_d
         """
         return cls([
             "iter", "upper", "data", "reg_smooth", "reg_scale",
-            "lower", "res", "jump", "bc", "rgrad", "jump_rgrad",
+            "lower", "res", "jump", "bc", "bc_grad", "rgrad", "jump_rgrad",
             "b0_star", "mean_d", "d_snap_iters", "d_snapshots"
         ])
 
@@ -376,6 +376,7 @@ def format_bilo_pretrain_progress(
     res: float,
     jump: float,
     bc: float,
+    bc_grad: float,
     rgrad: float,
     jump_rgrad: float,
     mean_d: float,
@@ -392,6 +393,7 @@ def format_bilo_pretrain_progress(
         res: PDE residual loss (unweighted)
         jump: Jump condition loss (unweighted)
         bc: Boundary condition loss (unweighted)
+        bc_grad: Boundary condition gradient penalty (unweighted)
         rgrad: Residual gradient penalty (unweighted)
         jump_rgrad: Jump gradient penalty (unweighted)
         mean_d: Mean D value
@@ -401,11 +403,12 @@ def format_bilo_pretrain_progress(
         Formatted multi-line string for printing.
     """
     bc_str = f" | Lbc: {bc:.3e}" if bc_type == "neumann" else ""
+    bc_grad_str = f" | Lbc_grad: {bc_grad:.3e}" if bc_type == "neumann" else ""
 
     return (
         f"[BiLO|pretrain] Iter {step:05d} | Ltot: {total:.3e}\n"
         f"  Lanchor: {anchor:.3e} | Llower: {lower:.3e} | Lsup: {sup:.3e}\n"
-        f"  Lres: {res:.3e} | Ljump: {jump:.3e} | "
-        f"Lrgrad: {rgrad:.3e} | Ljump_rgrad: {jump_rgrad:.3e}{bc_str}\n"
+        f"  Lres: {res:.3e} | Ljump: {jump:.3e}{bc_str}{bc_grad_str} | "
+        f"Lrgrad: {rgrad:.3e} | Ljump_rgrad: {jump_rgrad:.3e}\n"
         f"  mean_D: {mean_d:.3e}"
     )
