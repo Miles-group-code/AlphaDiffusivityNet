@@ -190,7 +190,7 @@ def _compute_bc_loss_neumann(
     domain: Tuple[float, float],
     device: torch.device,
     dtype: torch.dtype,
-) -> torch.Tensor:
+):
     """Penalize boundary derivatives for Neumann BCs: u'(x_min)=u'(x_max)=0."""
     x0 = torch.tensor([[domain[0]]], device=device, dtype=dtype, requires_grad=True)
     x1 = torch.tensor([[domain[1]]], device=device, dtype=dtype, requires_grad=True)
@@ -203,7 +203,14 @@ def _compute_bc_loss_neumann(
     u0_x = torch.autograd.grad(u0, x0, grad_outputs=torch.ones_like(u0), create_graph=True)[0]
     u1_x = torch.autograd.grad(u1, x1, grad_outputs=torch.ones_like(u1), create_graph=True)[0]
 
-    return torch.mean(u0_x ** 2 + u1_x ** 2)
+    Du0_x_D = torch.autograd.grad(d0 * u0_x, d0, grad_outputs=torch.ones_like(u0), create_graph=True)[0]
+    Du1_x_D = torch.autograd.grad(d1 * u1_x, d1, grad_outputs=torch.ones_like(u1), create_graph=True)[0]
+
+    bc_loss = torch.mean(u0_x ** 2 + u1_x ** 2)
+
+    bc_grad_loss =  torch.mean(Du0_x_D ** 2 + Du1_x_D ** 2)
+
+    return bc_loss, bc_grad_loss
 
 
 def _calc_data_loss(
@@ -282,8 +289,9 @@ def _calc_physics_loss(
     jump_loss = torch.mean(jump_res ** 2)
 
     bc_loss = torch.tensor(0.0, device=x_res.device, dtype=x_res.dtype)
+    bc_grad_loss = torch.tensor(0.0, device=x_res.device, dtype=x_res.dtype)
     if bc_type == "neumann":
-        bc_loss = _compute_bc_loss_neumann(d_net, local_op, z_tensor, domain, x_res.device, x_res.dtype)
+        bc_loss, bc_grad_loss = _compute_bc_loss_neumann(d_net, local_op, z_tensor, domain, x_res.device, x_res.dtype)
 
     if w_resgrad > 0.0:
         grad_jump = torch.autograd.grad(
@@ -305,7 +313,7 @@ def _calc_physics_loss(
 
     lower_loss = res_loss + w_jump * jump_loss + w_resgrad * (rgrad + jump_rgrad)
     if bc_type == "neumann":
-        lower_loss = lower_loss + w_bc * bc_loss
+        lower_loss = lower_loss + w_bc * (bc_loss) + w_resgrad * bc_grad_loss
     return lower_loss, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad
 
 
