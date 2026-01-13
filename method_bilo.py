@@ -298,7 +298,8 @@ def _calc_physics_loss(
         grad_jump = torch.autograd.grad(
             jump_res, d_z, grad_outputs=torch.ones_like(jump_res), create_graph=True, allow_unused=True
         )[0]
-        d_scale_jump = d_z.clamp(min=D_MIN)
+        # d_scale_jump = d_z.clamp(min=D_MIN)
+        d_scale_jump = 1.0
         jump_rgrad = torch.mean((grad_jump * d_scale_jump) ** 2) if grad_jump is not None else torch.tensor(0.0, device=x_res.device, dtype=x_res.dtype)
 
         grad_outputs = torch.ones_like(residual)
@@ -306,7 +307,8 @@ def _calc_physics_loss(
         grad_res = torch.autograd.grad(
             residual, d_pde, grad_outputs=grad_outputs, create_graph=True, allow_unused=True
         )[0]
-        d_scale_pde = d_pde.clamp(min=D_MIN)
+        # d_scale_pde = d_pde.clamp(min=D_MIN)
+        d_scale_pde = 1.0
         rgrad = torch.mean((grad_res * d_scale_pde) ** 2) if grad_res is not None else torch.tensor(0.0, device=x_res.device, dtype=x_res.dtype)
     else:
         rgrad = torch.tensor(0.0, device=x_res.device, dtype=x_res.dtype)
