@@ -495,15 +495,22 @@ class Solution:
         u_np = self._to_numpy(self.u_pred).reshape(-1)
         u_fdm = None
         if problem is not None and self.method in {"PINN", "BILO"}:
-            u_fdm = physics.fdm_solve_alpha(
-                d_np,
-                problem.alpha,
-                problem.mu,
-                x_res_np,
-                self.b0_star,
-                (problem.source_location,),
-                bc_type=problem.bc_type,
-            )
+            try:
+                u_fdm = physics.fdm_solve_alpha(
+                    d_np,
+                    problem.alpha,
+                    problem.mu,
+                    x_res_np,
+                    self.b0_star,
+                    (problem.source_location,),
+                    bc_type=problem.bc_type,
+                )
+            except ValueError as e:
+                print(f"Warning: FDM solve failed ({e}). Skipping FDM plot.")
+                u_fdm = None
+                pass
+                
+                
         plot_particles = (
             problem is not None
             and problem.mode == "particles"

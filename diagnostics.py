@@ -181,15 +181,23 @@ def compute_loss_comparison(
     bc_type = getattr(problem, "bc_type", "dirichlet")
 
     # Solve FDM with D_pred (unit source)
-    u_hat_pred = physics.fdm_solve_alpha(
-        d_pred,
-        problem.alpha,
-        problem.mu,
-        x_res,
-        1.0,
-        (problem.source_location,),
-        bc_type=bc_type,
-    )
+    u_hat_pred = None
+    try:
+        u_hat_pred = physics.fdm_solve_alpha(
+            d_pred,
+            problem.alpha,
+            problem.mu,
+            x_res,
+            1.0,
+            (problem.source_location,),
+            bc_type=bc_type,
+        )
+    except ValueError as e:
+        if "D must be strictly positive" in str(e):
+            if verbose:
+                print(f"Warning: FDM solve with D_pred failed ({e}). Skipping FDM comparison.")
+        else:
+            raise
 
     # Solve FDM with D_true (unit source)
     u_hat_true = physics.fdm_solve_alpha(
@@ -204,9 +212,8 @@ def compute_loss_comparison(
 
     # Convert to torch for VarPro
     x_res_t = torch.tensor(x_res, dtype=torch.float64)
-    u_hat_pred_t = torch.tensor(u_hat_pred, dtype=torch.float64)
+    u_hat_pred_t = torch.tensor(u_hat_pred, dtype=torch.float64) if u_hat_pred is not None else None
     u_hat_true_t = torch.tensor(u_hat_true, dtype=torch.float64)
-
     if problem.mode == "field":
         # Field mode: use observation field
         u_obs = problem.u_field.detach().cpu().view(-1)
@@ -832,20 +839,24 @@ def plot_bilo_d_variation(
             u_var = solution.b0_star * u_hat_var.view(-1).detach().cpu().numpy()
         
         # Also compute FDM solution for comparison
-        u_fdm_var = physics.fdm_solve_alpha(
-            D_var,
-            problem.alpha,
-            problem.mu,
-            x_np,
-            solution.b0_star,
-            (problem.source_location,),
-            bc_type=problem.bc_type,
-        )
+        try:
+            u_fdm_var = physics.fdm_solve_alpha(
+                D_var,
+                problem.alpha,
+                problem.mu,
+                x_np,
+                solution.b0_star,
+                (problem.source_location,),
+                bc_type=problem.bc_type,
+            )
+        except ValueError as e:
+            u_fdm_var = None
         
         # Plot u(x)
         ax_u = axes[idx, 0]
         ax_u.plot(x_np, u_var, label=f"LocalOp ({varkey})", linewidth=2)
-        ax_u.plot(x_np, u_fdm_var, "--", label="FDM", linewidth=1.5, alpha=0.7)
+        if u_fdm_var is not None:
+            ax_u.plot(x_np, u_fdm_var, "--", label="FDM", linewidth=1.5, alpha=0.7)
         
         # Plot u_0 for reference
         with torch.no_grad():

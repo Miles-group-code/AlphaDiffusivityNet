@@ -84,6 +84,9 @@ def map_shortcut(key: str) -> str:
         # Common training
         "lr_d": "train.lr_d_fine", # usually what people mean
         "max_iters": "train.finetune_iters",
+        
+        # Data config shortcuts
+        "b0_fixed_value": "data.b0_fixed_value",
     }
     return shortcuts.get(key, key)
 
@@ -243,7 +246,8 @@ def main():
     for k, v in metrics.items():
         print(f"{k}: {v:.4e}")
     
-    # Determine output directory (use config outdir when wandb is disabled)
+    # Determine output directory for saving plots to disk
+    # Skip local saving when wandb is enabled (user preference)
     outdir = cfg.run.outdir if not cfg.wandb.enabled else None
     
     if cfg.wandb.enabled and wandb.run is not None:
@@ -256,47 +260,81 @@ def main():
         fig = solution.plot(problem, show=False)
         if fig is not None:
             if cfg.wandb.enabled and wandb.run is not None:
-                wandb.log({"solution_plot": wandb.Image(fig)})
+                # Log to wandb - use commit=False to batch all plots together
+                wandb.log({"solution_plot": wandb.Image(fig)}, commit=False)
+                print(f"  ✓ Logged solution_plot to wandb (run: {wandb.run.name})")
             if outdir:
                 os.makedirs(outdir, exist_ok=True)
-                fig.savefig(os.path.join(outdir, "solution_plot.png"), dpi=150)
+                save_path = os.path.join(outdir, "solution_plot.png")
+                fig.savefig(save_path, dpi=150)
+                print(f"  ✓ Saved solution_plot to: {save_path}")
             plt.close(fig)
         else:
             print("Warning: solution.plot() returned None")
     except Exception as e:
         print(f"Warning: Failed to generate solution plot: {e}")
     
+    # Generate D evolution plot
     try:
-        from diagnostics import plot_d_evolution_color, plot_bilo_d_variation
-
+        from diagnostics import plot_d_evolution_color
         x_res_np = solution._get_x_array()
+        # When wandb is enabled, we need the figure returned (not saved), so pass outdir=None
+        # and handle saving separately
         fig_evo = plot_d_evolution_color(
             cfg.solver.method.upper(),
             solution.history,
             x_res_np,
-            outdir=outdir,
+            outdir=None,  # Don't save yet, we'll handle it below
             show=False
         )
         if fig_evo:
             if cfg.wandb.enabled and wandb.run is not None:
-                wandb.log({"d_evolution": wandb.Image(fig_evo)})
+                # Log to wandb - use commit=False to batch all plots together
+                wandb.log({"d_evolution": wandb.Image(fig_evo)}, commit=False)
+                print(f"  ✓ Logged d_evolution to wandb (run: {wandb.run.name})")
+            if outdir:
+                os.makedirs(outdir, exist_ok=True)
+                save_path = os.path.join(outdir, f"{cfg.solver.method.lower()}_d_evolution.png")
+                fig_evo.savefig(save_path, dpi=150)
+                print(f"  ✓ Saved d_evolution to: {save_path}")
             plt.close(fig_evo)
-        
-        # For BiLO, also plot D variation sensitivity
-        if cfg.solver.method.lower() == "bilo":
+        else:
+            print("  ⚠ D evolution plot not generated (insufficient snapshots)")
+    except Exception as e:
+        print(f"Warning: Failed to generate D evolution plot: {e}")
+    
+    # Generate BiLO D variation plot (only for BiLO)
+    if cfg.solver.method.lower() == "bilo":
+        try:
+            from diagnostics import plot_bilo_d_variation
+            # When wandb is enabled, we need the figure returned (not saved), so pass outdir=None
+            # and handle saving separately
             fig_var = plot_bilo_d_variation(
                 solution,
                 problem,
-                outdir=outdir,
+                outdir=None,  # Don't save yet, we'll handle it below
                 show=False
             )
             if fig_var:
                 if cfg.wandb.enabled and wandb.run is not None:
-                    wandb.log({"bilo_d_variation": wandb.Image(fig_var)})
+                    # Log to wandb - use commit=False to batch all plots together
+                    wandb.log({"bilo_d_variation": wandb.Image(fig_var)}, commit=False)
+                    print(f"  ✓ Logged bilo_d_variation to wandb (run: {wandb.run.name})")
+                if outdir:
+                    os.makedirs(outdir, exist_ok=True)
+                    save_path = os.path.join(outdir, "bilo_d_variation.png")
+                    fig_var.savefig(save_path, dpi=150)
+                    print(f"  ✓ Saved bilo_d_variation to: {save_path}")
                 plt.close(fig_var)
-            
-    except Exception as e:
-        print(f"Warning: Failed to generate auxiliary plots: {e}")
+            else:
+                print("  ⚠ BiLO D variation plot not generated")
+        except Exception as e:
+            print(f"Warning: Failed to generate BiLO D variation plot: {e}")
+    
+    # Commit all plots to wandb at once
+    if cfg.wandb.enabled and wandb.run is not None:
+        wandb.log({}, commit=True)
+        print(f"  ✓ All plots committed to wandb")
 
     print("\nDone.")
 
