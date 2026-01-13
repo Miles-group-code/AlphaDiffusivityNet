@@ -100,6 +100,7 @@ class DNet(nn.Module):
             feat = self.embed(x)
         raw = self.net(feat)
         return F.softplus(raw) + self.d_min
+        
 
 
 class LocalOperator(nn.Module):
@@ -483,44 +484,48 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
         opt_d = torch.optim.Adam(d_net.parameters(), lr=lr_d_pre)
         opt_l = torch.optim.Adam(local_op.parameters(), lr=lr_lower_pre)
 
-        for step in range(pretrain_iters):
-            opt_d.zero_grad(set_to_none=True)
-            d_pred = d_net(x_res)
-            anchor_loss = torch.mean((d_pred - d_init_profile) ** 2)
-            anchor_loss.backward()
-            opt_d.step()
+        try:
+            for step in range(pretrain_iters):
+                opt_d.zero_grad(set_to_none=True)
+                d_pred = d_net(x_res)
+                anchor_loss = torch.mean((d_pred - d_init_profile) ** 2)
+                anchor_loss.backward()
+                opt_d.step()
 
-            opt_l.zero_grad(set_to_none=True)
-            lower, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad, bc_grad_loss = _calc_physics_loss(
-                d_net, local_op, x_res, z_tensor, z_idx, alpha, mu,
-                w_jump, w_resgrad, bc_type, domain, w_bc
-            )
-            d_curr = d_net(x_res).detach()
-            u_pred, _ = local_op(x_res, d_curr, z_tensor)
-            loss_sup = torch.mean((u_pred - u_init_target) ** 2)
-            (lower + loss_sup).backward()
+                opt_l.zero_grad(set_to_none=True)
+                lower, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad, bc_grad_loss = _calc_physics_loss(
+                    d_net, local_op, x_res, z_tensor, z_idx, alpha, mu,
+                    w_jump, w_resgrad, bc_type, domain, w_bc
+                )
+                d_curr = d_net(x_res).detach()
+                u_pred, _ = local_op(x_res, d_curr, z_tensor)
+                loss_sup = torch.mean((u_pred - u_init_target) ** 2)
+                (lower + loss_sup).backward()
 
-            if verbose and step % log_every == 0:
-                with torch.no_grad():
-                    mean_d = torch.mean(d_curr).item()
-                    pre_total = (anchor_loss + lower + loss_sup).item()
-                print(format_bilo_pretrain_progress(
-                    step=step,
-                    total=pre_total,
-                    anchor=anchor_loss.item(),
-                    lower=lower.item(),
-                    sup=loss_sup.item(),
-                    res=res_loss.item(),
-                    jump=jump_loss.item(),
-                    bc=bc_loss.item(),
-                    bc_grad=bc_grad_loss.item(),
-                    rgrad=rgrad.item(),
-                    jump_rgrad=jump_rgrad.item(),
-                    mean_d=mean_d,
-                    bc_type=bc_type,
-                ))
+                if verbose and step % log_every == 0:
+                    with torch.no_grad():
+                        mean_d = torch.mean(d_curr).item()
+                        pre_total = (anchor_loss + lower + loss_sup).item()
+                    print(format_bilo_pretrain_progress(
+                        step=step,
+                        total=pre_total,
+                        anchor=anchor_loss.item(),
+                        lower=lower.item(),
+                        sup=loss_sup.item(),
+                        res=res_loss.item(),
+                        jump=jump_loss.item(),
+                        bc=bc_loss.item(),
+                        bc_grad=bc_grad_loss.item(),
+                        rgrad=rgrad.item(),
+                        jump_rgrad=jump_rgrad.item(),
+                        mean_d=mean_d,
+                        bc_type=bc_type,
+                    ))
 
-            opt_l.step()
+                opt_l.step()
+        except KeyboardInterrupt:
+            if verbose:
+                print(f"\n[BiLO] Pretraining interrupted by user at step {step}. Continuing to finetune...")
 
         # Final pretrain log
         if verbose:
@@ -585,77 +590,56 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
     # =========================================================================
     # MAIN BILEVEL TRAINING LOOP
     # =========================================================================
-    for step in range(finetune_iters + 1):
-        if not use_lbfgs:
-            optimizer.zero_grad(set_to_none=True)
+    try:
+        for step in range(finetune_iters + 1):
+            if not use_lbfgs:
+                optimizer.zero_grad(set_to_none=True)
 
-        # Upper level: data loss -> d_net gradients
-        b0_star, data_loss, reg_smooth, reg_scale = _calc_data_loss(
-            d_net, local_op, x_res, x_int, x_field, z_tensor,
-            mode, u_true, ppp, field_loss_type, d_target, smoothness_type,
-            b0_fixed_value=b0_fixed_value
-        )
-        upper_loss = data_loss + wreg_smooth * reg_smooth + wreg_scale * reg_scale
-
-        if not use_lbfgs:
-            grads_upper = torch.autograd.grad(upper_loss, d_params, create_graph=False, allow_unused=True)
-            for param, grad in zip(d_params, grads_upper):
-                if grad is not None:
-                    param.grad = grad
-
-        # Lower level: physics loss -> local_op gradients
-        lower_loss, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad, bc_grad_loss = _calc_physics_loss(
-            d_net, local_op, x_res, z_tensor, z_idx, alpha, mu,
-            w_jump, w_resgrad, bc_type, domain, w_bc
-        )
-
-        if not use_lbfgs:
-            grads_lower = torch.autograd.grad(lower_loss, local_op_params, create_graph=False, allow_unused=True)
-            for param, grad in zip(local_op_params, grads_lower):
-                if grad is not None:
-                    param.grad = grad
-
-        # -----------------------------------------------------------------
-        # LOGGING
-        # -----------------------------------------------------------------
-        total_loss = upper_loss + lower_loss
-        if step % log_every == 0:
-            with torch.no_grad():
-                d_res = d_net(x_res)
-                mean_d = torch.mean(d_res).item()
-                u_hat_res, _ = local_op(x_res, d_res, z_tensor)
-                if mode == "particles":
-                    d_int = d_net(x_int)
-                    u_hat_int, _ = local_op(x_int, d_int, z_tensor)
-                    integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
-                else:
-                    integral_unit = torch.trapezoid(u_hat_res.view(-1), x_res.view(-1))
-                d_snapshot = d_res.detach().cpu().numpy().reshape(-1)
-
-            history.log(
-                step=step,
-                upper=upper_loss.item(),
-                data=data_loss.item(),
-                reg_smooth=reg_smooth.item(),
-                reg_scale=reg_scale.item(),
-                lower=lower_loss.item(),
-                res=res_loss.item(),
-                jump=jump_loss.item(),
-                bc=bc_loss.item(),
-                bc_grad=bc_grad_loss.item(),
-                rgrad=rgrad.item(),
-                jump_rgrad=jump_rgrad.item(),
-                b0_star=b0_star.item(),
-                mean_d=mean_d,
+            # Upper level: data loss -> d_net gradients
+            b0_star, data_loss, reg_smooth, reg_scale = _calc_data_loss(
+                d_net, local_op, x_res, x_int, x_field, z_tensor,
+                mode, u_true, ppp, field_loss_type, d_target, smoothness_type,
+                b0_fixed_value=b0_fixed_value
             )
-            history.log_snapshot(step, d_snapshot)
+            upper_loss = data_loss + wreg_smooth * reg_smooth + wreg_scale * reg_scale
 
-            if verbose:
-                loss_name = field_loss_type if mode == "field" else "ppp"
-                print(format_bilo_progress(
+            if not use_lbfgs:
+                grads_upper = torch.autograd.grad(upper_loss, d_params, create_graph=False, allow_unused=True)
+                for param, grad in zip(d_params, grads_upper):
+                    if grad is not None:
+                        param.grad = grad
+
+            # Lower level: physics loss -> local_op gradients
+            lower_loss, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad, bc_grad_loss = _calc_physics_loss(
+                d_net, local_op, x_res, z_tensor, z_idx, alpha, mu,
+                w_jump, w_resgrad, bc_type, domain, w_bc
+            )
+
+            if not use_lbfgs:
+                grads_lower = torch.autograd.grad(lower_loss, local_op_params, create_graph=False, allow_unused=True)
+                for param, grad in zip(local_op_params, grads_lower):
+                    if grad is not None:
+                        param.grad = grad
+
+            # -----------------------------------------------------------------
+            # LOGGING
+            # -----------------------------------------------------------------
+            total_loss = upper_loss + lower_loss
+            if step % log_every == 0:
+                with torch.no_grad():
+                    d_res = d_net(x_res)
+                    mean_d = torch.mean(d_res).item()
+                    u_hat_res, _ = local_op(x_res, d_res, z_tensor)
+                    if mode == "particles":
+                        d_int = d_net(x_int)
+                        u_hat_int, _ = local_op(x_int, d_int, z_tensor)
+                        integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
+                    else:
+                        integral_unit = torch.trapezoid(u_hat_res.view(-1), x_res.view(-1))
+                    d_snapshot = d_res.detach().cpu().numpy().reshape(-1)
+
+                history.log(
                     step=step,
-                    phase="finetune",
-                    total=total_loss.item(),
                     upper=upper_loss.item(),
                     data=data_loss.item(),
                     reg_smooth=reg_smooth.item(),
@@ -664,73 +648,98 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                     res=res_loss.item(),
                     jump=jump_loss.item(),
                     bc=bc_loss.item(),
+                    bc_grad=bc_grad_loss.item(),
                     rgrad=rgrad.item(),
                     jump_rgrad=jump_rgrad.item(),
-                    wreg_smooth=wreg_smooth,
-                    wreg_scale=wreg_scale,
                     b0_star=b0_star.item(),
-                    integral_unit=integral_unit.item(),
                     mean_d=mean_d,
-                    loss_name=loss_name,
-                    bc_type=bc_type,
-                ))
+                )
+                history.log_snapshot(step, d_snapshot)
 
-        # -----------------------------------------------------------------
-        # EARLY STOPPING
-        # -----------------------------------------------------------------
-        stop_training = False
-        if step >= early_burnin:
-            total_val = total_loss.item()
-            if best_total is None:
-                best_total = total_val
-                patience = 0
-            else:
-                denom = max(abs(best_total), 1e-12)
-                improvement = (best_total - total_val) / denom
-                if improvement > early_tol:
+                if verbose:
+                    loss_name = field_loss_type if mode == "field" else "ppp"
+                    print(format_bilo_progress(
+                        step=step,
+                        phase="finetune",
+                        total=total_loss.item(),
+                        upper=upper_loss.item(),
+                        data=data_loss.item(),
+                        reg_smooth=reg_smooth.item(),
+                        reg_scale=reg_scale.item(),
+                        lower=lower_loss.item(),
+                        res=res_loss.item(),
+                        jump=jump_loss.item(),
+                        bc=bc_loss.item(),
+                        rgrad=rgrad.item(),
+                        jump_rgrad=jump_rgrad.item(),
+                        wreg_smooth=wreg_smooth,
+                        wreg_scale=wreg_scale,
+                        b0_star=b0_star.item(),
+                        integral_unit=integral_unit.item(),
+                        mean_d=mean_d,
+                        loss_name=loss_name,
+                        bc_type=bc_type,
+                    ))
+
+            # -----------------------------------------------------------------
+            # EARLY STOPPING
+            # -----------------------------------------------------------------
+            stop_training = False
+            if step >= early_burnin:
+                total_val = total_loss.item()
+                if best_total is None:
                     best_total = total_val
                     patience = 0
                 else:
-                    patience += 1
-                    if patience >= early_patience:
-                        stop_training = True
+                    denom = max(abs(best_total), 1e-12)
+                    improvement = (best_total - total_val) / denom
+                    if improvement > early_tol:
+                        best_total = total_val
+                        patience = 0
+                    else:
+                        patience += 1
+                        if patience >= early_patience:
+                            stop_training = True
 
-        # -----------------------------------------------------------------
-        # OPTIMIZER STEP
-        # -----------------------------------------------------------------
-        if step < finetune_iters and not stop_training:
-            if use_lbfgs:
-                def _lbfgs_closure() -> torch.Tensor:
-                    optimizer.zero_grad(set_to_none=True)
-                    _, data_loss, reg_smooth, reg_scale = _calc_data_loss(
-                        d_net, local_op, x_res, x_int, x_field, z_tensor,
-                        mode, u_true, ppp, field_loss_type, d_target, smoothness_type,
-                        b0_fixed_value=b0_fixed_value
-                    )
-                    upper_loss = data_loss + wreg_smooth * reg_smooth + wreg_scale * reg_scale
-                    grads_upper = torch.autograd.grad(upper_loss, d_params, create_graph=False, allow_unused=True)
-                    for param, grad in zip(d_params, grads_upper):
-                        if grad is not None:
-                            param.grad = grad
+            # -----------------------------------------------------------------
+            # OPTIMIZER STEP
+            # -----------------------------------------------------------------
+            if step < finetune_iters and not stop_training:
+                if use_lbfgs:
+                    def _lbfgs_closure() -> torch.Tensor:
+                        optimizer.zero_grad(set_to_none=True)
+                        _, data_loss, reg_smooth, reg_scale = _calc_data_loss(
+                            d_net, local_op, x_res, x_int, x_field, z_tensor,
+                            mode, u_true, ppp, field_loss_type, d_target, smoothness_type,
+                            b0_fixed_value=b0_fixed_value
+                        )
+                        upper_loss = data_loss + wreg_smooth * reg_smooth + wreg_scale * reg_scale
+                        grads_upper = torch.autograd.grad(upper_loss, d_params, create_graph=False, allow_unused=True)
+                        for param, grad in zip(d_params, grads_upper):
+                            if grad is not None:
+                                param.grad = grad
 
-                    lower_loss, _, _, _, _, _, _ = _calc_physics_loss(
-                        d_net, local_op, x_res, z_tensor, z_idx, alpha, mu,
-                        w_jump, w_resgrad, bc_type, domain, w_bc
-                    )
-                    grads_lower = torch.autograd.grad(lower_loss, local_op_params, create_graph=False, allow_unused=True)
-                    for param, grad in zip(local_op_params, grads_lower):
-                        if grad is not None:
-                            param.grad = grad
-                    return upper_loss + lower_loss
-                optimizer.step(_lbfgs_closure)
+                        lower_loss, _, _, _, _, _, _ = _calc_physics_loss(
+                            d_net, local_op, x_res, z_tensor, z_idx, alpha, mu,
+                            w_jump, w_resgrad, bc_type, domain, w_bc
+                        )
+                        grads_lower = torch.autograd.grad(lower_loss, local_op_params, create_graph=False, allow_unused=True)
+                        for param, grad in zip(local_op_params, grads_lower):
+                            if grad is not None:
+                                param.grad = grad
+                        return upper_loss + lower_loss
+                    optimizer.step(_lbfgs_closure)
+                else:
+                    optimizer.step()
+                    if scheduler is not None:
+                        scheduler.step()
             else:
-                optimizer.step()
-                if scheduler is not None:
-                    scheduler.step()
-        else:
-            if stop_training and verbose:
-                print(f"[BiLO] Early stopping triggered at step {step}.")
-            break
+                if stop_training and verbose:
+                    print(f"[BiLO] Early stopping triggered at step {step}.")
+                break
+    except KeyboardInterrupt:
+        if verbose:
+            print(f"\n[BiLO] Training interrupted by user at step {step}. Continuing to post-processing...")
 
     # =========================================================================
     # FINAL RESULT EXTRACTION

@@ -242,47 +242,61 @@ def main():
     print("\n--- Final Metrics ---")
     for k, v in metrics.items():
         print(f"{k}: {v:.4e}")
-        
+    
+    # Determine output directory (use config outdir when wandb is disabled)
+    outdir = cfg.run.outdir if not cfg.wandb.enabled else None
+    
     if cfg.wandb.enabled and wandb.run is not None:
         # Log metrics as summary only (not as charts)
         for k, v in metrics.items():
             wandb.run.summary[k] = v
-        
-        print("[WandB] Generating plots...")
+    
+    print("[Generating plots...]")
+    try:
         fig = solution.plot(problem, show=False)
-        wandb.log({"solution_plot": wandb.Image(fig)})
-        plt.close(fig)
-        
-        try:
-            from diagnostics import plot_d_evolution_color, plot_bilo_d_variation
+        if fig is not None:
+            if cfg.wandb.enabled and wandb.run is not None:
+                wandb.log({"solution_plot": wandb.Image(fig)})
+            if outdir:
+                os.makedirs(outdir, exist_ok=True)
+                fig.savefig(os.path.join(outdir, "solution_plot.png"), dpi=150)
+            plt.close(fig)
+        else:
+            print("Warning: solution.plot() returned None")
+    except Exception as e:
+        print(f"Warning: Failed to generate solution plot: {e}")
+    
+    try:
+        from diagnostics import plot_d_evolution_color, plot_bilo_d_variation
 
-            
-            x_res_np = solution._get_x_array()
-            fig_evo = plot_d_evolution_color(
-                cfg.solver.method.upper(),
-                solution.history,
-                x_res_np,
-                outdir=None,
+        x_res_np = solution._get_x_array()
+        fig_evo = plot_d_evolution_color(
+            cfg.solver.method.upper(),
+            solution.history,
+            x_res_np,
+            outdir=outdir,
+            show=False
+        )
+        if fig_evo:
+            if cfg.wandb.enabled and wandb.run is not None:
+                wandb.log({"d_evolution": wandb.Image(fig_evo)})
+            plt.close(fig_evo)
+        
+        # For BiLO, also plot D variation sensitivity
+        if cfg.solver.method.lower() == "bilo":
+            fig_var = plot_bilo_d_variation(
+                solution,
+                problem,
+                outdir=outdir,
                 show=False
             )
-            if fig_evo:
-                wandb.log({"d_evolution": wandb.Image(fig_evo)})
-                plt.close(fig_evo)
-            
-            # For BiLO, also plot D variation sensitivity
-            if cfg.solver.method.lower() == "bilo":
-                fig_var = plot_bilo_d_variation(
-                    solution,
-                    problem,
-                    outdir=None,
-                    show=False
-                )
-                if fig_var:
+            if fig_var:
+                if cfg.wandb.enabled and wandb.run is not None:
                     wandb.log({"bilo_d_variation": wandb.Image(fig_var)})
-                    plt.close(fig_var)
-                
-        except Exception as e:
-            print(f"[WandB] Warning: Failed to generate auxiliary plots: {e}")
+                plt.close(fig_var)
+            
+    except Exception as e:
+        print(f"Warning: Failed to generate auxiliary plots: {e}")
 
     print("\nDone.")
 

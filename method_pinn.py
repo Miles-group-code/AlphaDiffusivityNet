@@ -388,36 +388,40 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
             {"params": d_net.parameters(), "lr": lr_d_pre},
             {"params": u_net.parameters(), "lr": lr_lower_pre},
         ])
-        for step in range(pretrain_iters + 1):
-            optim_pre.zero_grad(set_to_none=True)
-            res_loss, jump_loss, bc_loss = _compute_physics_losses(
-                d_net, u_net, x_res, z_tensor, z_idx, alpha, mu, bc_type, domain
-            )
-            phys_loss = w_phys * res_loss + w_jump * jump_loss
-            if bc_type == "neumann":
-                phys_loss = phys_loss + w_bc * bc_loss
-            d_pred = d_net(x_res)
-            anchor_loss = physics.scale_anchor(d_pred, d_target)
-            pre_loss = phys_loss + anchor_loss
+        try:
+            for step in range(pretrain_iters + 1):
+                optim_pre.zero_grad(set_to_none=True)
+                res_loss, jump_loss, bc_loss = _compute_physics_losses(
+                    d_net, u_net, x_res, z_tensor, z_idx, alpha, mu, bc_type, domain
+                )
+                phys_loss = w_phys * res_loss + w_jump * jump_loss
+                if bc_type == "neumann":
+                    phys_loss = phys_loss + w_bc * bc_loss
+                d_pred = d_net(x_res)
+                anchor_loss = physics.scale_anchor(d_pred, d_target)
+                pre_loss = phys_loss + anchor_loss
 
-            if verbose and step % log_every == 0:
-                with torch.no_grad():
-                    mean_d = torch.mean(d_pred).item()
-                print(format_pinn_pretrain_progress(
-                    step=step,
-                    total=pre_loss.item(),
-                    phys=phys_loss.item(),
-                    anchor=anchor_loss.item(),
-                    res=res_loss.item(),
-                    jump=jump_loss.item(),
-                    bc=bc_loss.item(),
-                    mean_d=mean_d,
-                    bc_type=bc_type,
-                ))
+                if verbose and step % log_every == 0:
+                    with torch.no_grad():
+                        mean_d = torch.mean(d_pred).item()
+                    print(format_pinn_pretrain_progress(
+                        step=step,
+                        total=pre_loss.item(),
+                        phys=phys_loss.item(),
+                        anchor=anchor_loss.item(),
+                        res=res_loss.item(),
+                        jump=jump_loss.item(),
+                        bc=bc_loss.item(),
+                        mean_d=mean_d,
+                        bc_type=bc_type,
+                    ))
 
-            if step < pretrain_iters:
-                pre_loss.backward()
-                optim_pre.step()
+                if step < pretrain_iters:
+                    pre_loss.backward()
+                    optim_pre.step()
+        except KeyboardInterrupt:
+            if verbose:
+                print(f"\n[PINN] Pretraining interrupted by user at step {step}. Continuing to finetune...")
 
     # =========================================================================
     # FINETUNE OPTIMIZER SETUP
@@ -498,48 +502,31 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
     # =========================================================================
     # MAIN FINETUNE LOOP
     # =========================================================================
-    for step in range(finetune_iters + 1):
-        if not use_lbfgs:
-            optimizer.zero_grad(set_to_none=True)
+    try:
+        for step in range(finetune_iters + 1):
+            if not use_lbfgs:
+                optimizer.zero_grad(set_to_none=True)
 
-        # Forward pass
-        (
-            total_loss, data_loss, phys_loss, res_loss, jump_loss, bc_loss,
-            reg_smooth, reg_scale, b0_star, d_reg, integral_unit
-        ) = _compute_losses()
+            # Forward pass
+            (
+                total_loss, data_loss, phys_loss, res_loss, jump_loss, bc_loss,
+                reg_smooth, reg_scale, b0_star, d_reg, integral_unit
+            ) = _compute_losses()
 
-        # -----------------------------------------------------------------
-        # LOGGING
-        # -----------------------------------------------------------------
-        if step % log_every == 0:
-            with torch.no_grad():
-                d_vals = d_reg.detach()
-                mean_d = torch.mean(d_vals).item()
-                d_snapshot = d_vals.detach().cpu().numpy().reshape(-1)
-                if mode == "field":
-                    u_hat_res, _ = u_net(x_res, z_tensor)
-                    integral_unit = torch.trapezoid(u_hat_res.view(-1), x_res.view(-1))
+            # -----------------------------------------------------------------
+            # LOGGING
+            # -----------------------------------------------------------------
+            if step % log_every == 0:
+                with torch.no_grad():
+                    d_vals = d_reg.detach()
+                    mean_d = torch.mean(d_vals).item()
+                    d_snapshot = d_vals.detach().cpu().numpy().reshape(-1)
+                    if mode == "field":
+                        u_hat_res, _ = u_net(x_res, z_tensor)
+                        integral_unit = torch.trapezoid(u_hat_res.view(-1), x_res.view(-1))
 
-            history.log(
-                step=step,
-                total=total_loss.item(),
-                data=data_loss.item(),
-                phys=phys_loss.item(),
-                res=res_loss.item(),
-                jump=jump_loss.item(),
-                bc=bc_loss.item(),
-                reg_smooth=reg_smooth.item(),
-                reg_scale=reg_scale.item(),
-                b0_star=b0_star.item(),
-                mean_d=mean_d,
-            )
-            history.log_snapshot(step, d_snapshot)
-
-            if verbose:
-                loss_name = field_loss_type if mode == "field" else "ppp"
-                print(format_pinn_progress(
+                history.log(
                     step=step,
-                    phase="finetune",
                     total=total_loss.item(),
                     data=data_loss.item(),
                     phys=phys_loss.item(),
@@ -548,55 +535,76 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
                     bc=bc_loss.item(),
                     reg_smooth=reg_smooth.item(),
                     reg_scale=reg_scale.item(),
-                    wreg_smooth=wreg_smooth,
-                    wreg_scale=wreg_scale,
                     b0_star=b0_star.item(),
-                    integral_unit=integral_unit.item(),
                     mean_d=mean_d,
-                    loss_name=loss_name,
-                    bc_type=bc_type,
-                ))
+                )
+                history.log_snapshot(step, d_snapshot)
 
-        # -----------------------------------------------------------------
-        # EARLY STOPPING
-        # -----------------------------------------------------------------
-        stop_training = False
-        if step >= early_burnin:
-            total_val = total_loss.item()
-            if best_total is None:
-                best_total = total_val
-                patience = 0
-            else:
-                denom = max(abs(best_total), 1e-12)
-                improvement = (best_total - total_val) / denom
-                if improvement > early_tol:
+                if verbose:
+                    loss_name = field_loss_type if mode == "field" else "ppp"
+                    print(format_pinn_progress(
+                        step=step,
+                        phase="finetune",
+                        total=total_loss.item(),
+                        data=data_loss.item(),
+                        phys=phys_loss.item(),
+                        res=res_loss.item(),
+                        jump=jump_loss.item(),
+                        bc=bc_loss.item(),
+                        reg_smooth=reg_smooth.item(),
+                        reg_scale=reg_scale.item(),
+                        wreg_smooth=wreg_smooth,
+                        wreg_scale=wreg_scale,
+                        b0_star=b0_star.item(),
+                        integral_unit=integral_unit.item(),
+                        mean_d=mean_d,
+                        loss_name=loss_name,
+                        bc_type=bc_type,
+                    ))
+
+            # -----------------------------------------------------------------
+            # EARLY STOPPING
+            # -----------------------------------------------------------------
+            stop_training = False
+            if step >= early_burnin:
+                total_val = total_loss.item()
+                if best_total is None:
                     best_total = total_val
                     patience = 0
                 else:
-                    patience += 1
-                    if patience >= early_patience:
-                        stop_training = True
+                    denom = max(abs(best_total), 1e-12)
+                    improvement = (best_total - total_val) / denom
+                    if improvement > early_tol:
+                        best_total = total_val
+                        patience = 0
+                    else:
+                        patience += 1
+                        if patience >= early_patience:
+                            stop_training = True
 
-        # -----------------------------------------------------------------
-        # OPTIMIZER STEP
-        # -----------------------------------------------------------------
-        if step < finetune_iters and not stop_training:
-            if use_lbfgs:
-                def _lbfgs_closure() -> torch.Tensor:
-                    optimizer.zero_grad(set_to_none=True)
-                    loss_value = _compute_losses()[0]
-                    loss_value.backward()
-                    return loss_value
-                optimizer.step(_lbfgs_closure)
+            # -----------------------------------------------------------------
+            # OPTIMIZER STEP
+            # -----------------------------------------------------------------
+            if step < finetune_iters and not stop_training:
+                if use_lbfgs:
+                    def _lbfgs_closure() -> torch.Tensor:
+                        optimizer.zero_grad(set_to_none=True)
+                        loss_value = _compute_losses()[0]
+                        loss_value.backward()
+                        return loss_value
+                    optimizer.step(_lbfgs_closure)
+                else:
+                    total_loss.backward()
+                    optimizer.step()
+                    if scheduler is not None:
+                        scheduler.step()
             else:
-                total_loss.backward()
-                optimizer.step()
-                if scheduler is not None:
-                    scheduler.step()
-        else:
-            if stop_training and verbose:
-                print(f"[PINN] Early stopping triggered at step {step}.")
-            break
+                if stop_training and verbose:
+                    print(f"[PINN] Early stopping triggered at step {step}.")
+                break
+    except KeyboardInterrupt:
+        if verbose:
+            print(f"\n[PINN] Training interrupted by user at step {step}. Continuing to post-processing...")
 
     # =========================================================================
     # FINAL RESULT EXTRACTION

@@ -706,26 +706,32 @@ def plot_d_evolution_color(
     if not snaps:
         return None
     
+    # Debug: print snapshot info
+    if len(snaps) == 1:
+        print(f"Warning: Only 1 snapshot found in history (iter {iters[0] if iters else 'unknown'})")
+    else:
+        print(f"Plotting {len(snaps)} snapshots from iterations: {iters[:5]}{'...' if len(iters) > 5 else ''}")
+    
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.set_title(f"D(x) evolution: {name}")
     
-    # Color gradient from blue to yellow
+    # Sample colors evenly from viridis colormap
     n_snaps = len(snaps)
-    # Create custom gradient: blue (0,0,1) to yellow (1,1,0)
-    colors = []
-    for i in range(n_snaps):
-        t = i / max(n_snaps - 1, 1)  # 0 to 1
-        # Interpolate: blue (0,0,1) -> cyan (0,1,1) -> yellow (1,1,0)
-        if t < 0.5:
-            # Blue to cyan
-            r, g, b = 0.0, 2*t, 1.0
-        else:
-            # Cyan to yellow
-            r, g, b = 2*(t-0.5), 1.0, 2*(1-t)
-        colors.append((r, g, b))
+    cmap = plt.cm.viridis
+    colors = [cmap(i / max(n_snaps - 1, 1)) for i in range(n_snaps)]
     
     # Plot D(x) for each snapshot
     for i, (d_snap, iter_val) in enumerate(zip(snaps, iters)):
+        # Ensure d_snap is 1D and matches x length
+        d_snap = np.asarray(d_snap).reshape(-1)
+        if len(d_snap) != len(x):
+            # Try to interpolate if lengths don't match
+            if len(d_snap) > 0:
+                x_snap = np.linspace(x[0], x[-1], len(d_snap))
+                d_snap = np.interp(x, x_snap, d_snap)
+            else:
+                continue  # Skip empty snapshots
+        
         # Plot with color gradient
         label = f"iter {iter_val}" if i == 0 or i == n_snaps - 1 else None
         ax.plot(x, d_snap, color=colors[i], alpha=0.7, linewidth=1.5, label=label)
@@ -759,10 +765,10 @@ def plot_bilo_d_variation(
     """Visualize BiLO sensitivity to D variations after pretraining.
     
     After pretraining with D_0, shows how u(x) changes with D variations:
-    - D_0 + 0.1d (constant shift up)
-    - D_0 - 0.1d (constant shift down)
-    - D_0 + 0.1d*x (linear increase)
-    - D_0 - 0.1d*x (linear decrease)
+    - D_0 + 0.5d (constant shift up)
+    - D_0 - 0.5d (constant shift down)
+    - D_0 + 0.5d*x (linear increase)
+    - D_0 - 0.5d*x (linear decrease)
     
     where d = mean(D_0).
     
@@ -778,12 +784,18 @@ def plot_bilo_d_variation(
     if solution.method != "BILO" or solution.local_op is None:
         return None
     
+    # Get device from the networks (they should be on the same device)
+    device = next(solution.d_net.parameters()).device
+    dtype = next(solution.d_net.parameters()).dtype
+    
     x_res = solution.x_res
     x_np = x_res.detach().cpu().numpy().reshape(-1)
     
+    # Move x_res to the same device as the networks
+    x_res_t = x_res.to(device=device, dtype=dtype).view(-1, 1)
+    
     # Get D_0 after pretraining (evaluate d_net at x_res)
     with torch.no_grad():
-        x_res_t = x_res.view(-1, 1)
         D_0 = solution.d_net(x_res_t).view(-1).detach().cpu().numpy()
     
     # Compute mean d
@@ -791,17 +803,17 @@ def plot_bilo_d_variation(
     
     # Create variations
     variations = {
-        "shiftplus": lambda x: D_0 + 0.1 * d_mean * np.ones_like(x),
-        "shiftminus": lambda x: D_0 - 0.1 * d_mean * np.ones_like(x),
-        "linplus": lambda x: D_0 + 0.1 * d_mean * x,
-        "linminus": lambda x: D_0 - 0.1 * d_mean * x,
+        "shiftplus": lambda x: D_0 + 0.5 * d_mean * np.ones_like(x),
+        "shiftminus": lambda x: D_0 - 0.5 * d_mean * np.ones_like(x),
+        "linplus": lambda x: D_0 + 0.5 * d_mean * x,
+        "linminus": lambda x: D_0 - 0.5 * d_mean * x,
     }
     
-    # Prepare z_tensor for local operator
+    # Prepare z_tensor for local operator (use network device)
     z_tensor = torch.tensor(
         [[problem.source_location]],
-        device=x_res.device,
-        dtype=x_res.dtype
+        device=device,
+        dtype=dtype
     )
     
     # Create figure with subplots for each variation
@@ -812,7 +824,7 @@ def plot_bilo_d_variation(
     
     for idx, (varkey, varfun) in enumerate(variations.items()):
         D_var = varfun(x_np)
-        D_var_t = torch.tensor(D_var, device=x_res.device, dtype=x_res.dtype).view(-1, 1)
+        D_var_t = torch.tensor(D_var, device=device, dtype=dtype).view(-1, 1)
         
         # Compute u(x, D_var) using local operator
         with torch.no_grad():
@@ -837,7 +849,8 @@ def plot_bilo_d_variation(
         
         # Plot u_0 for reference
         with torch.no_grad():
-            u_hat_0, _ = solution.local_op(x_res_t, x_res_t.new_tensor(D_0).view(-1, 1), z_tensor)
+            D_0_t = torch.tensor(D_0, device=device, dtype=dtype).view(-1, 1)
+            u_hat_0, _ = solution.local_op(x_res_t, D_0_t, z_tensor)
             u_0 = solution.b0_star * u_hat_0.view(-1).detach().cpu().numpy()
         ax_u.plot(x_np, u_0, "k:", label="u_0", linewidth=1.5, alpha=0.5)
         

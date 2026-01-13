@@ -549,112 +549,116 @@ def fit(data_bundle: DTOData, cfg: Config, verbose: bool = True) -> DTOResult:
     # =========================================================================
     # MAIN TRAINING LOOP
     # =========================================================================
-    for step in range(finetune_iters + 1):
-        if not use_lbfgs:
-            optimizer.zero_grad(set_to_none=True)
+    try:
+        for step in range(finetune_iters + 1):
+            if not use_lbfgs:
+                optimizer.zero_grad(set_to_none=True)
 
-        # Forward pass
-        d_full, u_hat_unit, b0_star, data_loss, reg_smooth, reg_scale, total_loss = (
-            _compute_losses()
-        )
-
-        # -----------------------------------------------------------------
-        # LOGGING
-        # -----------------------------------------------------------------
-        if step % log_every == 0:
-            with torch.no_grad():
-                mean_d = torch.mean(d_full).item()
-                integral_unit = torch.trapezoid(u_hat_unit.view(-1), x_res.view(-1))
-                d_snapshot = d_full.detach().cpu().numpy()
-
-            history.log(
-                step=step,
-                total=total_loss.item(),
-                data=data_loss.item(),
-                reg_smooth=reg_smooth.item(),
-                reg_scale=reg_scale.item(),
-                b0_star=b0_star.item(),
-                mean_d=mean_d,
+            # Forward pass
+            d_full, u_hat_unit, b0_star, data_loss, reg_smooth, reg_scale, total_loss = (
+                _compute_losses()
             )
-            history.log_snapshot(step, d_snapshot)
 
-            if verbose:
-                loss_name = field_loss_type if mode == "field" else "ppp"
-                print(format_dto_progress(
+            # -----------------------------------------------------------------
+            # LOGGING
+            # -----------------------------------------------------------------
+            if step % log_every == 0:
+                with torch.no_grad():
+                    mean_d = torch.mean(d_full).item()
+                    integral_unit = torch.trapezoid(u_hat_unit.view(-1), x_res.view(-1))
+                    d_snapshot = d_full.detach().cpu().numpy()
+
+                history.log(
                     step=step,
                     total=total_loss.item(),
                     data=data_loss.item(),
                     reg_smooth=reg_smooth.item(),
                     reg_scale=reg_scale.item(),
-                    wreg_smooth=wreg_smooth,
-                    wreg_scale=wreg_scale,
                     b0_star=b0_star.item(),
-                    integral_unit=integral_unit.item(),
                     mean_d=mean_d,
-                    loss_name=loss_name,
-                ))
+                )
+                history.log_snapshot(step, d_snapshot)
 
-        # -----------------------------------------------------------------
-        # EARLY STOPPING
-        # -----------------------------------------------------------------
-        stop_training = False
-        if step >= early_burnin:
-            total_val = total_loss.item()
-            if best_total is None:
-                best_total = total_val
-                patience = 0
-            else:
-                denom = max(abs(best_total), 1e-12)
-                improvement = (best_total - total_val) / denom
-                if improvement > early_tol:
+                if verbose:
+                    loss_name = field_loss_type if mode == "field" else "ppp"
+                    print(format_dto_progress(
+                        step=step,
+                        total=total_loss.item(),
+                        data=data_loss.item(),
+                        reg_smooth=reg_smooth.item(),
+                        reg_scale=reg_scale.item(),
+                        wreg_smooth=wreg_smooth,
+                        wreg_scale=wreg_scale,
+                        b0_star=b0_star.item(),
+                        integral_unit=integral_unit.item(),
+                        mean_d=mean_d,
+                        loss_name=loss_name,
+                    ))
+
+            # -----------------------------------------------------------------
+            # EARLY STOPPING
+            # -----------------------------------------------------------------
+            stop_training = False
+            if step >= early_burnin:
+                total_val = total_loss.item()
+                if best_total is None:
                     best_total = total_val
                     patience = 0
                 else:
-                    patience += 1
-                    if patience >= early_patience:
-                        stop_training = True
+                    denom = max(abs(best_total), 1e-12)
+                    improvement = (best_total - total_val) / denom
+                    if improvement > early_tol:
+                        best_total = total_val
+                        patience = 0
+                    else:
+                        patience += 1
+                        if patience >= early_patience:
+                            stop_training = True
 
-        # -----------------------------------------------------------------
-        # OPTIMIZER STEP
-        # -----------------------------------------------------------------
-        if step < finetune_iters and not stop_training:
-            if use_lbfgs:
-                closure_calls = 0
+            # -----------------------------------------------------------------
+            # OPTIMIZER STEP
+            # -----------------------------------------------------------------
+            if step < finetune_iters and not stop_training:
+                if use_lbfgs:
+                    closure_calls = 0
 
-                def _lbfgs_closure() -> torch.Tensor:
-                    nonlocal closure_calls
-                    closure_calls += 1
-                    optimizer.zero_grad(set_to_none=True)
-                    loss_value = _compute_losses()[-1]
-                    loss_value.backward()
-                    return loss_value.detach()
+                    def _lbfgs_closure() -> torch.Tensor:
+                        nonlocal closure_calls
+                        closure_calls += 1
+                        optimizer.zero_grad(set_to_none=True)
+                        loss_value = _compute_losses()[-1]
+                        loss_value.backward()
+                        return loss_value.detach()
 
-                theta_before = model.theta_int.data.clone()
-                optimizer.step(_lbfgs_closure)
+                    theta_before = model.theta_int.data.clone()
+                    optimizer.step(_lbfgs_closure)
 
-                # Project to enforce D >= D_min
-                with torch.no_grad():
-                    model.theta_int.data.clamp_(min=0)
+                    # Project to enforce D >= D_min
+                    with torch.no_grad():
+                        model.theta_int.data.clamp_(min=0)
 
-                if step % log_every == 0 and verbose:
-                    theta_after = model.theta_int.data
-                    param_change = (theta_after - theta_before).abs().max().item()
-                    grad_norm = model.theta_int.grad.norm().item() if model.theta_int.grad is not None else 0.0
-                    print(f"  [LBFGS DEBUG] grad_norm: {grad_norm:.3e} | param_change: {param_change:.3e} | closure_calls: {closure_calls}")
+                    if step % log_every == 0 and verbose:
+                        theta_after = model.theta_int.data
+                        param_change = (theta_after - theta_before).abs().max().item()
+                        grad_norm = model.theta_int.grad.norm().item() if model.theta_int.grad is not None else 0.0
+                        print(f"  [LBFGS DEBUG] grad_norm: {grad_norm:.3e} | param_change: {param_change:.3e} | closure_calls: {closure_calls}")
+                else:
+                    total_loss.backward()
+                    optimizer.step()
+
+                    # Project to enforce D >= D_min
+                    with torch.no_grad():
+                        model.theta_int.data.clamp_(min=0)
+
+                    if scheduler is not None:
+                        scheduler.step()
             else:
-                total_loss.backward()
-                optimizer.step()
-
-                # Project to enforce D >= D_min
-                with torch.no_grad():
-                    model.theta_int.data.clamp_(min=0)
-
-                if scheduler is not None:
-                    scheduler.step()
-        else:
-            if stop_training and verbose:
-                print(f"[DTO] Early stopping triggered at step {step}.")
-            break
+                if stop_training and verbose:
+                    print(f"[DTO] Early stopping triggered at step {step}.")
+                break
+    except KeyboardInterrupt:
+        if verbose:
+            print(f"\n[DTO] Training interrupted by user at step {step}. Continuing to post-processing...")
 
     # =========================================================================
     # FINAL RESULT EXTRACTION
