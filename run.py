@@ -205,6 +205,7 @@ def main():
             entity=cfg.wandb.entity,
             tags=cfg.wandb.tags,
             config=cfg.to_dict(),
+            settings=wandb.Settings(_disable_stats=True),
         )
         print(f"[WandB] Run initialized: {wandb.run.name}")
     
@@ -243,7 +244,9 @@ def main():
         print(f"{k}: {v:.4e}")
         
     if cfg.wandb.enabled and wandb.run is not None:
-        wandb.log(metrics)
+        # Log metrics as summary only (not as charts)
+        for k, v in metrics.items():
+            wandb.run.summary[k] = v
         
         print("[WandB] Generating plots...")
         fig = solution.plot(problem, show=False)
@@ -251,21 +254,32 @@ def main():
         plt.close(fig)
         
         try:
-            from diagnostics import plot_d_evolution
+            from diagnostics import plot_d_evolution_color, plot_bilo_d_variation
 
             
             x_res_np = solution._get_x_array()
-            fig_evo = plot_d_evolution(
+            fig_evo = plot_d_evolution_color(
                 cfg.solver.method.upper(),
                 solution.history,
                 x_res_np,
                 outdir=None,
-                mean_d_true=np.mean(problem.d_true) if problem.d_true is not None else None,
                 show=False
             )
             if fig_evo:
                 wandb.log({"d_evolution": wandb.Image(fig_evo)})
                 plt.close(fig_evo)
+            
+            # For BiLO, also plot D variation sensitivity
+            if cfg.solver.method.lower() == "bilo":
+                fig_var = plot_bilo_d_variation(
+                    solution,
+                    problem,
+                    outdir=None,
+                    show=False
+                )
+                if fig_var:
+                    wandb.log({"bilo_d_variation": wandb.Image(fig_var)})
+                    plt.close(fig_var)
                 
         except Exception as e:
             print(f"[WandB] Warning: Failed to generate auxiliary plots: {e}")
