@@ -12,7 +12,8 @@ Usage:
 
 import sys
 import os
-from typing import Any, List, Dict
+import dataclasses
+from typing import Any, List, Dict, Set
 
 import torch
 import numpy as np
@@ -46,49 +47,31 @@ def parse_value(v: str) -> Any:
     return v
 
 
-def map_shortcut(key: str) -> str:
-    """Map common shortcuts to full config paths."""
-    shortcuts = {
-        # Solver
-        "method": "solver.method",
-        
-        # Physics
-        "alpha": "physics.alpha",
-        "mu": "physics.mu",
-        "bc_type": "physics.bc_type",
-        "b_true": "physics.b_true",
-        "source_loc": "physics.sources", # special handling needed, but usually 1 source
-        
-        # Data
-        "mode": "data.mode",
-        "m_obs": "data.m_obs",
-        "field_loss": "data.field_loss",
-        
-        # D Profile
-        "d_profile": "d_profile.profile_type",
-        "d_params": "d_profile.params",
-
-        # Run
-        "device": "run.device",
-        "seed": "run.seed",
-        "outdir": "run.outdir",
-        
-        # WandB
-        "wandb": "wandb.enabled",
-        "project": "wandb.project",
-        "entity": "wandb.entity",
-        "group": "wandb.group",
-        "name": "wandb.name",
-        "tags": "wandb.tags",
-        
-        # Common training
-        "lr_d": "train.lr_d_fine", # usually what people mean
-        "max_iters": "train.finetune_iters",
-        
-        # Data config shortcuts
-        "b0_fixed_value": "data.b0_fixed_value",
-    }
-    return shortcuts.get(key, key)
+def build_key_map(cfg_obj) -> Dict[str, List[str]]:
+    """
+    Recursively find all leaf keys in the config object.
+    Returns a dict mapping leaf_key -> list of full dot-paths.
+    """
+    mapping = {}
+    
+    def traverse(prefix, obj):
+        if dataclasses.is_dataclass(obj):
+            for field in dataclasses.fields(obj):
+                name = field.name
+                val = getattr(obj, name)
+                full_path = f"{prefix}.{name}" if prefix else name
+                
+                # Check if val is a nested config (dataclass instance)
+                if dataclasses.is_dataclass(val):
+                    traverse(full_path, val)
+                else:
+                    # Leaf field
+                    if name not in mapping:
+                        mapping[name] = []
+                    mapping[name].append(full_path)
+    
+    traverse("", cfg_obj)
+    return mapping
 
 
 def update_config_value(cfg: Config, key: str, value: Any) -> None:
@@ -108,11 +91,6 @@ def update_config_value(cfg: Config, key: str, value: Any) -> None:
 
     # Handle tags -> tuple
     if key == "wandb.tags":
-        # If passed as string "tag1 tag2", split it. 
-        # But our parser splits by space, so we might get individual tags if passed as separate args?
-        # The parser expects key-value pairs. 
-        # So user should pass tags "tag1,tag2" and we parse here, OR we assume simple values.
-        # Let's support comma-separated string
         if isinstance(value, str):
             value = tuple(t.strip() for t in value.split(","))
 
@@ -128,13 +106,6 @@ def update_config_value(cfg: Config, key: str, value: Any) -> None:
         
     leaf = parts[-1]
     if hasattr(obj, leaf):
-        # Type casting if possible (to match existing type)
-        current_val = getattr(obj, leaf)
-        if current_val is not None and not isinstance(value, type(current_val)) and value is not None:
-             # Basic casting for safety if types differ but value is compatible
-             # (parse_value already does int/float/bool inference)
-             pass 
-             
         setattr(obj, leaf, value)
         print(f"Config: {key} = {value}")
     else:
@@ -144,6 +115,15 @@ def update_config_value(cfg: Config, key: str, value: Any) -> None:
 def main():
     # 1. Setup Config
     cfg = Config()
+    
+    # Build map of unique names to full paths
+    key_map = build_key_map(cfg)
+    
+    # Collect all valid full paths to allow explicit dot-notation
+    valid_full_paths = set()
+    for paths in key_map.values():
+        for p in paths:
+            valid_full_paths.add(p)
     
     # 2. Parse arguments manually
     raw_args = sys.argv[1:]
@@ -156,36 +136,36 @@ def main():
     while i < len(raw_args):
         key = raw_args[i]
         
-        # Handle --flag (boolean true) if no value follows or next arg is a key
-        # But user said "arg1 val1 arg2 val2", implying strict pairs.
-        # However, standard CLI flags often don't take values.
-        # Let's stick to key-value pairs for simplicity and robustness as requested.
-        
-        # Strip leading dashes
-        while key.startswith("-"):
-            key = key[1:]
-            
-        if i + 1 >= len(raw_args):
-            # Trailing key without value?
-            # Could be a boolean flag like "wandb" meaning "wandb true"
-            # Let's assume boolean true if it maps to a boolean field, otherwise warn.
-            print(f"Warning: Missing value for argument '{key}', assuming True.")
-            val = True
-            i += 1 
-        else:
+        # Determine value (assume strict pairs: key value)
+        if i + 1 < len(raw_args):
             val_str = raw_args[i+1]
+            i += 2
+        else:
+            # Trailing key implies boolean True flag
+            val_str = "true"
+            i += 1
             
-            # Heuristic: if val_str looks like a key (starts with --), maybe current key is a bool flag?
-            if val_str.startswith("--"):
-                 print(f"Warning: Value '{val_str}' looks like a key. Assuming '{key}' is boolean True.")
-                 val = True
-                 # Don't consume the next arg
-                 i += 1
-            else:
-                val = parse_value(val_str)
-                i += 2
+        val = parse_value(val_str)
         
-        full_key = map_shortcut(key)
+        # Resolve key
+        full_key = None
+        
+        if key in valid_full_paths:
+            # Explicit full path (e.g. "solver.method")
+            full_key = key
+        elif key in key_map:
+            # Shortcut leaf name (e.g. "method")
+            paths = key_map[key]
+            if len(paths) == 1:
+                full_key = paths[0]
+            else:
+                print(f"Error: Ambiguous key '{key}'. Matches parent configs: {paths}")
+                print("Please specify the parent config (e.g. 'parent.key').")
+                sys.exit(1)
+        else:
+            print(f"Error: Unknown configuration key '{key}'")
+            sys.exit(1)
+        
         update_config_value(cfg, full_key, val)
 
     # 3. Validate
