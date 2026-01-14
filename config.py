@@ -75,7 +75,7 @@ class DProfileConfig:
     use_ddi: bool = True     # Use DDI as starting point for scalar fit
     ddi_d_min: float = 1e-4  # Lower clamp for DDI estimate
     ddi_d_max: float = 10.0  # Upper clamp for DDI estimate
-    
+
     # Synthetic problem generation
     profile_type: Literal["sinusoidal", "steps"] = "sinusoidal"
     params: Tuple[float, float, float] = (0.1, 0.04, 4.0) # mean, amplitude, frequency

@@ -260,7 +260,6 @@ def main():
         fig = solution.plot(problem, show=False)
         if fig is not None:
             if cfg.wandb.enabled and wandb.run is not None:
-                # Log to wandb - use commit=False to batch all plots together
                 wandb.log({"solution_plot": wandb.Image(fig)}, commit=False)
                 print(f"  ✓ Logged solution_plot to wandb (run: {wandb.run.name})")
             if outdir:
@@ -289,7 +288,6 @@ def main():
         )
         if fig_evo:
             if cfg.wandb.enabled and wandb.run is not None:
-                # Log to wandb - use commit=False to batch all plots together
                 wandb.log({"d_evolution": wandb.Image(fig_evo)}, commit=False)
                 print(f"  ✓ Logged d_evolution to wandb (run: {wandb.run.name})")
             if outdir:
@@ -317,7 +315,6 @@ def main():
             )
             if fig_var:
                 if cfg.wandb.enabled and wandb.run is not None:
-                    # Log to wandb - use commit=False to batch all plots together
                     wandb.log({"bilo_d_variation": wandb.Image(fig_var)}, commit=False)
                     print(f"  ✓ Logged bilo_d_variation to wandb (run: {wandb.run.name})")
                 if outdir:
@@ -335,6 +332,7 @@ def main():
     if cfg.wandb.enabled and wandb.run is not None:
         wandb.log({}, commit=True)
         print(f"  ✓ All plots committed to wandb")
+        wandb.finish()
 
     print("\nDone.")
 
