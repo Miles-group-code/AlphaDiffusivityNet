@@ -281,33 +281,6 @@ def main():
     except Exception as e:
         print(f"Warning: Failed to generate D evolution plot: {e}")
     
-    # Generate BiLO D variation plot (only for BiLO)
-    if cfg.solver.method.lower() == "bilo":
-        try:
-            from diagnostics import plot_bilo_d_variation
-            # When wandb is enabled, we need the figure returned (not saved), so pass outdir=None
-            # and handle saving separately
-            fig_var = plot_bilo_d_variation(
-                solution,
-                problem,
-                outdir=None,  # Don't save yet, we'll handle it below
-                show=False
-            )
-            if fig_var:
-                if cfg.wandb.enabled and wandb.run is not None:
-                    wandb.log({"bilo_d_variation": wandb.Image(fig_var)}, commit=False)
-                    print(f"  ✓ Logged bilo_d_variation to wandb (run: {wandb.run.name})")
-                if outdir:
-                    os.makedirs(outdir, exist_ok=True)
-                    save_path = os.path.join(outdir, "bilo_d_variation.png")
-                    fig_var.savefig(save_path, dpi=150)
-                    print(f"  ✓ Saved bilo_d_variation to: {save_path}")
-                plt.close(fig_var)
-            else:
-                print("  ⚠ BiLO D variation plot not generated")
-        except Exception as e:
-            print(f"Warning: Failed to generate BiLO D variation plot: {e}")
-    
     # Commit all plots to wandb at once
     if cfg.wandb.enabled and wandb.run is not None:
         wandb.log({}, commit=True)

@@ -767,6 +767,7 @@ def plot_bilo_d_variation(
     solution: "Solution",
     problem: "Problem",
     outdir: str | None = None,
+    filename: str = "bilo_d_variation.png",
     show: bool = True,
 ) -> Optional[plt.Figure]:
     """Visualize BiLO sensitivity to D variations after pretraining.
@@ -885,7 +886,6 @@ def plot_bilo_d_variation(
     
     if outdir:
         os.makedirs(outdir, exist_ok=True)
-        filename = "bilo_d_variation.png"
         fig.savefig(os.path.join(outdir, filename), dpi=150)
         plt.close(fig)
         return None

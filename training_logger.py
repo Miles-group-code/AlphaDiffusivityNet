@@ -305,22 +305,8 @@ def format_pinn_pretrain_progress(
 def format_bilo_progress(
     step: int,
     phase: str,
-    total: float,
-    upper: float,
-    data: float,
-    reg_smooth: float,
-    reg_scale: float,
-    lower: float,
-    res: float,
-    jump: float,
-    bc: float,
-    rgrad: float,
-    jump_rgrad: float,
-    wreg_smooth: float,
-    wreg_scale: float,
-    b0_star: float,
-    integral_unit: float,
-    mean_d: float,
+    metrics: Dict[str, float],
+    weights: Dict[str, float],
     loss_name: str = "mse",
     bc_type: str = "dirichlet",
 ) -> str:
@@ -329,28 +315,34 @@ def format_bilo_progress(
     Args:
         step: Current iteration
         phase: Training phase ("pretrain" or "finetune")
-        total: Total loss (upper + lower)
-        upper: Upper-level loss (data + regularization)
-        data: Data loss
-        reg_smooth: Smoothness regularization (unweighted)
-        reg_scale: Scale anchor regularization (unweighted)
-        lower: Lower-level loss (physics)
-        res: PDE residual loss (unweighted)
-        jump: Jump condition loss (unweighted)
-        bc: Boundary condition loss (unweighted)
-        rgrad: Residual gradient penalty (unweighted)
-        jump_rgrad: Jump gradient penalty (unweighted)
-        wreg_smooth: Smoothness weight
-        wreg_scale: Scale anchor weight
-        b0_star: Projected source amplitude
-        integral_unit: Integral of unit-response
-        mean_d: Mean D value
+        metrics: Dict containing the scalar metrics to display:
+            total, upper, data, reg_smooth, reg_scale, lower, res, jump, bc,
+            rgrad, jump_rgrad, b0_star, integral_unit, mean_d
+        weights: Dict containing weights to display effective reg terms:
+            wreg_smooth, wreg_scale
         loss_name: Loss type label
         bc_type: Boundary condition type
 
     Returns:
         Formatted multi-line string for printing.
     """
+    total = float(metrics["total"])
+    upper = float(metrics["upper"])
+    data = float(metrics["data"])
+    reg_smooth = float(metrics["reg_smooth"])
+    reg_scale = float(metrics["reg_scale"])
+    lower = float(metrics["lower"])
+    res = float(metrics["res"])
+    jump = float(metrics["jump"])
+    bc = float(metrics["bc"])
+    rgrad = float(metrics["rgrad"])
+    jump_rgrad = float(metrics["jump_rgrad"])
+    b0_star = float(metrics["b0_star"])
+    integral_unit = float(metrics["integral_unit"])
+    mean_d = float(metrics["mean_d"])
+
+    wreg_smooth = float(weights.get("wreg_smooth", 0.0))
+    wreg_scale = float(weights.get("wreg_scale", 0.0))
     reg_smooth_eff = wreg_smooth * reg_smooth
     reg_scale_eff = wreg_scale * reg_scale
     u_int = b0_star * integral_unit
@@ -369,39 +361,32 @@ def format_bilo_progress(
 
 def format_bilo_pretrain_progress(
     step: int,
-    total: float,
-    anchor: float,
-    lower: float,
-    sup: float,
-    res: float,
-    jump: float,
-    bc: float,
-    bc_grad: float,
-    rgrad: float,
-    jump_rgrad: float,
-    mean_d: float,
+    metrics: Dict[str, float],
     bc_type: str = "dirichlet",
 ) -> str:
     """Format BiLO pretrain progress.
 
     Args:
         step: Current iteration
-        total: Total pretrain loss (anchor + lower + sup)
-        anchor: Anchor loss to initialization
-        lower: Lower-level physics loss
-        sup: Supervised loss to FDM solution
-        res: PDE residual loss (unweighted)
-        jump: Jump condition loss (unweighted)
-        bc: Boundary condition loss (unweighted)
-        bc_grad: Boundary condition gradient penalty (unweighted)
-        rgrad: Residual gradient penalty (unweighted)
-        jump_rgrad: Jump gradient penalty (unweighted)
-        mean_d: Mean D value
+        metrics: Dict containing the scalar metrics to display:
+            total, anchor, lower, sup, res, jump, bc, bc_grad, rgrad, jump_rgrad, mean_d
         bc_type: Boundary condition type
 
     Returns:
         Formatted multi-line string for printing.
     """
+    total = float(metrics["total"])
+    anchor = float(metrics["anchor"])
+    lower = float(metrics["lower"])
+    sup = float(metrics["sup"])
+    res = float(metrics["res"])
+    jump = float(metrics["jump"])
+    bc = float(metrics["bc"])
+    bc_grad = float(metrics.get("bc_grad", 0.0))
+    rgrad = float(metrics["rgrad"])
+    jump_rgrad = float(metrics["jump_rgrad"])
+    mean_d = float(metrics["mean_d"])
+
     bc_str = f" | Lbc: {bc:.3e}" if bc_type == "neumann" else ""
     bc_grad_str = f" | Lbc_grad: {bc_grad:.3e}" if bc_type == "neumann" else ""
 

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -18,11 +20,11 @@ from config import Config
 from data import PPPData
 import physics, varpro
 from scale_estimation import estimate_ddi_scale, fit_constant_d
-from training_logger import (
-    TrainingHistory,
-    format_bilo_progress,
-    format_bilo_pretrain_progress,
-)
+from training_logger import TrainingHistory, format_bilo_pretrain_progress, format_bilo_progress
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 # =============================================================================
 # D PARAMETERIZATION: Softplus + offset
@@ -228,8 +230,12 @@ def _calc_data_loss(
     d_target: float,
     smoothness_type: str,
     b0_fixed_value: Optional[float] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute data and regularization terms for the upper-level objective."""
+) -> Dict[str, torch.Tensor]:
+    """Compute data and regularization terms for the upper-level objective.
+
+    Returns a dict for readability:
+        b0_star, data_loss, reg_smooth, reg_scale
+    """
     d_int = d_net(x_int)
     u_hat_int, _ = local_op(x_int, d_int, z_tensor)
 
@@ -255,7 +261,12 @@ def _calc_data_loss(
         reg_smooth = physics.h1_smoothness_d(x_reg, d_reg)
 
     reg_scale = physics.scale_anchor(d_reg, d_target)
-    return b0_star, data_loss, reg_smooth, reg_scale
+    return {
+        "b0_star": b0_star,
+        "data_loss": data_loss,
+        "reg_smooth": reg_smooth,
+        "reg_scale": reg_scale,
+    }
 
 
 def _calc_physics_loss(
@@ -266,13 +277,19 @@ def _calc_physics_loss(
     z_idx: int,
     alpha: float,
     mu: float,
-    w_jump: float,
-    w_resgrad: float,
+    loss_weights: Dict[str, float],
     bc_type: str,
     domain: Tuple[float, float],
-    w_bc: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute PDE residual, jump, and BC penalties for the lower-level objective."""
+) -> Dict[str, torch.Tensor]:
+    """Compute PDE residual, jump, and BC penalties for the lower-level objective.
+
+    Returns a dict for readability:
+        lower_loss, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad, bc_grad_loss
+    """
+    w_jump = loss_weights["w_jump"]
+    w_resgrad = loss_weights["w_resgrad"]
+    w_bc = loss_weights["w_bc"]
+
     x_pde = x_res.clone().detach().requires_grad_(True)
     d_pde = d_net(x_pde)
     u_hat_pde, _ = local_op(x_pde, d_pde, z_tensor)
@@ -317,7 +334,15 @@ def _calc_physics_loss(
     lower_loss = res_loss + w_jump * jump_loss + w_resgrad * (rgrad + jump_rgrad)
     if bc_type == "neumann":
         lower_loss = lower_loss + w_bc * (bc_loss) + w_resgrad * bc_grad_loss
-    return lower_loss, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad, bc_grad_loss
+    return {
+        "lower_loss": lower_loss,
+        "res_loss": res_loss,
+        "jump_loss": jump_loss,
+        "bc_loss": bc_loss,
+        "rgrad": rgrad,
+        "jump_rgrad": jump_rgrad,
+        "bc_grad_loss": bc_grad_loss,
+    }
 
 
 def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
@@ -495,10 +520,12 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                 opt_d.step()
 
                 opt_l.zero_grad(set_to_none=True)
-                lower, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad, bc_grad_loss = _calc_physics_loss(
+                phys = _calc_physics_loss(
                     d_net, local_op, x_res, z_tensor, z_idx, alpha, mu,
-                    w_jump, w_resgrad, bc_type, domain, w_bc
+                    {"w_jump": w_jump, "w_resgrad": w_resgrad, "w_bc": w_bc},
+                    bc_type, domain
                 )
+                lower = phys["lower_loss"]
                 d_curr = d_net(x_res).detach()
                 u_pred, _ = local_op(x_res, d_curr, z_tensor)
                 loss_sup = torch.mean((u_pred - u_init_target) ** 2)
@@ -510,17 +537,19 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                         pre_total = (anchor_loss + lower + loss_sup).item()
                     print(format_bilo_pretrain_progress(
                         step=step,
-                        total=pre_total,
-                        anchor=anchor_loss.item(),
-                        lower=lower.item(),
-                        sup=loss_sup.item(),
-                        res=res_loss.item(),
-                        jump=jump_loss.item(),
-                        bc=bc_loss.item(),
-                        bc_grad=bc_grad_loss.item(),
-                        rgrad=rgrad.item(),
-                        jump_rgrad=jump_rgrad.item(),
-                        mean_d=mean_d,
+                        metrics={
+                            "total": pre_total,
+                            "anchor": anchor_loss.item(),
+                            "lower": lower.item(),
+                            "sup": loss_sup.item(),
+                            "res": phys["res_loss"].item(),
+                            "jump": phys["jump_loss"].item(),
+                            "bc": phys["bc_loss"].item(),
+                            "bc_grad": phys["bc_grad_loss"].item(),
+                            "rgrad": phys["rgrad"].item(),
+                            "jump_rgrad": phys["jump_rgrad"].item(),
+                            "mean_d": mean_d,
+                        },
                         bc_type=bc_type,
                     ))
 
@@ -534,10 +563,12 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
             with torch.enable_grad():
                 d_pred = d_net(x_res)
                 anchor_loss = torch.mean((d_pred - d_init_profile) ** 2)
-                lower, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad, bc_grad_loss = _calc_physics_loss(
+                phys = _calc_physics_loss(
                     d_net, local_op, x_res, z_tensor, z_idx, alpha, mu,
-                    w_jump, w_resgrad, bc_type, domain, w_bc
+                    {"w_jump": w_jump, "w_resgrad": w_resgrad, "w_bc": w_bc},
+                    bc_type, domain
                 )
+                lower = phys["lower_loss"]
                 d_curr = d_net(x_res).detach()
                 u_pred, _ = local_op(x_res, d_curr, z_tensor)
                 loss_sup = torch.mean((u_pred - u_init_target) ** 2)
@@ -545,19 +576,64 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                 pre_total = (anchor_loss + lower + loss_sup).item()
             print(format_bilo_pretrain_progress(
                 step=pretrain_iters,
-                total=pre_total,
-                anchor=anchor_loss.item(),
-                lower=lower.item(),
-                sup=loss_sup.item(),
-                res=res_loss.item(),
-                jump=jump_loss.item(),
-                bc=bc_loss.item(),
-                bc_grad=bc_grad_loss.item(),
-                rgrad=rgrad.item(),
-                jump_rgrad=jump_rgrad.item(),
-                mean_d=mean_d,
+                metrics={
+                    "total": pre_total,
+                    "anchor": anchor_loss.item(),
+                    "lower": lower.item(),
+                    "sup": loss_sup.item(),
+                    "res": phys["res_loss"].item(),
+                    "jump": phys["jump_loss"].item(),
+                    "bc": phys["bc_loss"].item(),
+                    "bc_grad": phys["bc_grad_loss"].item(),
+                    "rgrad": phys["rgrad"].item(),
+                    "jump_rgrad": phys["jump_rgrad"].item(),
+                    "mean_d": mean_d,
+                },
                 bc_type=bc_type,
             ))
+
+        # ---------------------------------------------------------------------
+        # VISUALIZATION (after pretraining)
+        # ---------------------------------------------------------------------
+        try:
+            from diagnostics import plot_bilo_d_variation
+            import matplotlib.pyplot as plt
+
+            # Build lightweight stand-ins for diagnostics.plot_bilo_d_variation
+            dummy_solution = SimpleNamespace(
+                method="BILO",
+                d_net=d_net,
+                local_op=local_op,
+                x_res=x_res,
+                # Pretrain supervises the unit response (b0 = 1.0)
+                b0_star=1.0,
+            )
+            dummy_problem = SimpleNamespace(
+                source_location=float(sources[0]),
+                alpha=float(alpha),
+                mu=float(mu),
+                bc_type=str(bc_type),
+            )
+
+            if cfg.wandb.enabled and wandb is not None and wandb.run is not None:
+                fig_var = plot_bilo_d_variation(
+                    dummy_solution, dummy_problem, outdir=None, filename="bilo_d_variation_pretrain.png", show=False
+                )
+                if fig_var is not None:
+                    wandb.log({"bilo_d_variation_pretrain": wandb.Image(fig_var)}, commit=True)
+                    if verbose:
+                        print("  ✓ Logged bilo_d_variation_pretrain to wandb")
+                    plt.close(fig_var)
+            else:
+                outdir = cfg.run.outdir
+                plot_bilo_d_variation(
+                    dummy_solution, dummy_problem, outdir=outdir, filename="bilo_d_variation_pretrain.png", show=False
+                )
+                if verbose:
+                    print(f"  ✓ Saved bilo_d_variation_pretrain to: {os.path.join(outdir, 'bilo_d_variation_pretrain.png')}")
+        except Exception as e:
+            if verbose:
+                print(f"Warning: Failed to generate BiLO pretrain D variation plot: {e}")
 
     # =========================================================================
     # FINETUNE OPTIMIZER SETUP
@@ -598,11 +674,15 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                 optimizer.zero_grad(set_to_none=True)
 
             # Upper level: data loss -> d_net gradients
-            b0_star, data_loss, reg_smooth, reg_scale = _calc_data_loss(
+            data_terms = _calc_data_loss(
                 d_net, local_op, x_res, x_int, x_field, z_tensor,
                 mode, u_true, ppp, field_loss_type, d_target, smoothness_type,
                 b0_fixed_value=b0_fixed_value
             )
+            b0_star = data_terms["b0_star"]
+            data_loss = data_terms["data_loss"]
+            reg_smooth = data_terms["reg_smooth"]
+            reg_scale = data_terms["reg_scale"]
             upper_loss = data_loss + wreg_smooth * reg_smooth + wreg_scale * reg_scale
 
             if not use_lbfgs:
@@ -612,10 +692,18 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                         param.grad = grad
 
             # Lower level: physics loss -> local_op gradients
-            lower_loss, res_loss, jump_loss, bc_loss, rgrad, jump_rgrad, bc_grad_loss = _calc_physics_loss(
+            phys = _calc_physics_loss(
                 d_net, local_op, x_res, z_tensor, z_idx, alpha, mu,
-                w_jump, w_resgrad, bc_type, domain, w_bc
+                {"w_jump": w_jump, "w_resgrad": w_resgrad, "w_bc": w_bc},
+                bc_type, domain
             )
+            lower_loss = phys["lower_loss"]
+            res_loss = phys["res_loss"]
+            jump_loss = phys["jump_loss"]
+            bc_loss = phys["bc_loss"]
+            rgrad = phys["rgrad"]
+            jump_rgrad = phys["jump_rgrad"]
+            bc_grad_loss = phys["bc_grad_loss"]
 
             if not use_lbfgs:
                 grads_lower = torch.autograd.grad(lower_loss, local_op_params, create_graph=False, allow_unused=True)
@@ -663,22 +751,26 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                     print(format_bilo_progress(
                         step=step,
                         phase="finetune",
-                        total=total_loss.item(),
-                        upper=upper_loss.item(),
-                        data=data_loss.item(),
-                        reg_smooth=reg_smooth.item(),
-                        reg_scale=reg_scale.item(),
-                        lower=lower_loss.item(),
-                        res=res_loss.item(),
-                        jump=jump_loss.item(),
-                        bc=bc_loss.item(),
-                        rgrad=rgrad.item(),
-                        jump_rgrad=jump_rgrad.item(),
-                        wreg_smooth=wreg_smooth,
-                        wreg_scale=wreg_scale,
-                        b0_star=b0_star.item(),
-                        integral_unit=integral_unit.item(),
-                        mean_d=mean_d,
+                        metrics={
+                            "total": total_loss.item(),
+                            "upper": upper_loss.item(),
+                            "data": data_loss.item(),
+                            "reg_smooth": reg_smooth.item(),
+                            "reg_scale": reg_scale.item(),
+                            "lower": lower_loss.item(),
+                            "res": res_loss.item(),
+                            "jump": jump_loss.item(),
+                            "bc": bc_loss.item(),
+                            "rgrad": rgrad.item(),
+                            "jump_rgrad": jump_rgrad.item(),
+                            "b0_star": b0_star.item(),
+                            "integral_unit": integral_unit.item(),
+                            "mean_d": mean_d,
+                        },
+                        weights={
+                            "wreg_smooth": wreg_smooth,
+                            "wreg_scale": wreg_scale,
+                        },
                         loss_name=loss_name,
                         bc_type=bc_type,
                     ))
@@ -710,21 +802,26 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                 if use_lbfgs:
                     def _lbfgs_closure() -> torch.Tensor:
                         optimizer.zero_grad(set_to_none=True)
-                        _, data_loss, reg_smooth, reg_scale = _calc_data_loss(
+                        data_terms = _calc_data_loss(
                             d_net, local_op, x_res, x_int, x_field, z_tensor,
                             mode, u_true, ppp, field_loss_type, d_target, smoothness_type,
                             b0_fixed_value=b0_fixed_value
                         )
+                        data_loss = data_terms["data_loss"]
+                        reg_smooth = data_terms["reg_smooth"]
+                        reg_scale = data_terms["reg_scale"]
                         upper_loss = data_loss + wreg_smooth * reg_smooth + wreg_scale * reg_scale
                         grads_upper = torch.autograd.grad(upper_loss, d_params, create_graph=False, allow_unused=True)
                         for param, grad in zip(d_params, grads_upper):
                             if grad is not None:
                                 param.grad = grad
 
-                        lower_loss, _, _, _, _, _, _ = _calc_physics_loss(
+                        phys = _calc_physics_loss(
                             d_net, local_op, x_res, z_tensor, z_idx, alpha, mu,
-                            w_jump, w_resgrad, bc_type, domain, w_bc
+                            {"w_jump": w_jump, "w_resgrad": w_resgrad, "w_bc": w_bc},
+                            bc_type, domain
                         )
+                        lower_loss = phys["lower_loss"]
                         grads_lower = torch.autograd.grad(lower_loss, local_op_params, create_graph=False, allow_unused=True)
                         for param, grad in zip(local_op_params, grads_lower):
                             if grad is not None:
