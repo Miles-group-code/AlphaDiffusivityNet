@@ -457,7 +457,8 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
             d_max=ddi_d_max,
         )
     else:
-        d_ddi = 1.0
+        # Fall back to the ground-truth profile mean when DDI is disabled.
+        d_ddi = float(cfg.d_profile.params[0])
 
     if scalar_fit_iters > 0:
         d_scale = fit_constant_d(
