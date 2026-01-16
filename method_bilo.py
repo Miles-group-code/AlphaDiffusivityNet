@@ -158,6 +158,40 @@ class LocalOperator(nn.Module):
         return u, phi_z
 
 
+def _resolve_weights_path(path: Optional[str], outdir: str) -> Optional[str]:
+    """Resolve relative paths against the run output directory."""
+    if path is None:
+        return None
+    if not str(path).strip():
+        raise ValueError("Weight path must be a non-empty string.")
+    if os.path.isabs(path):
+        return path
+    return os.path.join(outdir, path)
+
+
+def _load_bilo_weights(path: str, d_net: nn.Module, local_op: nn.Module, device: torch.device) -> None:
+    """Load BiLO weights from disk into the provided modules."""
+    payload = torch.load(path, map_location=device)
+    if not isinstance(payload, dict) or "d_net" not in payload or "local_op" not in payload:
+        raise ValueError(f"Invalid BiLO weights file at '{path}'. Expected keys: d_net, local_op.")
+    d_net.load_state_dict(payload["d_net"], strict=True)
+    local_op.load_state_dict(payload["local_op"], strict=True)
+
+
+def _save_bilo_weights(path: str, d_net: nn.Module, local_op: nn.Module) -> None:
+    """Save BiLO weights for D-net and local operator."""
+    outdir = os.path.dirname(path)
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
+    torch.save(
+        {
+            "d_net": d_net.state_dict(),
+            "local_op": local_op.state_dict(),
+        },
+        path,
+    )
+
+
 def _init_d_profile(
     x: torch.Tensor, base: float, scale: float, freq: float
 ) -> torch.Tensor:
@@ -493,6 +527,12 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
     d_net = DNet(width=rff_width, use_rff=use_rff, rff_scale=rff_scale, d_min=d_min).to(device=device, dtype=dtype)
     local_op = LocalOperator(width=rff_width, use_rff=use_rff, rff_scale=rff_scale, bc_type=bc_type).to(device=device, dtype=dtype)
 
+    load_path = _resolve_weights_path(getattr(cfg.train, "bilo_load_path", None), cfg.run.outdir)
+    if load_path is not None:
+        if verbose:
+            print(f"[BiLO] Loading weights from: {load_path}")
+        _load_bilo_weights(load_path, d_net, local_op, device)
+
     # =========================================================================
     # TRAINING HISTORY
     # =========================================================================
@@ -621,7 +661,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                     dummy_solution, dummy_problem, outdir=None, filename="bilo_d_variation_pretrain.png", show=False
                 )
                 if fig_var is not None:
-                    wandb.log({"bilo_d_variation_pretrain": wandb.Image(fig_var)}, commit=True)
+                    wandb.log({"bilo_d_variation_pretrain": wandb.Image(fig_var)}, step=0, commit=True)
                     if verbose:
                         print("  ✓ Logged bilo_d_variation_pretrain to wandb")
                     plt.close(fig_var)
@@ -859,6 +899,12 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
             b0_star = varpro.get_b0_ppp(ppp.n_obs, ppp.m_obs, integral_unit, b0_fixed_value=b0_fixed_value)
         u_pred = b0_star * u_hat_res
         d_pred = d_final
+
+    save_path = _resolve_weights_path(getattr(cfg.train, "bilo_save_path", None), cfg.run.outdir)
+    if save_path is not None:
+        _save_bilo_weights(save_path, d_net, local_op)
+        if verbose:
+            print(f"[BiLO] Saved weights to: {save_path}")
 
     return BiLOResult(
         x_res=x_res.detach().cpu().view(-1),
