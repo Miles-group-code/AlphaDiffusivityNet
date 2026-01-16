@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import math
 import os
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -430,6 +430,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
     use_scheduler = cfg.train.use_scheduler
     log_every = cfg.train.log_every
     scalar_fit_iters = cfg.train.scalar_fit_iters
+    lower_tol = getattr(cfg.train, "lower_tol", None)
 
     # Early stopping
     early_burnin = cfg.train.early_burnin
@@ -692,15 +693,14 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
         )
         scheduler = None
     else:
-        optimizer = torch.optim.Adam([
-            {"params": d_params, "lr": lr_d_fine},
-            {"params": local_op_params, "lr": lr_lower_fine},
-        ])
+        d_optimizer = torch.optim.Adam(d_params, lr=lr_d_fine)
+        local_op_optimizer = torch.optim.Adam(local_op_params, lr=lr_lower_fine)
         scheduler = None
+        d_scheduler = None
+        local_op_scheduler = None
         if use_scheduler and finetune_iters > 0:
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=finetune_iters, eta_min=min(lr_d_fine, lr_lower_fine) * 0.1
-            )
+            d_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(d_optimizer, T_max=finetune_iters, eta_min=lr_d_fine * 0.1)
+            local_op_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(local_op_optimizer, T_max=finetune_iters, eta_min=lr_lower_fine * 0.1)
 
     # Early stopping state
     best_total: Optional[float] = None
@@ -712,7 +712,8 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
     try:
         for step in range(finetune_iters + 1):
             if not use_lbfgs:
-                optimizer.zero_grad(set_to_none=True)
+                d_optimizer.zero_grad(set_to_none=True)
+                local_op_optimizer.zero_grad(set_to_none=True)
 
             # Upper level: data loss -> d_net gradients
             data_terms = _calc_data_loss(
@@ -725,12 +726,6 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
             reg_smooth = data_terms["reg_smooth"]
             reg_scale = data_terms["reg_scale"]
             upper_loss = data_loss + wreg_smooth * reg_smooth + wreg_scale * reg_scale
-
-            if not use_lbfgs:
-                grads_upper = torch.autograd.grad(upper_loss, d_params, create_graph=False, allow_unused=True)
-                for param, grad in zip(d_params, grads_upper):
-                    if grad is not None:
-                        param.grad = grad
 
             # Lower level: physics loss -> local_op gradients
             phys = _calc_physics_loss(
@@ -746,11 +741,17 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
             jump_rgrad = phys["jump_rgrad"]
             bc_grad_loss = phys["bc_grad_loss"]
 
+            update_both = lower_tol is None or lower_loss.item() <= lower_tol
             if not use_lbfgs:
                 grads_lower = torch.autograd.grad(lower_loss, local_op_params, create_graph=False, allow_unused=True)
                 for param, grad in zip(local_op_params, grads_lower):
                     if grad is not None:
                         param.grad = grad
+                if update_both:
+                    grads_upper = torch.autograd.grad(upper_loss, d_params, create_graph=False, allow_unused=True)
+                    for param, grad in zip(d_params, grads_upper):
+                        if grad is not None:
+                            param.grad = grad
 
             # -----------------------------------------------------------------
             # LOGGING
@@ -863,16 +864,25 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                             bc_type, domain
                         )
                         lower_loss = phys["lower_loss"]
+                        update_both = lower_tol is None or lower_loss.item() <= lower_tol
                         grads_lower = torch.autograd.grad(lower_loss, local_op_params, create_graph=False, allow_unused=True)
                         for param, grad in zip(local_op_params, grads_lower):
                             if grad is not None:
                                 param.grad = grad
+                        if update_both:
+                            grads_upper = torch.autograd.grad(upper_loss, d_params, create_graph=False, allow_unused=True)
+                            for param, grad in zip(d_params, grads_upper):
+                                if grad is not None:
+                                    param.grad = grad
                         return upper_loss + lower_loss
                     optimizer.step(_lbfgs_closure)
                 else:
-                    optimizer.step()
-                    if scheduler is not None:
-                        scheduler.step()
+                    if update_both:
+                        d_optimizer.step()
+                    local_op_optimizer.step()
+                    if d_scheduler is not None:
+                        d_scheduler.step()
+                        local_op_scheduler.step()
             else:
                 if stop_training and verbose:
                     print(f"[BiLO] Early stopping triggered at step {step}.")

@@ -144,6 +144,7 @@ class TrainConfig:
 
     bilo_load_path: str | None = None
     bilo_save_path: str | None = None
+    lower_tol: float | None = None
     scalar_fit_iters: int = 500
     pretrain_iters: int = 1000
     finetune_iters: int = 10000
@@ -166,6 +167,8 @@ class TrainConfig:
             raise ValueError("bilo_load_path must be a non-empty string if provided.")
         if self.bilo_save_path is not None and not str(self.bilo_save_path).strip():
             raise ValueError("bilo_save_path must be a non-empty string if provided.")
+        if self.lower_tol is not None and self.lower_tol < 0.0:
+            raise ValueError("lower_tol must be non-negative if provided.")
         if self.scalar_fit_iters < 0:
             raise ValueError("scalar_fit_iters must be >= 0.")
         if self.optimizer not in {"adam", "lbfgs"}:
