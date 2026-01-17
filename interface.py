@@ -265,7 +265,7 @@ class Problem:
         n_obs: int = 201,
         domain: tuple[float, float] = (0.0, 1.0),
         bc_type: str = "dirichlet",
-        use_pde_sampling: bool = False,
+        use_pde_sampling: bool = True,
         sde_tmax: float = 100.0,
         sde_dt: float = 1e-3,
         seed: int = 42,
