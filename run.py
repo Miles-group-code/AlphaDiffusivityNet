@@ -13,6 +13,8 @@ Usage:
 import sys
 import os
 import dataclasses
+import socket
+from datetime import datetime
 from typing import Any, List, Dict, Set
 
 import torch
@@ -113,6 +115,16 @@ def update_config_value(cfg: Config, key: str, value: Any) -> None:
 
 
 def main():
+    # 0. Log execution info
+    pid = os.getpid()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    hostname = socket.gethostname()
+    full_command = " ".join([sys.executable] + sys.argv)
+    
+    log_entry = f"{pid},{timestamp},{hostname},{full_command}\n"
+    with open("command.txt", "a", encoding="utf-8") as f:
+        f.write(log_entry)
+    
     # 1. Setup Config
     cfg = Config()
     
