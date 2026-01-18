@@ -88,9 +88,9 @@ class DNet(nn.Module):
                 param.requires_grad = False
         self.net = nn.Sequential(
             nn.Linear(width, width),
-            nn.SiLU(),
+            nn.Tanh(),
             nn.Linear(width, width),
-            nn.SiLU(),
+            nn.Tanh(),
             nn.Linear(width, 1),
         )
 
@@ -100,8 +100,10 @@ class DNet(nn.Module):
             feat = torch.sin(2.0 * torch.pi * self.rff_scale * self.embed(x))
         else:
             feat = self.embed(x)
+        # print mean and std of feat
         raw = self.net(feat)
-        return F.softplus(raw) + self.d_min
+        return torch.exp(raw)
+        # return F.softplus(raw) + self.d_min
         
 
 
@@ -551,8 +553,8 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
         )
         u_init_target = torch.tensor(u_init_np, device=device, dtype=dtype).view(-1, 1)
 
-        opt_d = torch.optim.Adam(d_net.parameters(), lr=lr_d_pre)
-        opt_l = torch.optim.Adam(local_op.parameters(), lr=lr_lower_pre)
+        opt_d = torch.optim.AdamW(d_net.parameters(), lr=lr_d_pre)
+        opt_l = torch.optim.AdamW(local_op.parameters(), lr=lr_lower_pre)
 
         try:
             for step in range(pretrain_iters):
@@ -694,8 +696,8 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
         )
         scheduler = None
     else:
-        d_optimizer = torch.optim.Adam(d_params, lr=lr_d_fine)
-        local_op_optimizer = torch.optim.Adam(local_op_params, lr=lr_lower_fine)
+        d_optimizer = torch.optim.AdamW(d_params, lr=lr_d_fine)
+        local_op_optimizer = torch.optim.AdamW(local_op_params, lr=lr_lower_fine)
         scheduler = None
         d_scheduler = None
         local_op_scheduler = None
