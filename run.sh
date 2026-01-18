@@ -1,0 +1,39 @@
+python run.py \
+    method bilo \
+    alpha 1.0 \
+    mode field \
+    bc_type neumann \
+    profile_type sinusoidal \
+    params "0.1, 0.04, 3.0" \
+    mu 5.0 \
+    b_true 100.0 \
+    use_ddi false \
+    sources 0.5 \
+    m_obs 1000 \
+    wandb.group field \
+    wandb.name bilo \
+    seed 42 \
+    device cuda:1 \
+    lower_tol 0.001 \
+    train.pretrain_iters 500 \
+    train.finetune_iters 2000 \
+    train.lr_d_pre 1e-3\
+    train.lr_lower_pre 1e-3 \
+    train.lr_d_fine 1e-4 \
+    train.lr_lower_fine 1e-4 \
+    train.use_scheduler false \
+    train.early_burnin 10000 \
+    train.early_patience 500 \
+    train.early_tol 1e-4 \
+    train.log_every 10 \
+    train.scalar_fit_iters 0\
+    reg.wreg_smooth 1e-6 \
+    reg.wreg_scale 1.0 \
+    reg.w_jump 1.0 \
+    reg.w_resgrad 0.001 \
+    reg.w_bc 1.0 \
+    reg.smoothness_type h1 \
+    d_profile.pert_scale 0.0 \
+    d_profile.pert_freq 2.0 \
+    grid.n_res 201 \
+    wandb.enabled true \
