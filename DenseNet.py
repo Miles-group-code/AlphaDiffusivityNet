@@ -16,12 +16,13 @@ class RandomFourierFeatureLayer(nn.Module):
         nn.init.normal_(self.linear.weight, std=sigma)
         # Initialize bias with uniform distribution [0, 2*pi]
         nn.init.uniform_(self.linear.bias, 0, 2 * torch.pi)
+        self.m = torch.tensor(output_dim)
         # Freeze parameters
         for param in self.linear.parameters():
             param.requires_grad = False
             
     def forward(self, x):
-        return torch.sin(self.linear(x))
+        return torch.sqrt(2.0/self.m)*torch.sin(self.linear(x))
 
 class SineLayer(nn.Module):
     def __init__(self, in_features, out_features, bias=True,
@@ -89,6 +90,7 @@ class MLP(nn.Module):
             'relu': torch.relu,
             'sigmoid': torch.sigmoid,
             'softplus': torch.nn.functional.softplus,
+            'silu': torch.nn.functional.silu,
         }
             
         self.activation = string_to_activation[activation]
@@ -223,6 +225,7 @@ class ModifiedMLP(nn.Module):
             'relu': torch.relu,
             'sigmoid': torch.sigmoid,
             'softplus': torch.nn.functional.softplus,
+            'silu': torch.nn.functional.silu,
         }
             
         self.activation = string_to_activation[activation]

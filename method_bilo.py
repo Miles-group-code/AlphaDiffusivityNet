@@ -79,26 +79,15 @@ class LocalOperator(nn.Module):
 
     def __init__(
         self,
-        width: int = 128,
-        use_rff: bool = True,
-        rff_scale: float = 1.0,
+        u_net: nn.Module,
         bc_type: str = "dirichlet",
     ) -> None:
         super().__init__()
-        self.use_rff = use_rff
-        self.rff_scale = rff_scale
+        
         self.bc_type = bc_type.strip().lower()
         if self.bc_type not in {"dirichlet", "neumann"}:
             raise ValueError(f"Unsupported bc_type '{bc_type}'.")
-        self.geom_layer = nn.Linear(2, width)
-        if use_rff:
-            self.geom_layer.weight.requires_grad = False
-            if self.geom_layer.bias is not None:
-                self.geom_layer.bias.requires_grad = False
-        self.d_embed = nn.Linear(1, width, bias=False)
-        self.hidden = nn.ModuleList([nn.Linear(width, width) for _ in range(3)])
-        self.output = nn.Linear(width, 1)
-        self.activation = F.silu
+        self.u_net = u_net
 
     def forward(
         self, x: torch.Tensor, d: torch.Tensor, z_known: torch.Tensor
@@ -107,24 +96,15 @@ class LocalOperator(nn.Module):
         d = d.view(-1, 1)
 
         phi_z = torch.abs(x - z_known)
-        if phi_z.is_leaf and not phi_z.requires_grad:
-            phi_z.requires_grad_(True)
-        geom_in = torch.cat([x, phi_z], dim=1)
-        geom_lin = self.geom_layer(geom_in)
-        embed = self.d_embed(torch.log(d))
-        if self.use_rff:
-            h = self.activation(torch.sin(2.0 * torch.pi * self.rff_scale * geom_lin) + embed)
-        else:
-            h = self.activation(geom_lin + embed)
-        for layer in self.hidden:
-            h = self.activation(layer(h))
-        u_raw = self.output(h)
-        # u_pos = F.softplus(u_raw)
-        u_pos = u_raw
+        phi_z.requires_grad_(True)
+        
+        d_transform = torch.log(d)
+        input = torch.cat([x, phi_z, d_transform], dim=1)
+        u = self.u_net(input)
         if self.bc_type == "dirichlet":
-            u = u_pos * x * (1.0 - x)
+            u = u * x * (1.0 - x)
         else:
-            u = u_pos
+            u = u
         return u, phi_z
 
 
@@ -410,12 +390,16 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
     # Architecture
     d_min = getattr(cfg.arch, "d_min", D_MIN)
     rff_scale = getattr(cfg.arch, "rff_scale", 1.0)
-    rff_width = cfg.arch.rff_width
     use_rff = cfg.arch.use_rff
     
-    d_net_arch = getattr(cfg.arch, "d_net_arch", "mlp")
-    d_net_depth = getattr(cfg.arch, "d_net_depth", 3)
-    siren_omega0 = getattr(cfg.arch, "siren_omega0", 30.0)
+    d_net_arch = cfg.arch.d_net_arch
+    d_net_depth = cfg.arch.d_net_depth
+    d_net_width = cfg.arch.d_net_width
+    siren_omega0 = cfg.arch.siren_omega0
+
+    u_net_arch = cfg.arch.u_net_arch
+    u_net_depth = cfg.arch.u_net_depth
+    u_net_width = cfg.arch.u_net_width
 
     # Grid
     n_int = cfg.grid.n_int
@@ -502,16 +486,30 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
     d_net = DenseNet(
         input_dim=1,
         output_dim=1,
-        width=rff_width,
+        act='silu',
+        width=d_net_width,
         depth=d_net_depth,
         arch=d_net_arch,
         fourier=use_rff,
         sigma=rff_scale,
         omega_0=siren_omega0,
-        lambda_transform=lambda x, u: torch.exp(u)
+        # lambda_transform=lambda x, u: torch.exp(u),
+        lambda_transform=lambda x, u: F.softplus(u) + D_MIN,
     ).to(device=device, dtype=dtype)
     
-    local_op = LocalOperator(width=rff_width, use_rff=use_rff, rff_scale=rff_scale, bc_type=bc_type).to(device=device, dtype=dtype)
+
+
+    u_net = DenseNet(
+        input_dim=3,
+        output_dim=1,
+        act='silu',
+        width=u_net_width,
+        depth=u_net_depth,
+        arch=u_net_arch,
+        fourier=use_rff,
+        sigma=rff_scale)
+
+    local_op = LocalOperator(u_net, bc_type=bc_type).to(device=device, dtype=dtype)
 
     load_path = _resolve_weights_path(getattr(cfg.train, "bilo_load_path", None), cfg.run.outdir)
     if load_path is not None:
@@ -535,8 +533,8 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
         )
         u_init_target = torch.tensor(u_init_np, device=device, dtype=dtype).view(-1, 1)
 
-        opt_d = torch.optim.AdamW(d_net.parameters(), lr=lr_d_pre)
-        opt_l = torch.optim.AdamW(local_op.parameters(), lr=lr_lower_pre)
+        opt_d = torch.optim.Adam(d_net.parameters(), lr=lr_d_pre)
+        opt_l = torch.optim.Adam(local_op.parameters(), lr=lr_lower_pre)
 
         try:
             for step in range(pretrain_iters):
@@ -678,8 +676,8 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
         )
         scheduler = None
     else:
-        d_optimizer = torch.optim.AdamW(d_params, lr=lr_d_fine)
-        local_op_optimizer = torch.optim.AdamW(local_op_params, lr=lr_lower_fine)
+        d_optimizer = torch.optim.Adam(d_params, lr=lr_d_fine)
+        local_op_optimizer = torch.optim.Adam(local_op_params, lr=lr_lower_fine)
         scheduler = None
         d_scheduler = None
         local_op_scheduler = None
