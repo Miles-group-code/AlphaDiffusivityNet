@@ -214,6 +214,11 @@ class ArchConfig:
     rff_width: int = 128
     rff_scale: float = 1.0  # Frequency multiplier for RFF (higher = sharper features)
     rff_seed: int = 0
+    
+    # Architecture selection
+    d_net_arch: Literal["mlp", "pirate", "mmlp", "siren"] = "mlp"
+    d_net_depth: int = 4
+    siren_omega0: float = 30.0
 
     def validate(self) -> None:
         """Validate architecture settings."""

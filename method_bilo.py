@@ -21,6 +21,8 @@ from data import PPPData
 import physics, varpro
 from scale_estimation import estimate_ddi_scale, fit_constant_d
 from training_logger import TrainingHistory, format_bilo_pretrain_progress, format_bilo_progress
+from DenseNet import DenseNet
+
 try:
     import wandb
 except ImportError:
@@ -70,41 +72,6 @@ class BiLOResult:
     history: Dict[str, List[float]]
     d_net: Optional[nn.Module] = None
     local_op: Optional[nn.Module] = None
-
-
-class DNet(nn.Module):
-    """RFF-embedded MLP that parameterizes D(x) with softplus + offset."""
-
-    def __init__(
-        self, width: int = 128, use_rff: bool = True, rff_scale: float = 1.0, d_min: float = D_MIN
-    ) -> None:
-        super().__init__()
-        self.use_rff = use_rff
-        self.rff_scale = rff_scale
-        self.d_min = d_min
-        self.embed = nn.Linear(1, width)
-        if use_rff:
-            for param in self.embed.parameters():
-                param.requires_grad = False
-        self.net = nn.Sequential(
-            nn.Linear(width, width),
-            nn.Tanh(),
-            nn.Linear(width, width),
-            nn.Tanh(),
-            nn.Linear(width, 1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.view(-1, 1)
-        if self.use_rff:
-            feat = torch.sin(2.0 * torch.pi * self.rff_scale * self.embed(x))
-        else:
-            feat = self.embed(x)
-        # print mean and std of feat
-        raw = self.net(feat)
-        return torch.exp(raw)
-        # return F.softplus(raw) + self.d_min
-        
 
 
 class LocalOperator(nn.Module):
@@ -445,6 +412,10 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
     rff_scale = getattr(cfg.arch, "rff_scale", 1.0)
     rff_width = cfg.arch.rff_width
     use_rff = cfg.arch.use_rff
+    
+    d_net_arch = getattr(cfg.arch, "d_net_arch", "mlp")
+    d_net_depth = getattr(cfg.arch, "d_net_depth", 3)
+    siren_omega0 = getattr(cfg.arch, "siren_omega0", 30.0)
 
     # Grid
     n_int = cfg.grid.n_int
@@ -528,7 +499,18 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
     # =========================================================================
     d_init_profile = _init_d_profile(x_res.view(-1), base=d_scale, scale=pert_scale, freq=pert_freq).view(-1, 1)
 
-    d_net = DNet(width=rff_width, use_rff=use_rff, rff_scale=rff_scale, d_min=d_min).to(device=device, dtype=dtype)
+    d_net = DenseNet(
+        input_dim=1,
+        output_dim=1,
+        width=rff_width,
+        depth=d_net_depth,
+        arch=d_net_arch,
+        fourier=use_rff,
+        sigma=rff_scale,
+        omega_0=siren_omega0,
+        lambda_transform=lambda x, u: torch.exp(u)
+    ).to(device=device, dtype=dtype)
+    
     local_op = LocalOperator(width=rff_width, use_rff=use_rff, rff_scale=rff_scale, bc_type=bc_type).to(device=device, dtype=dtype)
 
     load_path = _resolve_weights_path(getattr(cfg.train, "bilo_load_path", None), cfg.run.outdir)
