@@ -70,6 +70,91 @@ class SirenNet(nn.Module):
         u = self.output_transform(x, u)
         return u
 
+class FourierNet(nn.Module):
+    """
+    Fourier series representation: 
+    D(x) = a0 + sum_{k=1}^{width/2} [a_k cos(2pi k x) + b_k sin(2pi k x)]
+    """
+    def __init__(self, input_size: int, width: int, output_dim: int, output_transform=lambda x,u: u):
+        super().__init__()
+        self.width = width
+        self.num_freqs = width // 2
+        self.output_dim = output_dim
+        
+        # We model this as a Linear layer on top of fixed features.
+        # Features: [cos(2pi*1*x), sin(2pi*1*x), ..., cos(2pi*N*x), sin(2pi*N*x)]
+        # Bias term corresponds to a0.
+        # Weights correspond to a_k and b_k.
+        
+        self.linear = nn.Linear(2 * self.num_freqs, output_dim, bias=True)
+        # Initialize coefficients (weights) to 0
+        nn.init.constant_(self.linear.weight, 0.0)
+        # Initialize shift term (bias) to 1.0
+        nn.init.constant_(self.linear.bias, 1.0)
+        
+        # We ignore output_transform as per instructions for this architecture
+        self.output_transform = lambda x, u: u 
+
+    def forward(self, x):
+        # x shape: (batch, input_size). We assume input_size=1 usually.
+        # If input_size > 1, we might need to handle it, but problem is 1D spatial.
+        
+        x_in = x[:, 0:1] # Ensure we take the spatial coordinate if multiple
+        
+        # Construct features
+        # frequencies k = 1 ... num_freqs
+        k = torch.arange(1, self.num_freqs + 1, device=x.device, dtype=x.dtype)
+        # 2 * pi * k * x
+        args = 2.0 * math.pi * x_in @ k.view(1, -1) # (batch, num_freqs)
+        
+        features = torch.cat([torch.cos(args), torch.sin(args)], dim=1) # (batch, 2*num_freqs)
+        
+        u = self.linear(features)
+        return u
+
+class GridNet(nn.Module):
+    """
+    Grid-based representation:
+    Learnable parameters d_i at uniformly spaced grid in [0, 1].
+    D(x) is linear interpolation of grid values.
+    """
+    def __init__(self, width: int, output_dim: int, output_transform=lambda x,u: u):
+        super().__init__()
+        self.width = width # Number of grid points
+        self.output_dim = output_dim
+        
+        # Learnable grid values
+        self.grid_values = nn.Parameter(torch.ones(width, output_dim))
+        
+        # We ignore output_transform for this architecture
+        self.output_transform = lambda x, u: u
+
+    def forward(self, x):
+        # x shape: (batch, input_size), assume 1D spatial coordinate in [0, 1]
+        x_in = x[:, 0:1]
+        
+        # Map x from [0, 1] to [0, width-1]
+        x_mapped = x_in * (self.width - 1)
+        
+        # Indices
+        idx_floor = torch.floor(x_mapped).long().clamp(0, self.width - 2)
+        idx_ceil = idx_floor + 1
+        
+        # Weights
+        w_ceil = x_mapped - idx_floor.float()
+        w_floor = 1.0 - w_ceil
+        
+        # Gather values
+        # self.grid_values shape: (width, output_dim)
+        # We need (batch, output_dim)
+        
+        val_floor = self.grid_values[idx_floor.squeeze(-1)] # (batch, output_dim)
+        val_ceil = self.grid_values[idx_ceil.squeeze(-1)]   # (batch, output_dim)
+        
+        u = w_floor * val_floor + w_ceil * val_ceil
+        
+        return u
+
 # simple mlp
 class MLP(nn.Module):
     def __init__(self, 
@@ -320,6 +405,12 @@ class DenseNet(nn.Module):
         elif arch == 'siren':
             self.net = SirenNet(input_dim, width, depth, output_dim,
                                 omega_0=omega_0, output_transform=lambda_transform)
+        elif arch == 'fourier':
+            self.net = FourierNet(input_dim, width, output_dim,
+                                  output_transform=lambda_transform)
+        elif arch == 'grid':
+            self.net = GridNet(width, output_dim,
+                               output_transform=lambda_transform)
         else:
             raise ValueError(f"Architecture {arch} not supported")
 

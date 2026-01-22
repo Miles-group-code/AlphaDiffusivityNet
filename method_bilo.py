@@ -389,12 +389,12 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
 
     # Architecture
     d_min = getattr(cfg.arch, "d_min", D_MIN)
-    rff_scale = getattr(cfg.arch, "rff_scale", 1.0)
     use_rff = cfg.arch.use_rff
     
     d_net_arch = cfg.arch.d_net_arch
     d_net_depth = cfg.arch.d_net_depth
     d_net_width = cfg.arch.d_net_width
+    d_net_rff_scale = cfg.arch.d_net_rff_scale
     siren_omega0 = cfg.arch.siren_omega0
 
     u_net_arch = cfg.arch.u_net_arch
@@ -491,7 +491,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
         depth=d_net_depth,
         arch=d_net_arch,
         fourier=use_rff,
-        sigma=rff_scale,
+        sigma=d_net_rff_scale,
         omega_0=siren_omega0,
         # lambda_transform=lambda x, u: torch.exp(u),
         lambda_transform=lambda x, u: F.softplus(u) + D_MIN,
@@ -507,7 +507,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
         depth=u_net_depth,
         arch=u_net_arch,
         fourier=use_rff,
-        sigma=rff_scale)
+        sigma=1.0)
 
     local_op = LocalOperator(u_net, bc_type=bc_type).to(device=device, dtype=dtype)
 
@@ -554,7 +554,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                 d_curr = d_net(x_res).detach()
                 u_pred, _ = local_op(x_res, d_curr, z_tensor)
                 loss_sup = torch.mean((u_pred - u_init_target) ** 2)
-                (lower + loss_sup).backward()
+                (lower + 10*loss_sup).backward()
 
                 if verbose and step % log_every == 0:
                     with torch.no_grad():

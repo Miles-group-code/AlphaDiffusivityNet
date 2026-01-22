@@ -211,16 +211,16 @@ class ArchConfig:
 
     use_rff: bool = True  # Enable Random Fourier Features for all networks
     d_min: float = 1e-6
-    rff_scale: float = 1.0  # Frequency multiplier for RFF (higher = sharper features)
     rff_seed: int = 0
     
     # Architecture selection
-    d_net_arch: Literal["mlp", "pirate", "mmlp", "siren"] = "mlp"
+    d_net_arch: Literal["mlp", "pirate", "mmlp", "siren", "fourier", "grid"] = "mlp"
     d_net_depth: int = 2
     d_net_width: int = 128
+    d_net_rff_scale: float = 1.0  # Frequency multiplier for RFF (higher = sharper features)
     siren_omega0: float = 30.0
 
-    u_net_arch: Literal["mlp", "pirate", "mmlp", "siren"] = "mlp"
+    u_net_arch: Literal["mlp", "pirate", "mmlp", "siren", "fourier", "grid"] = "mlp"
     u_net_depth: int = 3
     u_net_width: int = 128
 
