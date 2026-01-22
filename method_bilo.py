@@ -148,7 +148,7 @@ def _init_d_profile(
     """Build a sinusoidal D initialization on the grid."""
     if scale >= 1.0:
         raise ValueError("pert_scale must be < 1 to keep D_init positive.")
-    return base * (1.0 + scale * torch.sin(2.0 * torch.pi * freq * x))
+    return base + scale * torch.sin(2.0 * torch.pi * freq * x)
 
 
 def _trainable_params(module: nn.Module) -> List[nn.Parameter]:
