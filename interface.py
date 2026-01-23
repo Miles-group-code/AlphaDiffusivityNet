@@ -886,12 +886,24 @@ def solve(
         d_net = None
         local_op = None
     elif method_lower == "bilo":
+        d_true_res = None
+        if problem.d_true is not None:
+             x_obs_np = problem.x_grid.detach().cpu().numpy().reshape(-1)
+             x_res_np = x_res.detach().cpu().numpy().reshape(-1)
+             d_true_obs = problem.d_true.reshape(-1)
+             if x_obs_np.shape == x_res_np.shape and np.allclose(x_obs_np, x_res_np):
+                 d_true_res_np = d_true_obs
+             else:
+                 d_true_res_np = np.interp(x_res_np, x_obs_np, d_true_obs)
+             d_true_res = torch.from_numpy(d_true_res_np).to(device=x_res.device, dtype=x_res.dtype)
+
         data_bundle = method_bilo.BiLOData(
             mode=problem.mode,
             x_res=x_res,
             x_field=problem.x_grid,
             u_true=problem.u_field,
             ppp=problem.particles,
+            d_true=d_true_res,
         )
         result = method_bilo.fit(data_bundle, config, verbose=verbose)
         d_net = getattr(result, "d_net", None)

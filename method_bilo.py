@@ -12,6 +12,7 @@ import os
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -55,6 +56,7 @@ class BiLOData:
     x_field: Optional[torch.Tensor] = None
     u_true: Optional[torch.Tensor] = None
     ppp: Optional[PPPData] = None
+    d_true: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -98,7 +100,8 @@ class LocalOperator(nn.Module):
         phi_z = torch.abs(x - z_known)
         phi_z.requires_grad_(True)
         
-        d_transform = torch.log(d)
+        # d_transform = torch.log(d)
+        d_transform = d
         input = torch.cat([x, phi_z, d_transform], dim=1)
         u = self.u_net(input)
         if self.bc_type == "dirichlet":
@@ -357,6 +360,9 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
     mode = data_bundle.mode
     field_loss_type = cfg.data.field_loss
     b0_fixed_value = cfg.data.b0_fixed_value
+    d_true = data_bundle.d_true
+    if d_true is not None:
+        d_true = d_true.to(device=device, dtype=dtype).view(-1, 1)
 
     # D profile initialization
     use_ddi = cfg.d_profile.use_ddi
@@ -507,7 +513,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
         depth=u_net_depth,
         arch=u_net_arch,
         fourier=use_rff,
-        sigma=1.0)
+        sigma=4.0)
 
     local_op = LocalOperator(u_net, bc_type=bc_type).to(device=device, dtype=dtype)
 
@@ -753,6 +759,47 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                         integral_unit = torch.trapezoid(u_hat_res.view(-1), x_res.view(-1))
                     d_snapshot = d_res.detach().cpu().numpy().reshape(-1)
 
+                    # Validation Metrics
+                    metrics_extra = {}
+                    
+                    # 1. D Error (if ground truth available)
+                    if d_true is not None:
+                        d_err = torch.abs(d_res - d_true)
+                        d_err_l2 = torch.sqrt(torch.mean(d_err ** 2)).item()
+                        d_err_linf = torch.max(d_err).item()
+                        metrics_extra["d_err_l2"] = d_err_l2
+                        metrics_extra["d_err_linf"] = d_err_linf
+                    
+                    # 2. Solver Consistency (BiLO vs FDM with predicted D)
+                    # We compute FDM solution using the current d_pred and b0_star
+                    # BiLO prediction: u_pred = b0_star * u_hat_res
+                    b0_val = b0_star.item()
+                    u_bilo = b0_val * u_hat_res.view(-1)
+                    
+                    try:
+                        u_fdm_np = physics.fdm_solve_alpha(
+                            d=d_snapshot,
+                            alpha=alpha,
+                            mu=mu,
+                            x=x_res.detach().cpu().numpy().reshape(-1),
+                            b0=b0_val,
+                            sources=sources,
+                            bc_type=bc_type
+                        )
+                        u_fdm = torch.from_numpy(u_fdm_np).to(device=device, dtype=dtype)
+                        
+                        if field_loss_type == "rle":
+                            u_fdm_err = torch.abs(u_bilo - u_fdm) / (u_fdm + 1e-8)
+                        else:
+                            u_fdm_err = torch.abs(u_bilo - u_fdm)
+
+                        u_fdm_err = torch.mean(u_fdm_err ** 2).item()
+                        
+                        metrics_extra["u_fdm_err"] = u_fdm_err
+                    except Exception as e:
+                        # Fallback if FDM fails (e.g. numerical instability)
+                        pass
+
                 history.log(
                     step=step,
                     upper=upper_loss.item(),
@@ -768,30 +815,36 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                     jump_rgrad=jump_rgrad.item(),
                     b0_star=b0_star.item(),
                     mean_d=mean_d,
+                    **metrics_extra
                 )
                 history.log_snapshot(step, d_snapshot)
 
                 if verbose:
                     loss_name = field_loss_type if mode == "field" else "ppp"
+                    
+                    # Merge extra metrics into the display dict
+                    display_metrics = {
+                        "total": total_loss.item(),
+                        "upper": upper_loss.item(),
+                        "data": data_loss.item(),
+                        "reg_smooth": reg_smooth.item(),
+                        "reg_scale": reg_scale.item(),
+                        "lower": lower_loss.item(),
+                        "res": res_loss.item(),
+                        "jump": jump_loss.item(),
+                        "bc": bc_loss.item(),
+                        "rgrad": rgrad.item(),
+                        "jump_rgrad": jump_rgrad.item(),
+                        "b0_star": b0_star.item(),
+                        "integral_unit": integral_unit.item(),
+                        "mean_d": mean_d,
+                    }
+                    display_metrics.update(metrics_extra)
+                    
                     print(format_bilo_progress(
                         step=step,
                         phase="finetune",
-                        metrics={
-                            "total": total_loss.item(),
-                            "upper": upper_loss.item(),
-                            "data": data_loss.item(),
-                            "reg_smooth": reg_smooth.item(),
-                            "reg_scale": reg_scale.item(),
-                            "lower": lower_loss.item(),
-                            "res": res_loss.item(),
-                            "jump": jump_loss.item(),
-                            "bc": bc_loss.item(),
-                            "rgrad": rgrad.item(),
-                            "jump_rgrad": jump_rgrad.item(),
-                            "b0_star": b0_star.item(),
-                            "integral_unit": integral_unit.item(),
-                            "mean_d": mean_d,
-                        },
+                        metrics=display_metrics,
                         weights={
                             "wreg_smooth": wreg_smooth,
                             "wreg_scale": wreg_scale,

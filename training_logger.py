@@ -102,12 +102,14 @@ class TrainingHistory:
 
         Tracked metrics:
             iter, upper, data, reg_smooth, reg_scale, lower, res, jump, bc,
-            bc_grad, rgrad, jump_rgrad, b0_star, mean_d
+            bc_grad, rgrad, jump_rgrad, b0_star, mean_d,
+            d_err_l2, d_err_linf, u_fdm_err
         """
         return cls([
             "iter", "upper", "data", "reg_smooth", "reg_scale",
             "lower", "res", "jump", "bc", "bc_grad", "rgrad", "jump_rgrad",
-            "b0_star", "mean_d", "d_snap_iters", "d_snapshots"
+            "b0_star", "mean_d", "d_snap_iters", "d_snapshots",
+            "d_err_l2", "d_err_linf", "u_fdm_err"
         ])
 
     def log(self, **kwargs) -> None:
@@ -348,6 +350,13 @@ def format_bilo_progress(
     u_int = b0_star * integral_unit
     bc_str = f" | Lbc: {bc:.3e}" if bc_type == "neumann" else ""
 
+    # Append validation metrics if they exist
+    val_str = ""
+    if "d_err_l2" in metrics:
+        val_str += f"\n  D_err: L2 {float(metrics['d_err_l2']):.3e} | Linf {float(metrics['d_err_linf']):.3e}"
+    if "u_fdm_err" in metrics:
+        val_str += f" | U_consistency: L2 {float(metrics['u_fdm_err']):.3e}"
+
     return (
         f"[BiLO|{phase}] Iter {step:05d} | Ltot: {total:.3e}\n"
         f"  Upper: {upper:.3e} | Ldata({loss_name}): {data:.3e} | "
@@ -356,6 +365,7 @@ def format_bilo_progress(
         f"  Lower: {lower:.3e} | Lres: {res:.3e} | Ljump: {jump:.3e}{bc_str} | "
         f"Lrgrad: {rgrad:.3e} | Ljump_rgrad: {jump_rgrad:.3e}\n"
         f"  b0*: {b0_star:.2f} | int_u_hat: {integral_unit:.3e} | int_u: {u_int:.3e} | mean_D: {mean_d:.3e}"
+        f"{val_str}"
     )
 
 
