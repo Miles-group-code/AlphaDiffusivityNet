@@ -312,13 +312,11 @@ def _calc_physics_loss(
         bc_loss, bc_grad_loss = _compute_bc_loss_neumann(d_net, local_op, z_tensor, domain, x_res.device, x_res.dtype)
 
     if w_resgrad > 0.0:
-        grad_jump = torch.autograd.grad(
-            jump_res, d_z, grad_outputs=torch.ones_like(jump_res), create_graph=True, allow_unused=True
-        )[0]
-        jump_rgrad = torch.mean(grad_jump ** 2)
+        grad_jump_d = torch.autograd.grad(jump_res, d_z, grad_outputs=torch.ones_like(jump_res), create_graph=True, allow_unused=True)[0]
+        grad_jump_dx = torch.autograd.grad(jump_res, d_z_x, grad_outputs=torch.ones_like(jump_res), create_graph=True, allow_unused=True)[0]
+        jump_rgrad = torch.mean(grad_jump_d ** 2 + grad_jump_dx ** 2)
 
         grad_res_d = torch.autograd.grad(residual, d_pde, grad_outputs=torch.ones_like(residual), create_graph=True, allow_unused=True)[0]
-
         grad_res_dx = torch.autograd.grad(residual, d_x, grad_outputs=torch.ones_like(residual), create_graph=True, allow_unused=True)[0]
         rgrad = torch.mean(grad_res_d ** 2 + grad_res_dx ** 2)
     else:
@@ -800,7 +798,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                     u_fdm = torch.from_numpy(u_fdm_np).to(device=device, dtype=dtype)
                     
                     if field_loss_type == "rle":
-                        u_fdm_err = torch.abs(u_bilo - u_fdm) / (u_fdm + 1e-8)
+                        u_fdm_err = torch.abs(u_bilo - u_fdm) / (u_fdm + 1e-6)
                     else:
                         u_fdm_err = torch.abs(u_bilo - u_fdm)
 

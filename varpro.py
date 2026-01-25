@@ -114,7 +114,7 @@ def project_b0_field(
     u_hat: torch.Tensor,
     u_true: torch.Tensor,
     field_loss: Literal["mse", "rle"] = "mse",
-    eps: float = 1e-8,
+    eps: float = 1e-6,
 ) -> torch.Tensor:
     """Analytically project the optimal b0* for field data.
 
