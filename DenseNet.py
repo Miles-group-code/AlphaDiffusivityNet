@@ -386,10 +386,7 @@ class DenseNet(nn.Module):
             if name not in self.trainable_param:
                 param.requires_grad = False
 
-        # Backward compatibility
-        if modifiedmlp:
-            arch = 'pirate'
-
+        
         if arch == 'pirate':
             self.net = PirateNet(input_dim, width, depth, output_dim, 
                                  activation=act, sigma=sigma, 

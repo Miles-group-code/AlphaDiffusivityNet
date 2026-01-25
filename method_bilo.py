@@ -92,17 +92,15 @@ class LocalOperator(nn.Module):
         self.u_net = u_net
 
     def forward(
-        self, x: torch.Tensor, d: torch.Tensor, z_known: torch.Tensor
+        self, x: torch.Tensor, d: torch.Tensor, d_x: torch.Tensor, z_known: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         x = x.view(-1, 1)
         d = d.view(-1, 1)
-
+        d_x = d_x.view(-1, 1)
         phi_z = torch.abs(x - z_known)
         phi_z.requires_grad_(True)
         
-        # d_transform = torch.log(d)
-        d_transform = d
-        input = torch.cat([x, phi_z, d_transform], dim=1)
+        input = torch.cat([x, d, d_x, phi_z], dim=1)
         u = self.u_net(input)
         if self.bc_type == "dirichlet":
             u = u * x * (1.0 - x)
@@ -224,16 +222,20 @@ def _calc_data_loss(
         b0_star, data_loss, reg_smooth, reg_scale
     """
     d_int = d_net(x_int)
-    u_hat_int, _ = local_op(x_int, d_int, z_tensor)
+    
 
     if mode == "field":
+        x_field.requires_grad_(True)
         d_field = d_net(x_field)
-        u_hat_field, _ = local_op(x_field, d_field, z_tensor)
+        d_field_x = torch.autograd.grad(d_field, x_field, grad_outputs=torch.ones_like(d_field), create_graph=True)[0]
+        u_hat_field, _ = local_op(x_field, d_field, d_field_x, z_tensor)
         b0_star = varpro.get_b0_field(
             u_hat_field, u_true, field_loss=field_loss, b0_fixed_value=b0_fixed_value
         )
         data_loss = varpro.field_data_loss(u_hat_field, u_true, b0_star, field_loss=field_loss)
     else:
+        # need to compute d_int_x later
+        u_hat_int, _ = local_op(x_int, d_int, z_tensor)
         integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
         b0_star = varpro.get_b0_ppp(ppp.n_obs, ppp.m_obs, integral_unit, b0_fixed_value=b0_fixed_value)
         d_data = d_net(ppp.x_particles)
@@ -277,16 +279,27 @@ def _calc_physics_loss(
     w_resgrad = loss_weights["w_resgrad"]
     w_bc = loss_weights["w_bc"]
 
-    x_pde = x_res.clone().detach().requires_grad_(True)
+    # x_pde is xres remove z_idx
+    x_pde = torch.cat([x_res[:z_idx], x_res[z_idx+1:]]).clone().detach().requires_grad_(True)
+    
     d_pde = d_net(x_pde)
-    u_hat_pde, _ = local_op(x_pde, d_pde, z_tensor)
-    residual = _alpha_flux_residual(x_pde, d_pde, u_hat_pde, alpha, mu)
+    d_x = torch.autograd.grad(d_pde, x_pde, grad_outputs=torch.ones_like(d_pde), create_graph=True)[0]
+
+    u_hat_pde, _ = local_op(x_pde, d_pde, d_x, z_tensor)
+    # residual = _alpha_flux_residual(x_pde, d_pde, u_hat_pde, alpha, mu)
+    u_x = torch.autograd.grad(u_hat_pde, x_pde, grad_outputs=torch.ones_like(u_hat_pde), create_graph=True)[0]
+    u_xx = torch.autograd.grad(u_x, x_pde, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
+
+
+    residual = d_pde * u_xx + d_x * u_x - mu * u_hat_pde
+    
     n = residual.shape[0]
-    res_loss = (torch.sum(residual ** 2) - residual[z_idx] ** 2) / (n - 1)
+    res_loss = torch.mean(residual ** 2)
 
     z_probe = z_tensor.clone().detach().requires_grad_(True)
     d_z = d_net(z_probe)
-    u_hat_z, phi_z = local_op(z_probe, d_z, z_tensor)
+    d_z_x = torch.autograd.grad(d_z, z_probe, grad_outputs=torch.ones_like(d_z), create_graph=True)[0]
+    u_hat_z, phi_z = local_op(z_probe, d_z, d_z_x, z_tensor)
     du_dphi = torch.autograd.grad(
         u_hat_z, phi_z, grad_outputs=torch.ones_like(u_hat_z), create_graph=True
     )[0]
@@ -302,18 +315,12 @@ def _calc_physics_loss(
         grad_jump = torch.autograd.grad(
             jump_res, d_z, grad_outputs=torch.ones_like(jump_res), create_graph=True, allow_unused=True
         )[0]
-        # d_scale_jump = d_z.clamp(min=D_MIN).detach()
-        d_scale_jump = 1.0
-        jump_rgrad = torch.mean((grad_jump * d_scale_jump) ** 2) if grad_jump is not None else torch.tensor(0.0, device=x_res.device, dtype=x_res.dtype)
+        jump_rgrad = torch.mean(grad_jump ** 2)
 
-        grad_outputs = torch.ones_like(residual)
-        grad_outputs[z_idx] = 0.0
-        grad_res = torch.autograd.grad(
-            residual, d_pde, grad_outputs=grad_outputs, create_graph=True, allow_unused=True
-        )[0]
-        # d_scale_pde = d_pde.clamp(min=D_MIN).detach()
-        d_scale_pde = 1.0
-        rgrad = torch.mean((grad_res * d_scale_pde) ** 2) if grad_res is not None else torch.tensor(0.0, device=x_res.device, dtype=x_res.dtype)
+        grad_res_d = torch.autograd.grad(residual, d_pde, grad_outputs=torch.ones_like(residual), create_graph=True, allow_unused=True)[0]
+
+        grad_res_dx = torch.autograd.grad(residual, d_x, grad_outputs=torch.ones_like(residual), create_graph=True, allow_unused=True)[0]
+        rgrad = torch.mean(grad_res_d ** 2 + grad_res_dx ** 2)
     else:
         rgrad = torch.tensor(0.0, device=x_res.device, dtype=x_res.dtype)
         jump_rgrad = torch.tensor(0.0, device=x_res.device, dtype=x_res.dtype)
@@ -506,7 +513,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
 
 
     u_net = DenseNet(
-        input_dim=3,
+        input_dim=4,
         output_dim=1,
         act='silu',
         width=u_net_width,
@@ -557,10 +564,12 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                     bc_type, domain
                 )
                 lower = phys["lower_loss"]
-                d_curr = d_net(x_res).detach()
-                u_pred, _ = local_op(x_res, d_curr, z_tensor)
+                x_res.requires_grad_(True)
+                d_curr = d_net(x_res)
+                d_curr_x = torch.autograd.grad(d_curr, x_res, grad_outputs=torch.ones_like(d_curr), create_graph=True)[0]
+                u_pred, _ = local_op(x_res, d_curr, d_curr_x, z_tensor)
                 loss_sup = torch.mean((u_pred - u_init_target) ** 2)
-                (lower + 10*loss_sup).backward()
+                (lower + loss_sup).backward()
 
                 if verbose and step % log_every == 0:
                     with torch.no_grad():
@@ -600,8 +609,9 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                     bc_type, domain
                 )
                 lower = phys["lower_loss"]
-                d_curr = d_net(x_res).detach()
-                u_pred, _ = local_op(x_res, d_curr, z_tensor)
+                d_curr = d_net(x_res)
+                d_curr_x = torch.autograd.grad(d_curr, x_res, grad_outputs=torch.ones_like(d_curr), create_graph=True)[0]
+                u_pred, _ = local_op(x_res, d_curr, d_curr_x, z_tensor)
                 loss_sup = torch.mean((u_pred - u_init_target) ** 2)
                 mean_d = torch.mean(d_curr).item()
                 pre_total = (anchor_loss + lower + loss_sup).item()
@@ -747,58 +757,59 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
             # -----------------------------------------------------------------
             total_loss = upper_loss + lower_loss
             if step % log_every == 0:
-                with torch.no_grad():
-                    d_res = d_net(x_res)
-                    mean_d = torch.mean(d_res).item()
-                    u_hat_res, _ = local_op(x_res, d_res, z_tensor)
-                    if mode == "particles":
-                        d_int = d_net(x_int)
-                        u_hat_int, _ = local_op(x_int, d_int, z_tensor)
-                        integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
+                
+                d_res = d_net(x_res)
+                d_res_x = torch.autograd.grad(d_res, x_res, grad_outputs=torch.ones_like(d_res), create_graph=True)[0]
+                u_hat_res, _ = local_op(x_res, d_res, d_res_x, z_tensor)
+                mean_d = torch.mean(d_res).item()
+                if mode == "particles":
+                    d_int = d_net(x_int)
+                    u_hat_int, _ = local_op(x_int, d_int, z_tensor)
+                    integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
+                else:
+                    integral_unit = torch.trapezoid(u_hat_res.view(-1), x_res.view(-1))
+                d_snapshot = d_res.detach().cpu().numpy().reshape(-1)
+
+                # Validation Metrics
+                metrics_extra = {}
+                
+                # 1. D Error (if ground truth available)
+                if d_true is not None:
+                    d_err = torch.abs(d_res - d_true)
+                    d_err_l2 = torch.sqrt(torch.mean(d_err ** 2)).item()
+                    d_err_linf = torch.max(d_err).item()
+                    metrics_extra["d_err_l2"] = d_err_l2
+                    metrics_extra["d_err_linf"] = d_err_linf
+                
+                # 2. Solver Consistency (BiLO vs FDM with predicted D)
+                # We compute FDM solution using the current d_pred and b0_star
+                # BiLO prediction: u_pred = b0_star * u_hat_res
+                b0_val = b0_star.item()
+                u_bilo = b0_val * u_hat_res.view(-1)
+                
+                try:
+                    u_fdm_np = physics.fdm_solve_alpha(
+                        d=d_snapshot,
+                        alpha=alpha,
+                        mu=mu,
+                        x=x_res.detach().cpu().numpy().reshape(-1),
+                        b0=b0_val,
+                        sources=sources,
+                        bc_type=bc_type
+                    )
+                    u_fdm = torch.from_numpy(u_fdm_np).to(device=device, dtype=dtype)
+                    
+                    if field_loss_type == "rle":
+                        u_fdm_err = torch.abs(u_bilo - u_fdm) / (u_fdm + 1e-8)
                     else:
-                        integral_unit = torch.trapezoid(u_hat_res.view(-1), x_res.view(-1))
-                    d_snapshot = d_res.detach().cpu().numpy().reshape(-1)
+                        u_fdm_err = torch.abs(u_bilo - u_fdm)
 
-                    # Validation Metrics
-                    metrics_extra = {}
+                    u_fdm_err = torch.mean(u_fdm_err ** 2).item()
                     
-                    # 1. D Error (if ground truth available)
-                    if d_true is not None:
-                        d_err = torch.abs(d_res - d_true)
-                        d_err_l2 = torch.sqrt(torch.mean(d_err ** 2)).item()
-                        d_err_linf = torch.max(d_err).item()
-                        metrics_extra["d_err_l2"] = d_err_l2
-                        metrics_extra["d_err_linf"] = d_err_linf
-                    
-                    # 2. Solver Consistency (BiLO vs FDM with predicted D)
-                    # We compute FDM solution using the current d_pred and b0_star
-                    # BiLO prediction: u_pred = b0_star * u_hat_res
-                    b0_val = b0_star.item()
-                    u_bilo = b0_val * u_hat_res.view(-1)
-                    
-                    try:
-                        u_fdm_np = physics.fdm_solve_alpha(
-                            d=d_snapshot,
-                            alpha=alpha,
-                            mu=mu,
-                            x=x_res.detach().cpu().numpy().reshape(-1),
-                            b0=b0_val,
-                            sources=sources,
-                            bc_type=bc_type
-                        )
-                        u_fdm = torch.from_numpy(u_fdm_np).to(device=device, dtype=dtype)
-                        
-                        if field_loss_type == "rle":
-                            u_fdm_err = torch.abs(u_bilo - u_fdm) / (u_fdm + 1e-8)
-                        else:
-                            u_fdm_err = torch.abs(u_bilo - u_fdm)
-
-                        u_fdm_err = torch.mean(u_fdm_err ** 2).item()
-                        
-                        metrics_extra["u_fdm_err"] = u_fdm_err
-                    except Exception as e:
-                        # Fallback if FDM fails (e.g. numerical instability)
-                        pass
+                    metrics_extra["u_fdm_err"] = u_fdm_err
+                except Exception as e:
+                    # Fallback if FDM fails (e.g. numerical instability)
+                    pass
 
                 history.log(
                     step=step,
@@ -930,21 +941,24 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
     # =========================================================================
     # FINAL RESULT EXTRACTION
     # =========================================================================
-    with torch.no_grad():
-        d_final = d_net(x_res)
-        u_hat_res, _ = local_op(x_res, d_final, z_tensor)
-        if mode == "field":
-            d_field = d_net(x_field)
-            u_hat_field, _ = local_op(x_field, d_field, z_tensor)
-            b0_star = varpro.get_b0_field(
-                u_hat_field, u_true, field_loss=field_loss_type, b0_fixed_value=b0_fixed_value
-            )
-        else:
-            u_hat_int, _ = local_op(x_int, d_net(x_int), z_tensor)
-            integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
-            b0_star = varpro.get_b0_ppp(ppp.n_obs, ppp.m_obs, integral_unit, b0_fixed_value=b0_fixed_value)
-        u_pred = b0_star * u_hat_res
-        d_pred = d_final
+    
+    d_final = d_net(x_res)
+    d_final_x = torch.autograd.grad(d_final, x_res, grad_outputs=torch.ones_like(d_final), create_graph=True)[0]
+    u_hat_res, _ = local_op(x_res, d_final, d_final_x, z_tensor)
+    if mode == "field":
+        d_field = d_net(x_field)    
+        d_field_x = torch.autograd.grad(d_field, x_field, grad_outputs=torch.ones_like(d_field), create_graph=True)[0]
+        u_hat_field, _ = local_op(x_field, d_field, d_field_x, z_tensor)
+        b0_star = varpro.get_b0_field(
+            u_hat_field, u_true, field_loss=field_loss_type, b0_fixed_value=b0_fixed_value
+        )
+    else:
+        raise NotImplementedError("PPP mode not implemented yet")
+        u_hat_int, _ = local_op(x_int, d_net(x_int), z_tensor)
+        integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
+        b0_star = varpro.get_b0_ppp(ppp.n_obs, ppp.m_obs, integral_unit, b0_fixed_value=b0_fixed_value)
+    u_pred = b0_star * u_hat_res
+    d_pred = d_final
 
     save_path = _resolve_weights_path(getattr(cfg.train, "bilo_save_path", None), cfg.run.outdir)
     if save_path is not None:
