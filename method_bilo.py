@@ -29,6 +29,8 @@ try:
 except ImportError:
     wandb = None
 
+import matplotlib.pyplot as plt
+
 # =============================================================================
 # D PARAMETERIZATION: Softplus + offset
 # =============================================================================
@@ -108,6 +110,184 @@ class LocalOperator(nn.Module):
             u = u
         return u, phi_z
 
+
+def evaluate_bilo(
+    local_op: nn.Module,
+    d_net: nn.Module,
+    z_tensor: torch.Tensor,
+    x: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Evaluate d, d_x, u, and phi_z at x using the BiLO networks.
+
+    Args:
+        local_op: The local operator network (u_hat).
+        d_net: The diffusivity network (d).
+        z_tensor: Source location tensor.
+        x: Input coordinates (must have requires_grad=True or be capable of it).
+
+    Returns:
+        d: Diffusivity at x.
+        d_x: Gradient of diffusivity at x.
+        u: Local operator output at x.
+        phi_z: Distance feature |x - z|.
+    """
+    if not x.requires_grad:
+        x.requires_grad_(True)
+
+    d = d_net(x)
+    d_x = torch.autograd.grad(d, x, grad_outputs=torch.ones_like(d), create_graph=True)[0]
+    u, phi_z = local_op(x, d, d_x, z_tensor)
+    return d, d_x, u, phi_z
+
+
+class DNetVariationWrapper(nn.Module):
+    """Temporary wrapper that adds a variation to d_net's output."""
+    
+    def __init__(self, d_net: nn.Module, variation_func):
+        """Initialize wrapper.
+        
+        Args:
+            d_net: Base diffusivity network
+            variation_func: Callable(x) -> tensor, adds variation to d_net output
+        """
+        super().__init__()
+        self.d_net = d_net
+        self.variation_func = variation_func
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute d_net(x) + variation(x)."""
+        d_base = self.d_net(x)
+        variation = self.variation_func(x)
+        return d_base + variation
+
+
+def plot_bilo_d_variation(
+    solution: "Solution",
+    problem: "Problem",
+    outdir: str | None = None,
+    filename: str = "bilo_d_variation.png",
+    show: bool = True,
+) -> Optional[plt.Figure]:
+    """Visualize BiLO sensitivity to D variations after pretraining.
+    
+    After pretraining with D_0, shows how u(x) changes with D variations:
+    - D_0 + 0.5d (constant shift up)
+    - D_0 - 0.5d (constant shift down)
+    - D_0 + 0.5d*x (linear increase)
+    - D_0 - 0.5d*x (linear decrease)
+    
+    where d = mean(D_0).
+    
+    Args:
+        solution: BiLO Solution object with d_net and local_op
+        problem: Problem object with physics parameters
+        outdir: Output directory (if None, don't save)
+        show: Whether to show the plot
+        
+    Returns:
+        matplotlib Figure if show=False, None otherwise
+    """
+    if solution.method != "BILO" or solution.local_op is None:
+        return None
+    
+    # Get device from the networks (they should be on the same device)
+    device = next(solution.d_net.parameters()).device
+    dtype = next(solution.d_net.parameters()).dtype
+    
+    x_res = solution.x_res
+    x_np = x_res.detach().cpu().numpy().reshape(-1)
+    
+    # Move x_res to the same device as the networks
+    x_res_t = x_res.to(device=device, dtype=dtype).view(-1, 1)
+    
+    # Prepare z_tensor for local operator (use network device)
+    z_tensor = torch.tensor(
+        [[problem.source_location]],
+        device=device,
+        dtype=dtype
+    )
+    
+    # Get D_0 and u_0 using evaluate_bilo
+    d_0, d_0_x, u_hat_0, _ = evaluate_bilo(solution.local_op, solution.d_net, z_tensor, x_res_t)
+    D_0 = d_0.detach().cpu().numpy().reshape(-1)
+    u_0 = solution.b0_star * u_hat_0.view(-1).detach().cpu().numpy()
+    
+    # Compute mean d
+    d_mean = float(np.mean(D_0))
+    
+    # Create variation functions that take x (tensor) and return variation tensor
+    # These will be added to d_net output, so autograd will compute d_x correctly
+    variations = {
+        "shiftplus": lambda x: 0.5 * d_mean * torch.ones_like(x),
+        "shiftminus": lambda x: -0.5 * d_mean * torch.ones_like(x),
+        "linplus": lambda x: 0.5 * d_mean * x,
+        "linminus": lambda x: -0.5 * d_mean * x,
+    }
+    
+    # Create figure with subplots for each variation
+    n_vars = len(variations)
+    fig, axes = plt.subplots(n_vars, 2, figsize=(12, 4 * n_vars))
+    if n_vars == 1:
+        axes = axes.reshape(1, -1)
+    
+    for idx, (varkey, var_func) in enumerate(variations.items()):
+        # Create temporary wrapped d_net with variation
+        d_net_var = DNetVariationWrapper(solution.d_net, var_func)
+        
+        # Use evaluate_bilo to get d, d_x, u - autograd will compute d_x correctly
+        d_var, d_var_x, u_hat_var, _ = evaluate_bilo(solution.local_op, d_net_var, z_tensor, x_res_t)
+        D_var = d_var.detach().cpu().numpy().reshape(-1)
+        u_var = solution.b0_star * u_hat_var.view(-1).detach().cpu().numpy()
+        
+        # Also compute FDM solution for comparison
+        try:
+            u_fdm_var = physics.fdm_solve_alpha(
+                D_var,
+                problem.alpha,
+                problem.mu,
+                x_np,
+                solution.b0_star,
+                (problem.source_location,),
+                bc_type=problem.bc_type,
+            )
+        except ValueError as e:
+            u_fdm_var = None
+        
+        # Plot u(x)
+        ax_u = axes[idx, 0]
+        ax_u.plot(x_np, u_var, label=f"LocalOp ({varkey})", linewidth=2)
+        if u_fdm_var is not None:
+            ax_u.plot(x_np, u_fdm_var, "--", label="FDM", linewidth=1.5, alpha=0.7)
+        ax_u.plot(x_np, u_0, "k:", label="u_0", linewidth=1.5, alpha=0.5)
+        
+        ax_u.set_xlabel("x")
+        ax_u.set_ylabel("u(x)")
+        ax_u.set_title(f"u(x) variation: {varkey}")
+        ax_u.legend()
+        ax_u.grid(True, alpha=0.3)
+        
+        # Plot D(x)
+        ax_d = axes[idx, 1]
+        ax_d.plot(x_np, D_0, "k-", label="D_0", linewidth=2)
+        ax_d.plot(x_np, D_var, label=f"D_var ({varkey})", linewidth=1.5)
+        ax_d.set_xlabel("x")
+        ax_d.set_ylabel("D(x)")
+        ax_d.set_title(f"D(x) variation: {varkey}")
+        ax_d.legend()
+        ax_d.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
+        fig.savefig(os.path.join(outdir, filename), dpi=150)
+        plt.close(fig)
+        return None
+    elif show:
+        plt.show()
+        return None
+    else:
+        return fig
 
 def _resolve_weights_path(path: Optional[str], outdir: str) -> Optional[str]:
     """Resolve relative paths against the run output directory."""
@@ -221,25 +401,18 @@ def _calc_data_loss(
     Returns a dict for readability:
         b0_star, data_loss, reg_smooth, reg_scale
     """
-    d_int = d_net(x_int)
     
-
     if mode == "field":
-        x_field.requires_grad_(True)
-        d_field = d_net(x_field)
-        d_field_x = torch.autograd.grad(d_field, x_field, grad_outputs=torch.ones_like(d_field), create_graph=True)[0]
-        u_hat_field, _ = local_op(x_field, d_field, d_field_x, z_tensor)
+        d_field, d_field_x, u_hat_field, _ = evaluate_bilo(local_op, d_net, z_tensor, x_field)
         b0_star = varpro.get_b0_field(
             u_hat_field, u_true, field_loss=field_loss, b0_fixed_value=b0_fixed_value
         )
         data_loss = varpro.field_data_loss(u_hat_field, u_true, b0_star, field_loss=field_loss)
     else:
-        # need to compute d_int_x later
-        u_hat_int, _ = local_op(x_int, d_int, z_tensor)
+        d_int, d_int_x, u_hat_int, _ = evaluate_bilo(local_op, d_net, z_tensor, x_int)
         integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
         b0_star = varpro.get_b0_ppp(ppp.n_obs, ppp.m_obs, integral_unit, b0_fixed_value=b0_fixed_value)
-        d_data = d_net(ppp.x_particles)
-        u_hat_data, _ = local_op(ppp.x_particles, d_data, z_tensor)
+        d_data, d_data_x, u_hat_data, _ = evaluate_bilo(local_op, d_net, z_tensor, ppp.x_particles)
         data_loss = varpro.ppp_nll(u_hat_data.view(-1), b0_star, ppp.m_obs, integral_unit)
 
     x_reg = x_res.clone().detach().requires_grad_(True)
@@ -282,24 +455,14 @@ def _calc_physics_loss(
     # x_pde is xres remove z_idx
     x_pde = torch.cat([x_res[:z_idx], x_res[z_idx+1:]]).clone().detach().requires_grad_(True)
     
-    d_pde = d_net(x_pde)
-    d_x = torch.autograd.grad(d_pde, x_pde, grad_outputs=torch.ones_like(d_pde), create_graph=True)[0]
-
-    u_hat_pde, _ = local_op(x_pde, d_pde, d_x, z_tensor)
-    # residual = _alpha_flux_residual(x_pde, d_pde, u_hat_pde, alpha, mu)
-    u_x = torch.autograd.grad(u_hat_pde, x_pde, grad_outputs=torch.ones_like(u_hat_pde), create_graph=True)[0]
-    u_xx = torch.autograd.grad(u_x, x_pde, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
-
-
-    residual = d_pde * u_xx + d_x * u_x - mu * u_hat_pde
+    d_pde, d_x, u_hat_pde, _ = evaluate_bilo(local_op, d_net, z_tensor, x_pde)
+    residual = _alpha_flux_residual(x_pde, d_pde, u_hat_pde, alpha, mu)
     
     n = residual.shape[0]
     res_loss = torch.mean(residual ** 2)
 
     z_probe = z_tensor.clone().detach().requires_grad_(True)
-    d_z = d_net(z_probe)
-    d_z_x = torch.autograd.grad(d_z, z_probe, grad_outputs=torch.ones_like(d_z), create_graph=True)[0]
-    u_hat_z, phi_z = local_op(z_probe, d_z, d_z_x, z_tensor)
+    d_z, d_z_x, u_hat_z, phi_z = evaluate_bilo(local_op, d_net, z_tensor, z_probe)
     du_dphi = torch.autograd.grad(
         u_hat_z, phi_z, grad_outputs=torch.ones_like(u_hat_z), create_graph=True
     )[0]
@@ -494,6 +657,12 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
     # =========================================================================
     d_init_profile = _init_d_profile(x_res.view(-1), base=d_scale, scale=pert_scale, freq=pert_freq).view(-1, 1)
 
+    fix_endpoint = getattr(cfg.arch, "fix_endpoint", False)
+    if fix_endpoint:
+        lambda_transform = lambda x, u: d_target + u * x * (1.0 - x)
+    else:
+        lambda_transform = lambda x, u: F.softplus(u) + D_MIN
+
     d_net = DenseNet(
         input_dim=1,
         output_dim=1,
@@ -505,7 +674,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
         sigma=d_net_rff_scale,
         omega_0=siren_omega0,
         # lambda_transform=lambda x, u: torch.exp(u),
-        lambda_transform=lambda x, u: F.softplus(u) + D_MIN,
+        lambda_transform=lambda_transform,
     ).to(device=device, dtype=dtype)
     
 
@@ -562,10 +731,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                     bc_type, domain
                 )
                 lower = phys["lower_loss"]
-                x_res.requires_grad_(True)
-                d_curr = d_net(x_res)
-                d_curr_x = torch.autograd.grad(d_curr, x_res, grad_outputs=torch.ones_like(d_curr), create_graph=True)[0]
-                u_pred, _ = local_op(x_res, d_curr, d_curr_x, z_tensor)
+                d_curr, d_curr_x, u_pred, _ = evaluate_bilo(local_op, d_net, z_tensor, x_res)
                 loss_sup = torch.mean((u_pred - u_init_target) ** 2)
                 (lower + loss_sup).backward()
 
@@ -607,9 +773,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                     bc_type, domain
                 )
                 lower = phys["lower_loss"]
-                d_curr = d_net(x_res)
-                d_curr_x = torch.autograd.grad(d_curr, x_res, grad_outputs=torch.ones_like(d_curr), create_graph=True)[0]
-                u_pred, _ = local_op(x_res, d_curr, d_curr_x, z_tensor)
+                d_curr, d_curr_x, u_pred, _ = evaluate_bilo(local_op, d_net, z_tensor, x_res)
                 loss_sup = torch.mean((u_pred - u_init_target) ** 2)
                 mean_d = torch.mean(d_curr).item()
                 pre_total = (anchor_loss + lower + loss_sup).item()
@@ -635,28 +799,16 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
         # VISUALIZATION (after pretraining)
         # ---------------------------------------------------------------------
         try:
-            from diagnostics import plot_bilo_d_variation
-            import matplotlib.pyplot as plt
-
-            # Build lightweight stand-ins for diagnostics.plot_bilo_d_variation
-            dummy_solution = SimpleNamespace(
-                method="BILO",
-                d_net=d_net,
-                local_op=local_op,
-                x_res=x_res,
-                # Pretrain supervises the unit response (b0 = 1.0)
-                b0_star=1.0,
+            solution = SimpleNamespace(
+                method="BILO", d_net=d_net, local_op=local_op, x_res=x_res, b0_star=1.0
             )
-            dummy_problem = SimpleNamespace(
-                source_location=float(sources[0]),
-                alpha=float(alpha),
-                mu=float(mu),
-                bc_type=str(bc_type),
+            problem = SimpleNamespace(
+                source_location=float(sources[0]), alpha=float(alpha), mu=float(mu), bc_type=str(bc_type)
             )
 
             if cfg.wandb.enabled and wandb is not None and wandb.run is not None:
                 fig_var = plot_bilo_d_variation(
-                    dummy_solution, dummy_problem, outdir=None, filename="bilo_d_variation_pretrain.png", show=False
+                    solution, problem, outdir=None, filename="bilo_d_variation_pretrain.png", show=False
                 )
                 if fig_var is not None:
                     wandb.log({"bilo_d_variation_pretrain": wandb.Image(fig_var)}, step=0, commit=True)
@@ -664,14 +816,15 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                         print("  ✓ Logged bilo_d_variation_pretrain to wandb")
                     plt.close(fig_var)
             else:
-                outdir = cfg.run.outdir
                 plot_bilo_d_variation(
-                    dummy_solution, dummy_problem, outdir=outdir, filename="bilo_d_variation_pretrain.png", show=False
+                    solution, problem, outdir=cfg.run.outdir, filename="bilo_d_variation_pretrain.png", show=False
                 )
                 if verbose:
-                    print(f"  ✓ Saved bilo_d_variation_pretrain to: {os.path.join(outdir, 'bilo_d_variation_pretrain.png')}")
+                    print(f"  ✓ Saved bilo_d_variation_pretrain to: {os.path.join(cfg.run.outdir, 'bilo_d_variation_pretrain.png')}")
         except Exception as e:
             if verbose:
+                import traceback
+                traceback.print_exc()
                 print(f"Warning: Failed to generate BiLO pretrain D variation plot: {e}")
 
     # =========================================================================
@@ -756,13 +909,10 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
             total_loss = upper_loss + lower_loss
             if step % log_every == 0:
                 
-                d_res = d_net(x_res)
-                d_res_x = torch.autograd.grad(d_res, x_res, grad_outputs=torch.ones_like(d_res), create_graph=True)[0]
-                u_hat_res, _ = local_op(x_res, d_res, d_res_x, z_tensor)
+                d_res, d_res_x, u_hat_res, _ = evaluate_bilo(local_op, d_net, z_tensor, x_res)
                 mean_d = torch.mean(d_res).item()
                 if mode == "particles":
-                    d_int = d_net(x_int)
-                    u_hat_int, _ = local_op(x_int, d_int, z_tensor)
+                    d_int, d_int_x, u_hat_int, _ = evaluate_bilo(local_op, d_net, z_tensor, x_int)
                     integral_unit = torch.trapezoid(u_hat_int.view(-1), x_int.view(-1))
                 else:
                     integral_unit = torch.trapezoid(u_hat_res.view(-1), x_res.view(-1))
@@ -940,13 +1090,9 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
     # FINAL RESULT EXTRACTION
     # =========================================================================
     
-    d_final = d_net(x_res)
-    d_final_x = torch.autograd.grad(d_final, x_res, grad_outputs=torch.ones_like(d_final), create_graph=True)[0]
-    u_hat_res, _ = local_op(x_res, d_final, d_final_x, z_tensor)
+    d_final, d_final_x, u_hat_res, _ = evaluate_bilo(local_op, d_net, z_tensor, x_res)
     if mode == "field":
-        d_field = d_net(x_field)    
-        d_field_x = torch.autograd.grad(d_field, x_field, grad_outputs=torch.ones_like(d_field), create_graph=True)[0]
-        u_hat_field, _ = local_op(x_field, d_field, d_field_x, z_tensor)
+        d_field, d_field_x, u_hat_field, _ = evaluate_bilo(local_op, d_net, z_tensor, x_field)
         b0_star = varpro.get_b0_field(
             u_hat_field, u_true, field_loss=field_loss_type, b0_fixed_value=b0_fixed_value
         )
