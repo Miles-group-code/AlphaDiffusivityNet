@@ -632,44 +632,53 @@ def plot_d_evolution(
     log_threshold: float = 5.0,
     show: bool = True,
 ) -> Optional[plt.Figure]:
-    """Visualize D(x) snapshots across training iterations."""
+    """Visualize D(x) snapshots across training iterations.
+    
+    Plots 10 uniformly spaced snapshots (including start and end) as line plots.
+    """
     snaps = hist.get("d_snapshots", [])
     iters = hist.get("d_snap_iters", [])
     if not snaps:
-        return
-    d_stack = np.stack(snaps, axis=0)
-    log_scale = False
-    if mean_d_true is not None and mean_d_true > 0.0:
-        mean_vals = np.array(hist.get("mean_d", []))
-        if (
-            mean_vals.size > 0
-            and np.all(mean_vals > 0.0)
-            and np.nanmax(mean_vals) > log_threshold * mean_d_true
-        ):
-            log_scale = True
-
-    norm = None
-    if log_scale:
-        positive = d_stack[d_stack > 0.0]
-        if positive.size > 0:
-            from matplotlib.colors import LogNorm
-
-            vmin = max(float(np.min(positive)), 1e-12)
-            vmax = float(np.max(positive))
-            norm = LogNorm(vmin=vmin, vmax=vmax)
-    fig, ax = plt.subplots(figsize=(10, 4))
+        return None
+    
+    # Select 10 uniformly spaced indices, including start (0) and end (len-1)
+    n_snaps = len(snaps)
+    if n_snaps <= 10:
+        indices = list(range(n_snaps))
+    else:
+        indices = [0] + [int(np.round(i * (n_snaps - 1) / 9)) for i in range(1, 9)] + [n_snaps - 1]
+        # Remove duplicates while preserving order
+        seen = set()
+        indices = [idx for idx in indices if idx not in seen and not seen.add(idx)]
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
     ax.set_title(f"D(x) evolution: {name}")
-    im = ax.imshow(
-        d_stack,
-        aspect="auto",
-        origin="lower",
-        extent=[x[0], x[-1], iters[0], iters[-1]],
-        norm=norm,
-    )
+    
+    # Use viridis colormap for color gradient
+    cmap = plt.cm.viridis
+    n_plot = len(indices)
+    colors = [cmap(i / max(n_plot - 1, 1)) for i in range(n_plot)]
+    
+    # Plot selected snapshots
+    for i, idx in enumerate(indices):
+        d_snap = np.asarray(snaps[idx]).reshape(-1)
+        if len(d_snap) != len(x):
+            if len(d_snap) > 0:
+                x_snap = np.linspace(x[0], x[-1], len(d_snap))
+                d_snap = np.interp(x, x_snap, d_snap)
+            else:
+                continue
+        
+        iter_val = iters[idx] if idx < len(iters) else idx
+        label = f"iter {iter_val}" if i == 0 or i == n_plot - 1 else None
+        ax.plot(x, d_snap, color=colors[i], alpha=0.7, linewidth=1.5, label=label)
+    
     ax.set_xlabel("x")
-    ax.set_ylabel("iter")
-    plt.colorbar(im, ax=ax, label="D(x)")
+    ax.set_ylabel("D(x)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
     plt.tight_layout()
+    
     if outdir:
         os.makedirs(outdir, exist_ok=True)
         if filename is None:
@@ -763,137 +772,6 @@ def plot_d_evolution_color(
         return fig
 
 
-def plot_bilo_d_variation(
-    solution: "Solution",
-    problem: "Problem",
-    outdir: str | None = None,
-    filename: str = "bilo_d_variation.png",
-    show: bool = True,
-) -> Optional[plt.Figure]:
-    """Visualize BiLO sensitivity to D variations after pretraining.
-    
-    After pretraining with D_0, shows how u(x) changes with D variations:
-    - D_0 + 0.5d (constant shift up)
-    - D_0 - 0.5d (constant shift down)
-    - D_0 + 0.5d*x (linear increase)
-    - D_0 - 0.5d*x (linear decrease)
-    
-    where d = mean(D_0).
-    
-    Args:
-        solution: BiLO Solution object with d_net and local_op
-        problem: Problem object with physics parameters
-        outdir: Output directory (if None, don't save)
-        show: Whether to show the plot
-        
-    Returns:
-        matplotlib Figure if show=False, None otherwise
-    """
-    if solution.method != "BILO" or solution.local_op is None:
-        return None
-    
-    # Get device from the networks (they should be on the same device)
-    device = next(solution.d_net.parameters()).device
-    dtype = next(solution.d_net.parameters()).dtype
-    
-    x_res = solution.x_res
-    x_np = x_res.detach().cpu().numpy().reshape(-1)
-    
-    # Move x_res to the same device as the networks
-    x_res_t = x_res.to(device=device, dtype=dtype).view(-1, 1)
-    
-    # Get D_0 after pretraining (evaluate d_net at x_res)
-    with torch.no_grad():
-        D_0 = solution.d_net(x_res_t).view(-1).detach().cpu().numpy()
-    
-    # Compute mean d
-    d_mean = float(np.mean(D_0))
-    
-    # Create variations
-    variations = {
-        "shiftplus": lambda x: D_0 + 0.5 * d_mean * np.ones_like(x),
-        "shiftminus": lambda x: D_0 - 0.5 * d_mean * np.ones_like(x),
-        "linplus": lambda x: D_0 + 0.5 * d_mean * x,
-        "linminus": lambda x: D_0 - 0.5 * d_mean * x,
-    }
-    
-    # Prepare z_tensor for local operator (use network device)
-    z_tensor = torch.tensor(
-        [[problem.source_location]],
-        device=device,
-        dtype=dtype
-    )
-    
-    # Create figure with subplots for each variation
-    n_vars = len(variations)
-    fig, axes = plt.subplots(n_vars, 2, figsize=(12, 4 * n_vars))
-    if n_vars == 1:
-        axes = axes.reshape(1, -1)
-    
-    for idx, (varkey, varfun) in enumerate(variations.items()):
-        D_var = varfun(x_np)
-        D_var_t = torch.tensor(D_var, device=device, dtype=dtype).view(-1, 1)
-        
-        # Compute u(x, D_var) using local operator
-        with torch.no_grad():
-            u_hat_var, _ = solution.local_op(x_res_t, D_var_t, z_tensor)
-            u_var = solution.b0_star * u_hat_var.view(-1).detach().cpu().numpy()
-        
-        # Also compute FDM solution for comparison
-        try:
-            u_fdm_var = physics.fdm_solve_alpha(
-                D_var,
-                problem.alpha,
-                problem.mu,
-                x_np,
-                solution.b0_star,
-                (problem.source_location,),
-                bc_type=problem.bc_type,
-            )
-        except ValueError as e:
-            u_fdm_var = None
-        
-        # Plot u(x)
-        ax_u = axes[idx, 0]
-        ax_u.plot(x_np, u_var, label=f"LocalOp ({varkey})", linewidth=2)
-        if u_fdm_var is not None:
-            ax_u.plot(x_np, u_fdm_var, "--", label="FDM", linewidth=1.5, alpha=0.7)
-        
-        # Plot u_0 for reference
-        with torch.no_grad():
-            D_0_t = torch.tensor(D_0, device=device, dtype=dtype).view(-1, 1)
-            u_hat_0, _ = solution.local_op(x_res_t, D_0_t, z_tensor)
-            u_0 = solution.b0_star * u_hat_0.view(-1).detach().cpu().numpy()
-        ax_u.plot(x_np, u_0, "k:", label="u_0", linewidth=1.5, alpha=0.5)
-        
-        ax_u.set_xlabel("x")
-        ax_u.set_ylabel("u(x)")
-        ax_u.set_title(f"u(x) variation: {varkey}")
-        ax_u.legend()
-        ax_u.grid(True, alpha=0.3)
-        
-        # Plot D(x)
-        ax_d = axes[idx, 1]
-        ax_d.plot(x_np, D_0, "k-", label="D_0", linewidth=2)
-        ax_d.plot(x_np, D_var, label=f"D_var ({varkey})", linewidth=1.5)
-        ax_d.set_xlabel("x")
-        ax_d.set_ylabel("D(x)")
-        ax_d.set_title(f"D(x) variation: {varkey}")
-        ax_d.legend()
-        ax_d.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    
-    if outdir:
-        os.makedirs(outdir, exist_ok=True)
-        fig.savefig(os.path.join(outdir, filename), dpi=150)
-        plt.close(fig)
-        return None
-    elif show:
-        plt.show()
-        return None
-    else:
-        return fig
 
 
 def plot_particle_comparison(
