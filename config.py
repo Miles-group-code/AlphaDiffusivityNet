@@ -219,6 +219,8 @@ class ArchConfig:
     d_net_width: int = 128
     d_net_rff_scale: float = 1.0  # Frequency multiplier for RFF (higher = sharper features)
     siren_omega0: float = 30.0
+    fix_endpoint: bool = False
+    bilo_order: int = 1  # Highest order of derivative of D to use (0=D only, 1=D,D', 2=D,D',D'')
 
     u_net_arch: Literal["mlp", "pirate", "mmlp", "siren", "fourier", "grid"] = "mlp"
     u_net_depth: int = 3

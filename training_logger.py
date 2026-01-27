@@ -357,6 +357,19 @@ def format_bilo_progress(
     if "u_fdm_err" in metrics:
         val_str += f" | U_consistency: L2 {float(metrics['u_fdm_err']):.3e}"
 
+    # Append dynamic rgrad metrics
+    rgrad_str = ""
+    for k in sorted(metrics.keys()):
+        if k.startswith("rgrad_d"):
+            rgrad_str += f" | {k}: {metrics[k]:.3e}"
+        elif k.startswith("jump_rgrad_d"):
+            rgrad_str += f" | {k}: {metrics[k]:.3e}"
+        elif k.startswith("bc_grad_d"):
+            rgrad_str += f" | {k}: {metrics[k]:.3e}"
+    
+    if rgrad_str:
+        val_str += "\n  " + rgrad_str.strip(" |")
+
     return (
         f"[BiLO|{phase}] Iter {step:05d} | Ltot: {total:.3e}\n"
         f"  Upper: {upper:.3e} | Ldata({loss_name}): {data:.3e} | "
@@ -400,10 +413,25 @@ def format_bilo_pretrain_progress(
     bc_str = f" | Lbc: {bc:.3e}" if bc_type == "neumann" else ""
     bc_grad_str = f" | Lbc_grad: {bc_grad:.3e}" if bc_type == "neumann" else ""
 
+    # Append dynamic rgrad metrics
+    rgrad_str = ""
+    for k in sorted(metrics.keys()):
+        if k.startswith("rgrad_d"):
+            rgrad_str += f" | {k}: {metrics[k]:.3e}"
+        elif k.startswith("jump_rgrad_d"):
+            rgrad_str += f" | {k}: {metrics[k]:.3e}"
+        elif k.startswith("bc_grad_d"):
+            rgrad_str += f" | {k}: {metrics[k]:.3e}"
+    
+    extra_str = ""
+    if rgrad_str:
+        extra_str = "\n  " + rgrad_str.strip(" |")
+
     return (
         f"[BiLO|pretrain] Iter {step:05d} | Ltot: {total:.3e}\n"
         f"  Lanchor: {anchor:.3e} | Llower: {lower:.3e} | Lsup: {sup:.3e}\n"
         f"  Lres: {res:.3e} | Ljump: {jump:.3e}{bc_str}{bc_grad_str} | "
         f"Lrgrad: {rgrad:.3e} | Ljump_rgrad: {jump_rgrad:.3e}\n"
         f"  mean_D: {mean_d:.3e}"
+        f"{extra_str}"
     )
