@@ -991,7 +991,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                 
                 # Add dynamic rgrad keys from phys
                 for k, v in phys.items():
-                    if k.startswith("rgrad_") or k.startswith("jump_rgrad_"):
+                    if k.startswith("rgrad_") or k.startswith("jump_rgrad_") or k.startswith("bc_grad_"):
                         metrics_extra[k] = v.item()
 
                 # 1. D Error (if ground truth available)

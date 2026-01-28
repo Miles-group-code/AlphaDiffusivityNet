@@ -127,15 +127,14 @@ class TrainingHistory:
             kwargs["iter"] = kwargs.pop("step")
 
         for k, v in kwargs.items():
-            if k in self._data:
-                self._data[k].append(v)
+            if k not in self._data:
+                self._data[k] = []
+            self._data[k].append(v)
         
         # Log to wandb if active
         if wandb is not None and wandb.run is not None:
-            # We filter only what is in _data to be consistent, or just log everything provided?
-            # The docstring says "others are silently ignored" for self._data. 
             # For wandb, we probably want to log what's being tracked.
-            log_dict = {k: v for k, v in kwargs.items() if k in self._data}
+            log_dict = kwargs
             if "iter" in log_dict:
                 step = log_dict["iter"]
                 wandb.log(log_dict, step=step)
