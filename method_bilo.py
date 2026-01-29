@@ -395,8 +395,8 @@ def _compute_bc_loss_neumann(
     bc_grad_details = {}
 
     for i, (d0_term, d1_term) in enumerate(zip(d0_list, d1_list)):
-        g0 = torch.autograd.grad(d0_term * u0_x, d0_term, grad_outputs=torch.ones_like(u0), create_graph=True)[0]
-        g1 = torch.autograd.grad(d1_term * u1_x, d1_term, grad_outputs=torch.ones_like(u1), create_graph=True)[0]
+        g0 = torch.autograd.grad(u0_x, d0_term, grad_outputs=torch.ones_like(u0), create_graph=True)[0]
+        g1 = torch.autograd.grad(u1_x, d1_term, grad_outputs=torch.ones_like(u1), create_graph=True)[0]
         
         term_loss = torch.mean(g0 ** 2 + g1 ** 2)
         total_bc_grad_loss = total_bc_grad_loss + term_loss
@@ -481,7 +481,14 @@ def _calc_physics_loss(
     
     d_pde_list, u_hat_pde, _ = evaluate_bilo(local_op, d_net, z_tensor, x_pde)
     d_pde = d_pde_list[0]
-    residual = _alpha_flux_residual(x_pde, d_pde, u_hat_pde, alpha, mu)
+    # if order == 0, use the following residual
+    if local_op.order == 0:
+        residual = _alpha_flux_residual(x_pde, d_pde, u_hat_pde, alpha, mu)
+    else:
+        u_x = torch.autograd.grad(u_hat_pde, x_pde, grad_outputs=torch.ones_like(u_hat_pde), create_graph=True)[0]
+        u_xx = torch.autograd.grad(u_x, x_pde, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
+        residual = d_pde * u_xx + d_pde_list[1] * u_x - mu * u_hat_pde
+    
     
     n = residual.shape[0]
     res_loss = torch.mean(residual ** 2)
