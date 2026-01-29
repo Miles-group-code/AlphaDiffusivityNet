@@ -195,6 +195,7 @@ class RegConfig:
     w_resgrad: float = 0.01
     wreg_smooth: float = 1e-7
     wreg_scale: float = 0.1
+    lower_data: float | None = None
     smoothness_type: Literal["h1", "tv"] = "h1"
 
     def validate(self) -> None:
@@ -239,6 +240,8 @@ class RunConfig:
     device: str = "cpu"
     dtype: str = "float64"
     outdir: str = "runs"
+    name: str | None = None
+    group: str | None = None
 
     def validate(self) -> None:
         """Validate run configuration."""

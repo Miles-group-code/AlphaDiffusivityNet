@@ -87,9 +87,14 @@ def update_config_value(cfg: Config, key: str, value: Any) -> None:
         if isinstance(value, str):
              # Remove brackets if present
              value = value.strip("[]()")
-             value = tuple(float(x.strip()) for x in value.split(","))
+             if "," in value:
+                 value = tuple(float(x.strip()) for x in value.split(","))
+             else:
+                 value = (float(value),)
         elif isinstance(value, (list, tuple)):
              value = tuple(float(x) for x in value)
+        elif isinstance(value, (int, float)):
+             value = (float(value),)
 
     # Handle tags -> tuple
     if key == "wandb.tags":
@@ -162,21 +167,23 @@ def main():
         # Resolve key
         full_key = None
         
-        if key in valid_full_paths:
-            # Explicit full path (e.g. "solver.method")
-            full_key = key
-        elif key in key_map:
-            # Shortcut leaf name (e.g. "method")
-            paths = key_map[key]
-            if len(paths) == 1:
-                full_key = paths[0]
+        
+        if full_key is None:
+            if key in valid_full_paths:
+                # Explicit full path (e.g. "solver.method")
+                full_key = key
+            elif key in key_map:
+                # Shortcut leaf name (e.g. "method")
+                paths = key_map[key]
+                if len(paths) == 1:
+                    full_key = paths[0]
+                else:
+                    print(f"Error: Ambiguous key '{key}'. Matches parent configs: {paths}")
+                    print("Please specify the parent config (e.g. 'parent.key').")
+                    sys.exit(1)
             else:
-                print(f"Error: Ambiguous key '{key}'. Matches parent configs: {paths}")
-                print("Please specify the parent config (e.g. 'parent.key').")
+                print(f"Error: Unknown configuration key '{key}'")
                 sys.exit(1)
-        else:
-            print(f"Error: Unknown configuration key '{key}'")
-            sys.exit(1)
         
         update_config_value(cfg, full_key, val)
 
@@ -187,8 +194,12 @@ def main():
         print(f"Configuration Error: {e}")
         sys.exit(1)
 
-    # 4. Setup WandB
+    # 4. Setup WandB and Output Directory
+    # Sync generic run/group names with WandB config
     if cfg.wandb.enabled:
+        cfg.wandb.name = cfg.run.name
+        cfg.wandb.group = cfg.run.group
+
         if wandb is None:
             print("Error: wandb requested but not installed/imported.")
             sys.exit(1)
@@ -203,6 +214,19 @@ def main():
             settings=wandb.Settings(_disable_stats=True),
         )
         print(f"[WandB] Run initialized: {wandb.run.name}")
+    else:
+        # If wandb disabled, organize output by group/name
+        base_out = cfg.run.outdir
+        if cfg.run.group and cfg.run.name:
+             cfg.run.outdir = os.path.join(base_out, cfg.run.group, cfg.run.name)
+        elif cfg.run.name:
+             cfg.run.outdir = os.path.join(base_out, cfg.run.name)
+        elif cfg.run.group:
+             cfg.run.outdir = os.path.join(base_out, cfg.run.group)
+        
+        print(f"Output directory updated to: {cfg.run.outdir}")
+        os.makedirs(cfg.run.outdir, exist_ok=True)
+
     
     # 5. Create Problem
     print(f"\n--- Setting up Problem ({cfg.data.mode}) ---")

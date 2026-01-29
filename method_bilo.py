@@ -85,7 +85,7 @@ class LocalOperator(nn.Module):
         self,
         u_net: nn.Module,
         bc_type: str = "dirichlet",
-        order: int = 2,
+        order: int = 0,
     ) -> None:
         super().__init__()
         
@@ -586,6 +586,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
     w_resgrad = cfg.reg.w_resgrad
     w_bc = cfg.reg.w_bc
     wreg_smooth, wreg_scale = cfg.reg.wreg_smooth, cfg.reg.wreg_scale
+    lower_data = cfg.reg.lower_data
     smoothness_type = cfg.reg.smoothness_type
 
     # Training
@@ -718,7 +719,6 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
         fourier=use_rff,
         sigma=d_net_rff_scale,
         omega_0=siren_omega0,
-        # lambda_transform=lambda x, u: torch.exp(u),
         lambda_transform=lambda_transform,
     ).to(device=device, dtype=dtype)
     
@@ -951,6 +951,12 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                 bc_type, domain
             )
             lower_loss = phys["lower_loss"]
+            # Check tolerance against pure physics loss, but optimize combined loss if requested
+            lower_loss_pure = lower_loss
+
+            if lower_data is not None and lower_data > 0.0:
+                lower_loss = lower_loss + lower_data * data_loss
+
             res_loss = phys["res_loss"]
             jump_loss = phys["jump_loss"]
             bc_loss = phys["bc_loss"]
@@ -958,9 +964,9 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
             jump_rgrad = phys["jump_rgrad"]
             bc_grad_loss = phys["bc_grad_loss"]
 
-            update_both = lower_tol is None or lower_loss.item() <= lower_tol
+            update_both = lower_tol is None or lower_loss_pure.item() <= lower_tol
             if not use_lbfgs:
-                grads_lower = torch.autograd.grad(lower_loss, local_op_params, create_graph=False, allow_unused=True)
+                grads_lower = torch.autograd.grad(lower_loss, local_op_params, create_graph=False, allow_unused=True, retain_graph=update_both)
                 for param, grad in zip(local_op_params, grads_lower):
                     if grad is not None:
                         param.grad = grad
@@ -1132,7 +1138,10 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                             bc_type, domain
                         )
                         lower_loss = phys["lower_loss"]
-                        update_both = lower_tol is None or lower_loss.item() <= lower_tol
+                        lower_loss_pure = lower_loss
+                        if lower_data is not None and lower_data > 0.0:
+                            lower_loss = lower_loss + lower_data * data_loss
+                        update_both = lower_tol is None or lower_loss_pure.item() <= lower_tol
                         grads_lower = torch.autograd.grad(lower_loss, local_op_params, create_graph=False, allow_unused=True)
                         for param, grad in zip(local_op_params, grads_lower):
                             if grad is not None:
