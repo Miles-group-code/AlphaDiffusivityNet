@@ -77,7 +77,7 @@ class DProfileConfig:
     ddi_d_max: float = 10.0  # Upper clamp for DDI estimate
 
     # Synthetic problem generation
-    profile_type: Literal["sinusoidal", "steps"] = "sinusoidal"
+    profile_type: Literal["sinusoidal", "cos", "steps"] = "sinusoidal"
     params: Tuple[float, float, float] = (0.1, 0.04, 4.0) # mean, amplitude, frequency
 
     def validate(self) -> None:
@@ -86,8 +86,8 @@ class DProfileConfig:
             raise ValueError("pert_scale must be < 1 to keep D_init positive.")
         if self.ddi_d_min > self.ddi_d_max:
             raise ValueError("ddi_d_min must be <= ddi_d_max.")
-        if self.profile_type not in {"sinusoidal", "steps"}:
-            raise ValueError("profile_type must be 'sinusoidal' or 'steps'.")
+        if self.profile_type not in {"sinusoidal", "cos", "steps"}:
+            raise ValueError("profile_type must be 'sinusoidal', 'cos', or 'steps'.")
         if len(self.params) != 3:
             raise ValueError("params must be a 3-tuple (mean, amplitude, frequency).")
 

@@ -207,6 +207,19 @@ def _build_d_profile(
 
         return d_callable, dprime_callable
 
+    if profile == "cos":
+        def d_callable(x: np.ndarray) -> np.ndarray:
+            return mean + amplitude * np.cos(2.0 * np.pi * frequency * x)
+
+        def dprime_callable(x: np.ndarray) -> np.ndarray:
+            return (
+                -amplitude
+                * (2.0 * np.pi * frequency)
+                * np.sin(2.0 * np.pi * frequency * x)
+            )
+
+        return d_callable, dprime_callable
+
     if profile == "steps":
         # Random phase shift to avoid jumps landing exactly on grid points (e.g. source at 0.5)
         phase_shift = np.random.rand()
