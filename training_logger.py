@@ -101,12 +101,12 @@ class TrainingHistory:
         """Create history tracker for BiLO method.
 
         Tracked metrics:
-            iter, upper, data, reg_smooth, reg_scale, lower, res, jump, bc,
+            iter, upper, data, reg_smooth, reg_scale, d_neumann, lower, res, jump, bc,
             bc_grad, rgrad, jump_rgrad, b0_star, mean_d,
             d_err_l2, d_err_linf, u_fdm_err
         """
         return cls([
-            "iter", "upper", "data", "reg_smooth", "reg_scale",
+            "iter", "upper", "data", "reg_smooth", "reg_scale", "d_neumann",
             "lower", "res", "jump", "bc", "bc_grad", "rgrad", "jump_rgrad",
             "b0_star", "mean_d", "d_snap_iters", "d_snapshots",
             "d_err_l2", "d_err_linf", "u_fdm_err"
@@ -332,6 +332,7 @@ def format_bilo_progress(
     data = float(metrics["data"])
     reg_smooth = float(metrics["reg_smooth"])
     reg_scale = float(metrics["reg_scale"])
+    d_neumann = float(metrics.get("d_neumann", 0.0))
     lower = float(metrics["lower"])
     res = float(metrics["res"])
     jump = float(metrics["jump"])
@@ -344,8 +345,10 @@ def format_bilo_progress(
 
     wreg_smooth = float(weights.get("wreg_smooth", 0.0))
     wreg_scale = float(weights.get("wreg_scale", 0.0))
+    wreg_d_neumann = float(weights.get("wreg_d_neumann", 0.0))
     reg_smooth_eff = wreg_smooth * reg_smooth
     reg_scale_eff = wreg_scale * reg_scale
+    d_neumann_eff = wreg_d_neumann * d_neumann
     u_int = b0_star * integral_unit
     bc_str = f" | Lbc: {bc:.3e}" if bc_type == "neumann" else ""
 
@@ -373,7 +376,8 @@ def format_bilo_progress(
         f"[BiLO|{phase}] Iter {step:05d} | Ltot: {total:.3e}\n"
         f"  Upper: {upper:.3e} | Ldata({loss_name}): {data:.3e} | "
         f"RegSmooth: {reg_smooth:.3e} (eff: {reg_smooth_eff:.3e}) | "
-        f"RegScale: {reg_scale:.3e} (eff: {reg_scale_eff:.3e})\n"
+        f"RegScale: {reg_scale:.3e} (eff: {reg_scale_eff:.3e}) | "
+        f"D_Neu: {d_neumann:.3e} (eff: {d_neumann_eff:.3e})\n"
         f"  Lower: {lower:.3e} | Lres: {res:.3e} | Ljump: {jump:.3e}{bc_str} | "
         f"Lrgrad: {rgrad:.3e} | Ljump_rgrad: {jump_rgrad:.3e}\n"
         f"  b0*: {b0_star:.2f} | int_u_hat: {integral_unit:.3e} | int_u: {u_int:.3e} | mean_D: {mean_d:.3e}"
@@ -405,6 +409,7 @@ def format_bilo_pretrain_progress(
     jump = float(metrics["jump"])
     bc = float(metrics["bc"])
     bc_grad = float(metrics.get("bc_grad", 0.0))
+    d_neumann = float(metrics.get("d_neumann", 0.0))
     rgrad = float(metrics["rgrad"])
     jump_rgrad = float(metrics["jump_rgrad"])
     mean_d = float(metrics["mean_d"])
@@ -429,7 +434,7 @@ def format_bilo_pretrain_progress(
     return (
         f"[BiLO|pretrain] Iter {step:05d} | Ltot: {total:.3e}\n"
         f"  Lanchor: {anchor:.3e} | Llower: {lower:.3e} | Lsup: {sup:.3e}\n"
-        f"  Lres: {res:.3e} | Ljump: {jump:.3e}{bc_str}{bc_grad_str} | "
+        f"  Lres: {res:.3e} | Ljump: {jump:.3e}{bc_str}{bc_grad_str} | D_Neu: {d_neumann:.3e} | "
         f"Lrgrad: {rgrad:.3e} | Ljump_rgrad: {jump_rgrad:.3e}\n"
         f"  mean_D: {mean_d:.3e}"
         f"{extra_str}"

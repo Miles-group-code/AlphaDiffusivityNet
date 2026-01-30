@@ -418,12 +418,13 @@ def _calc_data_loss(
     field_loss: str,
     d_target: float,
     smoothness_type: str,
+    domain: Tuple[float, float] = (0.0, 1.0),
     b0_fixed_value: Optional[float] = None,
 ) -> Dict[str, torch.Tensor]:
     """Compute data and regularization terms for the upper-level objective.
 
     Returns a dict for readability:
-        b0_star, data_loss, reg_smooth, reg_scale
+        b0_star, data_loss, reg_smooth, reg_scale, d_neumann
     """
     
     if mode == "field":
@@ -447,11 +448,22 @@ def _calc_data_loss(
         reg_smooth = physics.h1_smoothness_d(x_reg, d_reg)
 
     reg_scale = physics.scale_anchor(d_reg, d_target)
+
+    # D Neumann regularization
+    x0 = torch.tensor([[domain[0]]], device=x_res.device, dtype=x_res.dtype, requires_grad=True)
+    x1 = torch.tensor([[domain[1]]], device=x_res.device, dtype=x_res.dtype, requires_grad=True)
+    d0 = d_net(x0)
+    d1 = d_net(x1)
+    d0_x = torch.autograd.grad(d0, x0, grad_outputs=torch.ones_like(d0), create_graph=True)[0]
+    d1_x = torch.autograd.grad(d1, x1, grad_outputs=torch.ones_like(d1), create_graph=True)[0]
+    d_neumann = torch.mean(d0_x ** 2 + d1_x ** 2)
+
     return {
         "b0_star": b0_star,
         "data_loss": data_loss,
         "reg_smooth": reg_smooth,
         "reg_scale": reg_scale,
+        "d_neumann": d_neumann,
     }
 
 
@@ -592,6 +604,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
     w_jump = cfg.reg.w_jump
     w_resgrad = cfg.reg.w_resgrad
     w_bc = cfg.reg.w_bc
+    wreg_d_neumann = cfg.reg.wreg_d_neumann
     wreg_smooth, wreg_scale = cfg.reg.wreg_smooth, cfg.reg.wreg_scale
     lower_data = cfg.reg.lower_data
     smoothness_type = cfg.reg.smoothness_type
@@ -792,6 +805,19 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                     with torch.no_grad():
                         mean_d = torch.mean(d_curr).item()
                         pre_total = (anchor_loss + lower + loss_sup).item()
+                        
+                        # Compute d_neumann for logging
+                        x0 = torch.tensor([[domain[0]]], device=x_res.device, dtype=x_res.dtype)
+                        x1 = torch.tensor([[domain[1]]], device=x_res.device, dtype=x_res.dtype)
+                        with torch.enable_grad():
+                            # Need gradients for d_neumann
+                            x0.requires_grad_(True)
+                            x1.requires_grad_(True)
+                            d0 = d_net(x0)
+                            d1 = d_net(x1)
+                            d0_x = torch.autograd.grad(d0, x0, grad_outputs=torch.ones_like(d0), create_graph=True)[0]
+                            d1_x = torch.autograd.grad(d1, x1, grad_outputs=torch.ones_like(d1), create_graph=True)[0]
+                            d_neumann_val = torch.mean(d0_x ** 2 + d1_x ** 2).item()
                     
                     metrics = {
                         "total": pre_total,
@@ -801,6 +827,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                         "res": phys["res_loss"].item(),
                         "jump": phys["jump_loss"].item(),
                         "bc": phys["bc_loss"].item(),
+                        "d_neumann": d_neumann_val,
                         "bc_grad": phys["bc_grad_loss"].item(),
                         "rgrad": phys["rgrad"].item(),
                         "jump_rgrad": phys["jump_rgrad"].item(),
@@ -838,6 +865,15 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                 loss_sup = torch.mean((u_pred - u_init_target) ** 2)
                 mean_d = torch.mean(d_curr).item()
                 pre_total = (anchor_loss + lower + loss_sup).item()
+                
+                # Compute d_neumann for logging
+                x0 = torch.tensor([[domain[0]]], device=x_res.device, dtype=x_res.dtype, requires_grad=True)
+                x1 = torch.tensor([[domain[1]]], device=x_res.device, dtype=x_res.dtype, requires_grad=True)
+                d0 = d_net(x0)
+                d1 = d_net(x1)
+                d0_x = torch.autograd.grad(d0, x0, grad_outputs=torch.ones_like(d0), create_graph=True)[0]
+                d1_x = torch.autograd.grad(d1, x1, grad_outputs=torch.ones_like(d1), create_graph=True)[0]
+                d_neumann_val = torch.mean(d0_x ** 2 + d1_x ** 2).item()
             
             metrics = {
                 "total": pre_total,
@@ -847,6 +883,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                 "res": phys["res_loss"].item(),
                 "jump": phys["jump_loss"].item(),
                 "bc": phys["bc_loss"].item(),
+                "d_neumann": d_neumann_val,
                 "bc_grad": phys["bc_grad_loss"].item(),
                 "rgrad": phys["rgrad"].item(),
                 "jump_rgrad": phys["jump_rgrad"].item(),
@@ -943,20 +980,18 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
             data_terms = _calc_data_loss(
                 d_net, local_op, x_res, x_int, x_field, z_tensor,
                 mode, u_true, ppp, field_loss_type, d_target, smoothness_type,
+                domain=domain,
                 b0_fixed_value=b0_fixed_value
             )
             b0_star = data_terms["b0_star"]
             data_loss = data_terms["data_loss"]
             reg_smooth = data_terms["reg_smooth"]
             reg_scale = data_terms["reg_scale"]
-            upper_loss = data_loss + wreg_smooth * reg_smooth + wreg_scale * reg_scale
+            d_neumann = data_terms["d_neumann"]
+            upper_loss = data_loss + wreg_smooth * reg_smooth + wreg_scale * reg_scale + wreg_d_neumann * d_neumann
 
             # Lower level: physics loss -> local_op gradients
-            phys = _calc_physics_loss(
-                d_net, local_op, x_res, z_tensor, z_idx, alpha, mu,
-                {"w_jump": w_jump, "w_resgrad": w_resgrad, "w_bc": w_bc},
-                bc_type, domain
-            )
+            phys = _calc_physics_loss(d_net, local_op, x_res, z_tensor, z_idx, alpha, mu,{"w_jump": w_jump, "w_resgrad": w_resgrad, "w_bc": w_bc}, bc_type, domain)
             lower_loss = phys["lower_loss"]
             # Check tolerance against pure physics loss, but optimize combined loss if requested
             lower_loss_pure = lower_loss
@@ -1051,6 +1086,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                     data=data_loss.item(),
                     reg_smooth=reg_smooth.item(),
                     reg_scale=reg_scale.item(),
+                    d_neumann=d_neumann.item(),
                     lower=lower_loss.item(),
                     res=res_loss.item(),
                     jump=jump_loss.item(),
@@ -1074,6 +1110,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                         "data": data_loss.item(),
                         "reg_smooth": reg_smooth.item(),
                         "reg_scale": reg_scale.item(),
+                        "d_neumann": d_neumann.item(),
                         "lower": lower_loss.item(),
                         "res": res_loss.item(),
                         "jump": jump_loss.item(),
@@ -1093,6 +1130,7 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                         weights={
                             "wreg_smooth": wreg_smooth,
                             "wreg_scale": wreg_scale,
+                            "wreg_d_neumann": wreg_d_neumann,
                         },
                         loss_name=loss_name,
                         bc_type=bc_type,
@@ -1128,12 +1166,14 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
                         data_terms = _calc_data_loss(
                             d_net, local_op, x_res, x_int, x_field, z_tensor,
                             mode, u_true, ppp, field_loss_type, d_target, smoothness_type,
+                            domain=domain,
                             b0_fixed_value=b0_fixed_value
                         )
                         data_loss = data_terms["data_loss"]
                         reg_smooth = data_terms["reg_smooth"]
                         reg_scale = data_terms["reg_scale"]
-                        upper_loss = data_loss + wreg_smooth * reg_smooth + wreg_scale * reg_scale
+                        d_neumann = data_terms["d_neumann"]
+                        upper_loss = data_loss + wreg_smooth * reg_smooth + wreg_scale * reg_scale + wreg_d_neumann * d_neumann
                         grads_upper = torch.autograd.grad(upper_loss, d_params, create_graph=False, allow_unused=True)
                         for param, grad in zip(d_params, grads_upper):
                             if grad is not None:

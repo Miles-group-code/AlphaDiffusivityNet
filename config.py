@@ -192,6 +192,7 @@ class RegConfig:
     w_phys: float = 1.0
     w_jump: float = 1.0
     w_bc: float = 1.0
+    wreg_d_neumann: float = 0.0
     w_resgrad: float = 0.01
     wreg_smooth: float = 1e-7
     wreg_scale: float = 0.1
