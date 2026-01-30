@@ -1141,15 +1141,15 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
             # -----------------------------------------------------------------
             stop_training = False
             if step >= early_burnin:
-                total_val = total_loss.item()
+                monitor_val = upper_loss.item()
                 if best_total is None:
-                    best_total = total_val
+                    best_total = monitor_val
                     patience = 0
                 else:
                     denom = max(abs(best_total), 1e-12)
-                    improvement = (best_total - total_val) / denom
+                    improvement = (best_total - monitor_val) / denom
                     if improvement > early_tol:
-                        best_total = total_val
+                        best_total = monitor_val
                         patience = 0
                     else:
                         patience += 1
