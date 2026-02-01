@@ -87,12 +87,12 @@ class TrainingHistory:
         """Create history tracker for PINN method.
 
         Tracked metrics:
-            iter, total, data, phys, res, jump, bc, reg_smooth, reg_scale,
+            iter, total, data, phys, res, jump, bc, reg_smooth, reg_scale, d_neumann,
             b0_star, mean_d
         """
         return cls([
             "iter", "total", "data", "phys", "res", "jump", "bc",
-            "reg_smooth", "reg_scale", "b0_star", "mean_d",
+            "reg_smooth", "reg_scale", "d_neumann", "b0_star", "mean_d",
             "d_snap_iters", "d_snapshots"
         ])
 
@@ -226,6 +226,8 @@ def format_pinn_progress(
     mean_d: float,
     loss_name: str = "mse",
     bc_type: str = "dirichlet",
+    d_neumann: float = 0.0,
+    wreg_d_neumann: float = 0.0,
 ) -> str:
     """Format PINN training progress for console output.
 
@@ -247,12 +249,15 @@ def format_pinn_progress(
         mean_d: Mean D value
         loss_name: Loss type label
         bc_type: Boundary condition type (for conditional display)
+        d_neumann: D Neumann regularization (unweighted)
+        wreg_d_neumann: D Neumann regularization weight
 
     Returns:
         Formatted multi-line string for printing.
     """
     reg_smooth_eff = wreg_smooth * reg_smooth
     reg_scale_eff = wreg_scale * reg_scale
+    d_neumann_eff = wreg_d_neumann * d_neumann
     u_int = b0_star * integral_unit
     bc_str = f" | Lbc: {bc:.3e}" if bc_type == "neumann" else ""
 
@@ -260,7 +265,8 @@ def format_pinn_progress(
         f"[PINN|{phase}] Iter {step:05d} | Ltot: {total:.3e}\n"
         f"  Ldata({loss_name}): {data:.3e} | Lphys: {phys:.3e} | "
         f"RegSmooth: {reg_smooth:.3e} (eff: {reg_smooth_eff:.3e}) | "
-        f"RegScale: {reg_scale:.3e} (eff: {reg_scale_eff:.3e})\n"
+        f"RegScale: {reg_scale:.3e} (eff: {reg_scale_eff:.3e}) | "
+        f"D_Neu: {d_neumann:.3e} (eff: {d_neumann_eff:.3e})\n"
         f"  Lres: {res:.3e} | Ljump: {jump:.3e}{bc_str}\n"
         f"  b0*: {b0_star:.2f} | int_u_hat: {integral_unit:.3e} | int_u: {u_int:.3e} | mean_D: {mean_d:.3e}"
     )

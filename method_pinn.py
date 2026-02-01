@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from DenseNet import DenseNet
 from config import Config
 from data import PPPData
 import physics, varpro
@@ -51,6 +52,7 @@ class PINNData:
     x_field: Optional[torch.Tensor] = None
     u_true: Optional[torch.Tensor] = None
     ppp: Optional[PPPData] = None
+    d_true: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -66,80 +68,35 @@ class PINNResult:
     u_pred: torch.Tensor
     b0_star: float
     history: Dict[str, List[float]]
-
-
-class DNet(nn.Module):
-    """RFF-embedded MLP that parameterizes D(x) with softplus + offset."""
-
-    def __init__(
-        self, width: int = 128, use_rff: bool = True, rff_scale: float = 1.0, d_min: float = D_MIN
-    ) -> None:
-        super().__init__()
-        self.use_rff = use_rff
-        self.rff_scale = rff_scale
-        self.d_min = d_min
-        self.embed = nn.Linear(1, width)
-        if use_rff:
-            for param in self.embed.parameters():
-                param.requires_grad = False
-        self.net = nn.Sequential(
-            nn.Linear(width, width),
-            nn.SiLU(),
-            nn.Linear(width, width),
-            nn.SiLU(),
-            nn.Linear(width, 1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.view(-1, 1)
-        if self.use_rff:
-            feat = torch.sin(2.0 * torch.pi * self.rff_scale * self.embed(x))
-        else:
-            feat = self.embed(x)
-        raw = self.net(feat)
-        return F.softplus(raw) + self.d_min
+    d_net: Optional[nn.Module] = None
+    u_net: Optional[nn.Module] = None
 
 
 class LocalOperator(nn.Module):
-    """Local operator network for the unit response u_hat(x)."""
+    """Local operator network for u(x), conditioned on z."""
 
     def __init__(
         self,
-        width: int = 128,
-        use_rff: bool = True,
-        rff_scale: float = 1.0,
+        u_net: nn.Module,
         bc_type: str = "dirichlet",
     ) -> None:
         super().__init__()
-        self.use_rff = use_rff
-        self.rff_scale = rff_scale
+        self.u_net = u_net
         self.bc_type = bc_type.strip().lower()
         if self.bc_type not in {"dirichlet", "neumann"}:
             raise ValueError(f"Unsupported bc_type '{bc_type}'.")
-        self.geom_layer = nn.Linear(2, width)
-        if use_rff:
-            self.geom_layer.weight.requires_grad = False
-            if self.geom_layer.bias is not None:
-                self.geom_layer.bias.requires_grad = False
-        self.hidden = nn.ModuleList([nn.Linear(width, width) for _ in range(3)])
-        self.output = nn.Linear(width, 1)
-        self.activation = F.silu
 
     def forward(self, x: torch.Tensor, z_known: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = x.view(-1, 1)
         phi_z = torch.abs(x - z_known)
         if phi_z.is_leaf and not phi_z.requires_grad:
             phi_z.requires_grad_(True)
-        geom_in = torch.cat([x, phi_z], dim=1)
-        geom_lin = self.geom_layer(geom_in)
-        if self.use_rff:
-            h = self.activation(torch.sin(2.0 * torch.pi * self.rff_scale * geom_lin))
-        else:
-            h = self.activation(geom_lin)
-        for layer in self.hidden:
-            h = self.activation(layer(h))
-        u_raw = self.output(h)
+        # Input: x and distance to source
+        net_in = torch.cat([x, phi_z], dim=1)
+        u_raw = self.u_net(net_in)
+        
         u_pos = F.softplus(u_raw)
+        
         if self.bc_type == "dirichlet":
             u = u_pos * x * (1.0 - x)
         else:
@@ -265,6 +222,7 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
     w_jump = cfg.reg.w_jump
     w_bc = cfg.reg.w_bc
     wreg_smooth, wreg_scale = cfg.reg.wreg_smooth, cfg.reg.wreg_scale
+    wreg_d_neumann = cfg.reg.wreg_d_neumann
     smoothness_type = cfg.reg.smoothness_type
 
     # Training
@@ -285,9 +243,17 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
 
     # Architecture
     d_min = getattr(cfg.arch, "d_min", D_MIN)
-    rff_scale = getattr(cfg.arch, "rff_scale", 1.0)
-    rff_width = cfg.arch.rff_width
     use_rff = cfg.arch.use_rff
+    
+    d_net_arch = cfg.arch.d_net_arch
+    d_net_depth = cfg.arch.d_net_depth
+    d_net_width = cfg.arch.d_net_width
+    d_net_rff_scale = cfg.arch.d_net_rff_scale
+    siren_omega0 = cfg.arch.siren_omega0
+
+    u_net_arch = cfg.arch.u_net_arch
+    u_net_depth = cfg.arch.u_net_depth
+    u_net_width = cfg.arch.u_net_width
 
     # Grid
     n_int = cfg.grid.n_int
@@ -368,11 +334,40 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
     # =========================================================================
     # MODEL INITIALIZATION
     # =========================================================================
-    d_net = DNet(
-        width=rff_width, use_rff=use_rff, rff_scale=rff_scale, d_min=d_min
+    fix_endpoint = cfg.arch.fix_endpoint
+    if fix_endpoint:
+        lambda_transform = lambda x, u: d_target + u * x * (1.0 - x)
+    else:
+        lambda_transform = lambda x, u: F.softplus(u) + D_MIN
+
+    d_net = DenseNet(
+        input_dim=1,
+        output_dim=1,
+        act='silu',
+        width=d_net_width,
+        depth=d_net_depth,
+        arch=d_net_arch,
+        fourier=use_rff,
+        sigma=d_net_rff_scale,
+        omega_0=siren_omega0,
+        lambda_transform=lambda_transform,
     ).to(device=device, dtype=dtype)
+
+    # u_net handles x and phi_z, so input_dim=2
+    u_net_inner = DenseNet(
+        input_dim=2,
+        output_dim=1,
+        act='silu',
+        width=u_net_width,
+        depth=u_net_depth,
+        arch=u_net_arch,
+        fourier=use_rff,
+        sigma=4.0
+    )
+    
     u_net = LocalOperator(
-        width=rff_width, use_rff=use_rff, rff_scale=rff_scale, bc_type=bc_type
+        u_net=u_net_inner,
+        bc_type=bc_type
     ).to(device=device, dtype=dtype)
 
     # =========================================================================
@@ -488,15 +483,25 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
 
         reg_scale = physics.scale_anchor(d_reg, d_target)
 
+        # D Neumann regularization
+        x0 = torch.tensor([[domain[0]]], device=x_res.device, dtype=x_res.dtype, requires_grad=True)
+        x1 = torch.tensor([[domain[1]]], device=x_res.device, dtype=x_res.dtype, requires_grad=True)
+        d0 = d_net(x0)
+        d1 = d_net(x1)
+        d0_x = torch.autograd.grad(d0, x0, grad_outputs=torch.ones_like(d0), create_graph=True)[0]
+        d1_x = torch.autograd.grad(d1, x1, grad_outputs=torch.ones_like(d1), create_graph=True)[0]
+        d_neumann = torch.mean(d0_x ** 2 + d1_x ** 2)
+
         total_loss = (
             w_data * data_loss
             + phys_loss
             + wreg_smooth * reg_smooth
             + wreg_scale * reg_scale
+            + wreg_d_neumann * d_neumann
         )
         return (
             total_loss, data_loss, phys_loss, res_loss, jump_loss, bc_loss,
-            reg_smooth, reg_scale, b0_star, d_reg, integral_unit
+            reg_smooth, reg_scale, b0_star, d_reg, integral_unit, d_neumann
         )
 
     # =========================================================================
@@ -510,7 +515,7 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
             # Forward pass
             (
                 total_loss, data_loss, phys_loss, res_loss, jump_loss, bc_loss,
-                reg_smooth, reg_scale, b0_star, d_reg, integral_unit
+                reg_smooth, reg_scale, b0_star, d_reg, integral_unit, d_neumann
             ) = _compute_losses()
 
             # -----------------------------------------------------------------
@@ -537,6 +542,7 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
                     reg_scale=reg_scale.item(),
                     b0_star=b0_star.item(),
                     mean_d=mean_d,
+                    d_neumann=d_neumann.item(),
                 )
                 history.log_snapshot(step, d_snapshot)
 
@@ -560,6 +566,8 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
                         mean_d=mean_d,
                         loss_name=loss_name,
                         bc_type=bc_type,
+                        d_neumann=d_neumann.item(),
+                        wreg_d_neumann=wreg_d_neumann,
                     ))
 
             # -----------------------------------------------------------------
@@ -633,4 +641,6 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
         u_pred=u_pred.detach().cpu().view(-1),
         b0_star=float(b0_star.item()),
         history=history.to_dict(),
+        d_net=d_net,
+        u_net=u_net,
     )
