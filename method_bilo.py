@@ -144,10 +144,10 @@ def evaluate_bilo(
     d = d_net(x)
     d_list = [d]
     
-    order = getattr(local_op, "order", 2)
+    
     
     curr_d = d
-    for _ in range(order):
+    for _ in range(local_op.order):
         curr_d = torch.autograd.grad(curr_d, x, grad_outputs=torch.ones_like(curr_d), create_graph=True)[0]
         d_list.append(curr_d)
 
@@ -529,20 +529,24 @@ def _calc_physics_loss(
     if w_resgrad > 0.0:
         total_rgrad = 0.0
         for i, d_term in enumerate(d_pde_list):
-             g = torch.autograd.grad(residual, d_term, grad_outputs=torch.ones_like(residual), create_graph=True, allow_unused=True)[0]
-             if g is not None:
-                 term_loss = torch.mean(g ** 2)
-                 total_rgrad = total_rgrad + term_loss
-                 extra_metrics[f"rgrad_d{i}"] = term_loss
+            g = torch.autograd.grad(residual, d_term, grad_outputs=torch.ones_like(residual), create_graph=True, allow_unused=True)[0]
+            # correction of r==1
+            if i==1:
+                u_x_f = torch.autograd.grad(u_hat_pde, d_pde, grad_outputs=torch.ones_like(u_hat_pde), create_graph=True)[0]
+                g = g + d_pde * u_x_f
+
+            term_loss = torch.mean(g ** 2)
+            total_rgrad = total_rgrad + term_loss
+            extra_metrics[f"rgrad_d{i}"] = term_loss
+                 
         
         total_jump_rgrad = 0.0
         for i, d_term in enumerate(d_z_list):
-             g = torch.autograd.grad(jump_res, d_term, grad_outputs=torch.ones_like(jump_res), create_graph=True, allow_unused=True)[0]
-             if g is not None:
-                 term_loss = torch.mean(g ** 2)
-                 total_jump_rgrad = total_jump_rgrad + term_loss
-                 extra_metrics[f"jump_rgrad_d{i}"] = term_loss
-        
+            g = torch.autograd.grad(jump_res, d_term, grad_outputs=torch.ones_like(jump_res), create_graph=True, allow_unused=True)[0]
+            term_loss = torch.mean(g ** 2)
+            total_jump_rgrad = total_jump_rgrad + term_loss
+            extra_metrics[f"jump_rgrad_d{i}"] = term_loss
+    
         rgrad = total_rgrad
         jump_rgrad = total_jump_rgrad
 
