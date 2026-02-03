@@ -304,7 +304,7 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
             d_max=ddi_d_max,
         )
     else:
-        d_ddi = 1.0
+        d_ddi = float(cfg.d_profile.params[0])
 
     if scalar_fit_iters > 0:
         d_scale = fit_constant_d(
