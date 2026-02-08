@@ -1,0 +1,58 @@
+# YAML for running experiments with ExpScheduler.py
+
+# 1. Define anchors for shared configuration
+_logging: &logging
+  # Logging settings
+  log: "wandb.enabled true wandb.project AlphaDiffusivityNet run.outdir runs/sweep_results"
+
+_common: &common
+  # Physics and Data
+  physics: "physics.alpha 1.0 physics.mu 5.0 physics.b_true 100.0 physics.sources 0.5 physics.bc_type neumann"
+  data: " data.mode particles data.field_loss mse data.m_obs 1000 grid.n_res 201 run.seed 42"
+  # data.b0_fixed_value 100.0
+  
+  # Method and Architecture
+  d_profile: "d_profile.use_ddi True d_profile.pert_scale 0.0 d_profile.pert_freq 2.0 d_profile.profile_type cos"
+  arch: "arch.d_net_arch mlp arch.d_net_width 64 arch.d_net_depth 3 arch.d_net_rff_scale 5.0 arch.u_net_arch mmlp arch.u_net_width 256 fix_endpoint false arch.bilo_order 1"
+  
+  # Training
+  lr: "train.lower_tol 0.01 train.lr_d_pre 0.001 train.lr_lower_pre 0.001 train.lr_d_fine 1e-4 train.lr_lower_fine 1e-4 train.use_scheduler false "
+  train: "train.log_every 10 train.scalar_fit_iters 0 train.pretrain_iters 1000 train.finetune_iters 5000"
+  
+  # Regularization
+  reg: "reg.wreg_smooth 1e-3 reg.wreg_scale 1e-3 reg.w_jump 1.0 reg.w_resgrad 0.01 reg.w_bc 1.0 wreg_d_neumann 1.0 reg.smoothness_type h1"
+
+# 2. Define Experiments
+# Structure: Group -> Run -> Params
+_methods: &methods
+  pinn:
+    solver: "solver.method pinn"
+  bilo:
+    solver: "solver.method bilo"
+  dto:
+    solver: "solver.method dto"
+
+step_neu:
+  # This group_name will be passed to run.py and used for wandb.group / output folder
+  group: "group compare_step_ddi"
+  # Mixin logging and common settings
+  <<: *logging
+  <<: *common
+  freq05:
+    dparam: "d_profile.params 0.1,0.05,0.5"
+    <<: *methods
+  freq1:
+    dparam: "d_profile.params 0.1,0.05,1"
+    <<: *methods
+  freq15:
+    dparam: "d_profile.params 0.1,0.05,1.5"
+    <<: *methods
+  freq2:
+    dparam: "d_profile.params 0.1,0.05,2"
+    <<: *methods
+  freq25:
+    dparam: "d_profile.params 0.1,0.05,2.5"
+    <<: *methods
+  freq3:
+    dparam: "d_profile.params 0.1,0.05,3"
+    <<: *methods
