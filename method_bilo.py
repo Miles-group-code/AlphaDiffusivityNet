@@ -532,8 +532,17 @@ def _calc_physics_loss(
             g = torch.autograd.grad(residual, d_term, grad_outputs=torch.ones_like(residual), create_graph=True, allow_unused=True)[0]
             # correction of r==1
             if i==1:
-                u_x_f = torch.autograd.grad(u_hat_pde, d_pde, grad_outputs=torch.ones_like(u_hat_pde), create_graph=True)[0]
-                g = g + d_pde * u_x_f
+                u_d = torch.autograd.grad(u_hat_pde, d_pde, grad_outputs=torch.ones_like(u_hat_pde), create_graph=True)[0]
+                
+                # 2. Compute v_D' (sensitivity of u_x to D)
+                u_x_d = torch.autograd.grad(u_x, d_pde, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
+                
+                # 3. Apply the full correction formula:
+                # Correction = D' * v_D  +  2 * D * v_D'
+                # (d_term is d_x/D')
+                correction = (d_term * u_d) + (2.0 * d_pde * u_x_d)
+                
+                g = g + correction
 
             term_loss = torch.mean(g ** 2)
             total_rgrad = total_rgrad + term_loss
