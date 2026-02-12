@@ -103,10 +103,9 @@ class LocalOperator(nn.Module):
         phi_z.requires_grad_(True)
         
         scaled_d = []
-        for i, d_tens in enumerate(d_list):
-            if i > self.order:
-                break
-            scaled_d.append(d_tens.view(-1, 1))
+        for i in range(self.order+1):
+            scale = 10**i
+            scaled_d.append(d_list[i].view(-1, 1)/scale)
             
         input_list = [x] + scaled_d + [phi_z]
         input = torch.cat(input_list, dim=1)
@@ -142,8 +141,6 @@ def evaluate_bilo(
 
     d = d_net(x)
     d_list = [d]
-    
-    
     
     curr_d = d
     for _ in range(local_op.order):
@@ -492,13 +489,12 @@ def _calc_physics_loss(
     
     d_pde_list, u_hat_pde, _ = evaluate_bilo(local_op, d_net, z_tensor, x_pde)
     d_pde = d_pde_list[0]
-    d_x = d_pde_list[1]
-    d_xx = d_pde_list[2]
     
     u_x = torch.autograd.grad(u_hat_pde, x_pde, grad_outputs=torch.ones_like(u_hat_pde), create_graph=True)[0]
     u_xx = torch.autograd.grad(u_x, x_pde, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
-    residual = d_pde * u_xx + (2-alpha) * d_pde_list[1] * u_x + (1-alpha) * u_hat_pde * d_pde_list[2] - mu * u_hat_pde
-    
+    residual = d_pde * u_xx + (2-alpha) * d_pde_list[1] * u_x  - mu * u_hat_pde
+    if alpha != 1.0:
+        residual = residual + (1-alpha) * u_hat_pde * d_pde_list[2]
     
     n = residual.shape[0]
     res_loss = torch.mean(residual ** 2)
@@ -541,13 +537,12 @@ def _calc_physics_loss(
                 
                 g = g + correction
             
-            if i == 2:
+            if alpha != 1.0 and i == 2:
                 # correction  = D * (2 u_x_d' + u_d) + (2-alpha) u_x_d
-                
-                u_dp = torch.autograd.grad(u_x, d_pde_list[1], grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
-                u_dp_x = torch.autograd.grad(u_dp, x_pde, grad_outputs=torch.ones_like(u_dp), create_graph=True)[0]
+                u_x_dx = torch.autograd.grad(u_x, d_pde_list[1], grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
+                u_dx = torch.autograd.grad(u_hat_pde, d_pde_list[1], grad_outputs=torch.ones_like(u_hat_pde), create_graph=True)[0]
 
-                correction = d_pde_list[0] * (2.0 * u_dp_x + u_d) + (2-alpha) * u_x_d
+                correction = d_pde_list[0] * (2.0 * u_x_dx + u_d) + (2-alpha) * u_dx
                 g = g + correction
 
             term_loss = torch.mean(g ** 2)

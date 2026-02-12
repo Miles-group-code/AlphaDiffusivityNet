@@ -722,17 +722,24 @@ def plot_d_evolution_color(
     if not snaps:
         return None
     
+    # Subsample to 10 evenly spaced snapshots
+    n_total = len(snaps)
+    if n_total > 10:
+        indices = np.linspace(0, n_total - 1, 10, dtype=int)
+        snaps = [snaps[i] for i in indices]
+        iters = [iters[i] for i in indices]
+    n_snaps = len(snaps)
+    
     # Debug: print snapshot info
-    if len(snaps) == 1:
+    if n_snaps == 1:
         print(f"Warning: Only 1 snapshot found in history (iter {iters[0] if iters else 'unknown'})")
     else:
-        print(f"Plotting {len(snaps)} snapshots from iterations: {iters[:5]}{'...' if len(iters) > 5 else ''}")
+        print(f"Plotting {n_snaps} snapshots from iterations: {iters[:5]}{'...' if len(iters) > 5 else ''}")
     
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.set_title(f"D(x) evolution: {name}")
     
     # Sample colors evenly from viridis colormap
-    n_snaps = len(snaps)
     cmap = plt.cm.viridis
     colors = [cmap(i / max(n_snaps - 1, 1)) for i in range(n_snaps)]
     
