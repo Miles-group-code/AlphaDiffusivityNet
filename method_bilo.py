@@ -542,7 +542,7 @@ def _calc_physics_loss(
                 u_x_dx = torch.autograd.grad(u_x, d_pde_list[1], grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
                 u_dx = torch.autograd.grad(u_hat_pde, d_pde_list[1], grad_outputs=torch.ones_like(u_hat_pde), create_graph=True)[0]
 
-                correction = d_pde_list[0] * (2.0 * u_x_dx + u_d) + (2-alpha) * u_dx
+                correction = d_pde_list[0] * (2.0 * u_x_dx + u_d) + (2-alpha) * d_pde_list[1] * u_dx
                 g = g + correction
 
             term_loss = torch.mean(g ** 2)
