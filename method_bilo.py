@@ -493,9 +493,8 @@ def _calc_physics_loss(
     
     u_x = torch.autograd.grad(u_hat_pde, x_pde, grad_outputs=torch.ones_like(u_hat_pde), create_graph=True)[0]
     u_xx = torch.autograd.grad(u_x, x_pde, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
-    residual = d_pde * u_xx + (2-alpha) * d_pde_list[1] * u_x  - mu * u_hat_pde
-    if alpha != 1.0:
-        residual = residual + (1-alpha) * u_hat_pde * d_pde_list[2]
+    residual = d_pde * u_xx + (2-alpha) * d_pde_list[1] * u_x + (1-alpha) * u_hat_pde * d_pde_list[2]  - mu * u_hat_pde
+    
     
     n = residual.shape[0]
     res_loss = torch.mean(residual ** 2)
@@ -738,11 +737,17 @@ def fit(data_bundle: BiLOData, cfg: Config, verbose: bool = True) -> BiLOResult:
     # =========================================================================
     d_init_profile = _init_d_profile(x_res.view(-1), base=d_scale, scale=pert_scale, freq=pert_freq).view(-1, 1)
 
-    fix_endpoint = cfg.arch.fix_endpoint
-    if fix_endpoint:
+    # Determine lambda_transform based on d_transform option
+    d_transform = cfg.arch.d_transform
+    if d_transform == "fix_end":
         lambda_transform = lambda x, u: d_target + u * x * (1.0 - x)
+    elif d_transform == "soft_plus":
+        d_min = getattr(cfg.arch, "d_min", D_MIN)
+        lambda_transform = lambda x, u: F.softplus(u) + d_min
+    elif d_transform == "exp":
+        lambda_transform = lambda x, u: torch.exp(u)
     else:
-        lambda_transform = lambda x, u: F.softplus(u) + D_MIN
+        raise ValueError(f"Unknown d_transform: {d_transform}. Must be one of: 'fix_end', 'soft_plus', 'exp'")
 
     d_net = DenseNet(
         input_dim=1,

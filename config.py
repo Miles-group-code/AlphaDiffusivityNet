@@ -221,7 +221,7 @@ class ArchConfig:
     d_net_width: int = 128
     d_net_rff_scale: float = 1.0  # Frequency multiplier for RFF (higher = sharper features)
     siren_omega0: float = 30.0
-    fix_endpoint: bool = False
+    d_transform: Literal["fix_end", "soft_plus", "exp"] = "exp"  # Transformation for d_net: "fix_end" fixes endpoint at d_target, "soft_plus" uses F.softplus(u) + d_min, "exp" uses torch.exp(u)
     bilo_order: int = 1  # Highest order of derivative of D to use (0=D only, 1=D,D', 2=D,D',D'')
 
     u_net_arch: Literal["mlp", "pirate", "mmlp", "siren", "fourier", "grid"] = "mlp"
@@ -230,6 +230,8 @@ class ArchConfig:
 
     def validate(self) -> None:
         """Validate architecture settings."""
+        if self.d_transform not in {"fix_end", "soft_plus", "exp"}:
+            raise ValueError(f"d_transform must be one of 'fix_end', 'soft_plus', 'exp', got '{self.d_transform}'")
         return
 
 
@@ -238,7 +240,7 @@ class RunConfig:
     """Runtime settings such as device, dtype, and output directory."""
 
     seed: int = 42
-    device: str = "cpu"
+    device: str = "cuda:0"
     dtype: str = "float64"
     outdir: str = "runs"
     name: str | None = None
