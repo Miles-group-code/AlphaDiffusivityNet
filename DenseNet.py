@@ -47,6 +47,8 @@ class SineLayer(nn.Module):
         return torch.sin(self.omega_0 * self.linear(input))
 
 class SirenNet(nn.Module):
+    # Sitzmann, V., Martel, J.N.P., Bergman, A.W., Lindell, D.B., Wetzstein, G., 2020. Implicit Neural Representations with Periodic Activation Functions. https://doi.org/10.48550/arXiv.2006.09661
+
     def __init__(self, input_size, width, depth, output_dim, omega_0=30.0, output_transform=lambda x,u: u):
         super().__init__()
         self.output_transform = output_transform
@@ -239,6 +241,8 @@ class PirateBlock(nn.Module):
         return self.alpha * h + (1 - self.alpha) * x
 
 class PirateNet(nn.Module):
+    # Wang, S., Li, B., Chen, Y., Perdikaris, P., 2024. PirateNets: Physics-informed Deep Learning with Residual Adaptive Networks. https://doi.org/10.48550/arXiv.2402.00326
+
     def __init__(self, 
                   input_size:int,
                   width:int, 
@@ -294,6 +298,8 @@ class PirateNet(nn.Module):
         return u
 
 class ModifiedMLP(nn.Module):
+    # Wang, S., Sankaran, S., Perdikaris, P., 2024. Respecting causality for training physics-informed neural networks. Computer Methods in Applied Mechanics and Engineering 421, 116813. https://doi.org/10.1016/j.cma.2024.116813
+
     def __init__(self, 
                   input_size:int,
                   width:int, 

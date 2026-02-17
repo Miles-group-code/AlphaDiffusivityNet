@@ -99,7 +99,6 @@ solution = solve(problem, method="pinn", optimizer="lbfgs")  # Available but not
 ```
 
 Note: For PINN/BiLO, the pretrain phase always uses Adam to warm up the networks before finetuning.
-
 ## Usage
 
 ### Quick Start
@@ -151,6 +150,74 @@ solution = solve(problem, method="pinn", **settings)
 *   **Small D values (PINN/BiLO):** Softplus parameterization has gradient suppression proportional to D. At D = 0.01, gradients are ~100x weaker than at D = 1. If your nondimensional D is small (e.g., D/μ ≈ 0.01), use DTO or increase training iterations. See `README.md` troubleshooting for details.
 *   **Single source only:** Multi-source support is planned but not yet implemented.
 
+## Running Experiments
+
+### 1. Command Line Interface (CLI)
+You can run single experiments using `run.py`. Arguments can be provided in `key value` pairs.
+
+The keys can be either full paths or shortcuts.
+*   **Full paths**: `python run.py physics.b_true 100.0`
+*   **Shortcuts**: `python run.py b_true 100.0` (works if `b_true` is unique in the config)
+
+**Examples:**
+```bash
+python run.py method bilo alpha 1.0 train.lr_d_fine 1e-3 reg.wreg_smooth 1e-4
+
+```
+
+### 2. Batch Experiments
+For running many experiments (for example, different methods), use `runexp.py` with a YAML file.
+This script manages a queue of experiments and distributes them across available GPUs.
+
+**Usage:**
+```bash
+python runexp.py fic_all.yaml
+```
+**Example YAML File:**
+The nested YAML structure will be flattened into a list of experiments.
+
+```yaml
+# 1. Define reusable blocks (anchors) starting with _
+_common: &common
+  physics: "alpha 1.0 mu 5.0"
+  lr: "train.lr_lower_pre 1e-4 "
+
+_methods: &methods
+  pinn:
+    solver: "method pinn"
+  bilo:
+    solver: "method bilo"
+
+# 2. Define Experiment Groups
+fickian:
+  group: "group fic_sweep"  # Sets wandb group
+  <<: *common               # Inherits common settings
+  
+  freq05:
+    dparam: "params 0.1,0.05,0.5"
+    <<: *methods            # Expands to pinn and bilo
+  freq1:
+    dparam: "params 0.1,0.05,1"
+    <<: *methods
+```
+
+**This generates the following experiments:**
+
+| Run Name | Combined Arguments (Simplified) |
+| :--- | :--- |
+| `fickian_freq05_pinn` | `group fic_sweep alpha 1.0 mu 5.0 train.lr_lower_pre 1e-4  params 0.1,0.05,0.5 method pinn` |
+| `fickian_freq05_bilo` | `group fic_sweep alpha 1.0 mu 5.0 train.lr_lower_pre 1e-4  params 0.1,0.05,0.5 method bilo` |
+| `fickian_freq1_pinn` | `group fic_sweep alpha 1.0 mu 5.0 train.lr_lower_pre 1e-4  params 0.1,0.05,1 method pinn` |
+| `fickian_freq1_bilo` | `group fic_sweep alpha 1.0 mu 5.0 train.lr_lower_pre 1e-4  params 0.1,0.05,1 method bilo` |
+
+This hierarchical structure allows you to define shared physics/training settings once (`*common`), and then run multiple experiments with different parameters or solvers.
+
+### 3. Weights & Biases (WandB)
+WandB is used for logging loss histories and visualizations.
+
+Pass `wandb.enabled true` will enable wandb logging. Various options can be set in the config.WandBConfig.
+If wandb is not installed, it will log to the local directory `runs/[run_name]/`.
+
 ## Repository Structure
 
 *   `interface.py`: **Main Entry Point**. High-level API for defining problems and running solvers.
@@ -165,6 +232,10 @@ solution = solve(problem, method="pinn", **settings)
     *   `method_bilo.py`: BiLO implementation.
 *   `training_logger.py`: Training history tracking and progress formatters.
 *   `diagnostics.py`: Plotting and metric calculation tools.
+*   `run.py`: **CLI Entry Point**. Runs a single experiment from command line arguments.
+*   `runexp.py`: **Batch Runner**. Executes multiple experiments defined in a YAML file, handling GPU allocation.
+*   `DenseNet.py`: Contains all neural network definitions (MLP, Siren, etc.) shared by BiLO and PINN.
+
 
 ## License
 

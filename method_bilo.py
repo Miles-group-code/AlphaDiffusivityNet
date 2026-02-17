@@ -391,6 +391,7 @@ def _compute_bc_loss_neumann(
     total_bc_grad_loss = torch.tensor(0.0, device=device, dtype=dtype)
     bc_grad_details = {}
 
+    # Compute gradient of neumann bc w.r.t d, d_x, d_xx, etc.
     for i in range(local_op.order+1):
         d0_term = d0_list[i]
         d1_term = d1_list[i]
@@ -522,25 +523,23 @@ def _calc_physics_loss(
     extra_metrics = {}
     extra_metrics.update(bc_grad_details)
 
+    # Gradient of residua and jump condition w.r.t d, d_x, d_xx, etc.
     if w_resgrad > 0.0:
         total_rgrad = 0.0
         for i in range(local_op.order+1):
             g = torch.autograd.grad(residual, d_pde_list[i], grad_outputs=torch.ones_like(residual), create_graph=True, allow_unused=True)[0]
             # correction of r==1
             if i==1:
+                # Correction = D * (2 * u_x_d) + (2-alpha) D' * u_d
                 u_d = torch.autograd.grad(u_hat_pde, d_pde, grad_outputs=torch.ones_like(u_hat_pde), create_graph=True)[0]
-                
-                # 2. Compute v_D' (sensitivity of u_x to D)
                 u_x_d = torch.autograd.grad(u_x, d_pde, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
                 
-                # 3. Apply the full correction formula:
-                # Correction = D * (2 * u_x_d) + (2-alpha) D' * u_d
                 correction = d_pde_list[0] * (2.0 * u_x_d) + (2-alpha) * d_pde_list[1] * u_d
                 
                 g = g + correction
             
             if alpha != 1.0 and i == 2:
-                # correction  = D * (2 u_x_d' + u_d) + (2-alpha) u_x_d
+                # correction  = D * (2 u_x_d' + u_d) + (2-alpha) u_dx
                 u_x_dx = torch.autograd.grad(u_x, d_pde_list[1], grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
                 u_dx = torch.autograd.grad(u_hat_pde, d_pde_list[1], grad_outputs=torch.ones_like(u_hat_pde), create_graph=True)[0]
 
