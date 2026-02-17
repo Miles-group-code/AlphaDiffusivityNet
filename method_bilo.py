@@ -391,7 +391,9 @@ def _compute_bc_loss_neumann(
     total_bc_grad_loss = torch.tensor(0.0, device=device, dtype=dtype)
     bc_grad_details = {}
 
-    for i, (d0_term, d1_term) in enumerate(zip(d0_list, d1_list)):
+    for i in range(local_op.order+1):
+        d0_term = d0_list[i]
+        d1_term = d1_list[i]
         g0 = torch.autograd.grad(u0_x, d0_term, grad_outputs=torch.ones_like(u0), create_graph=True)[0]
         g1 = torch.autograd.grad(u1_x, d1_term, grad_outputs=torch.ones_like(u1), create_graph=True)[0]
         

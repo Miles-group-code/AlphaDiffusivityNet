@@ -334,11 +334,17 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
     # =========================================================================
     # MODEL INITIALIZATION
     # =========================================================================
-    fix_endpoint = cfg.arch.fix_endpoint
-    if fix_endpoint:
+    # Determine lambda_transform based on d_transform option
+    d_transform = cfg.arch.d_transform
+    if d_transform == "fix_end":
         lambda_transform = lambda x, u: d_target + u * x * (1.0 - x)
+    elif d_transform == "soft_plus":
+        d_min = getattr(cfg.arch, "d_min", D_MIN)
+        lambda_transform = lambda x, u: F.softplus(u) + d_min
+    elif d_transform == "exp":
+        lambda_transform = lambda x, u: torch.exp(u)
     else:
-        lambda_transform = lambda x, u: F.softplus(u) + D_MIN
+        raise ValueError(f"Unknown d_transform: {d_transform}. Must be one of: 'fix_end', 'soft_plus', 'exp'")
 
     d_net = DenseNet(
         input_dim=1,
