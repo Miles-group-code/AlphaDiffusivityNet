@@ -78,7 +78,7 @@ The physics and domain settings are fully configurable via the `Problem` interfa
 
 ### Variable Projection (VarPro)
 All methods use **Variable Projection** to handle the unknown source amplitude $b_0$. Instead of optimizing $b_0$ via gradient descent, we compute its optimal value $b_0^*$ in closed form at every step:
-*   For **MSE**: $b_0^* = \frac{\langle u_{data}, \hat{u}_{unit} \rangle}{\|\hat{u}_{unit}\|^2}$
+*   For **MSE**: $b_0^* = \frac{\langle u_{data}, \hat{u}_{unit} \rangle}{\lVert\hat{u}_{unit}\rVert^2}$
 *   For **RLE**: Weighted Least Squares solution.
 *   For **Particles**: $b_0^* = \frac{N_{particles}}{M_{SNAPSHOTS} \int \hat{u}_{unit} dx}$
 
