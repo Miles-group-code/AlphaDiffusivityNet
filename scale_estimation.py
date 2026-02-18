@@ -185,15 +185,20 @@ def fit_constant_d(
             d_const.clamp_(min=D_MIN)
 
         # Track best solution (loss may not decrease monotonically due to Adam momentum)
+        # sometimes get D_min accidentally
         loss_value = float(loss.item())
-        if loss_value < best_loss:
-            best_loss = loss_value
-            best_d = float(d_const.item())
+        # if loss_value < best_loss:
+        #     best_loss = loss_value
+        #     best_d = float(d_const.item())
 
         if verbose and step % 100 == 0:
             print(
                 f"[scalar_fit] iter {step}: D={float(d_const.item()):.6f}, loss={loss_value:.6e}"
             )
+
+        # take the last value
+        best_d = float(d_const.item())
+        best_loss = float(loss.item())
 
     if verbose:
         print(f"[scalar_fit] Final: D={best_d:.6f}, loss={best_loss:.6e}")
