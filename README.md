@@ -27,8 +27,7 @@ This repository implements three distinct solvers, each with different parameter
     *   Uses direct parameterization ($D = \theta + D_{min}$, projected) to avoid gradient suppression.
 
 ### 2. PINN (Physics-Informed Neural Network)
-*   **Mechanism**: Parameterizes both $D(x)$ and $u(x)$ as separate neural networks (`DNet` and `LocalOperator`). The networks are trained jointly to minimize a composite loss:
-$$\mathcal{L} = \mathcal{L}_{data} + \mathcal{L}_{physics}$$
+*   **Mechanism**: Parameterizes both $D(x)$ and $u(x)$ as separate neural networks (`DNet` and `LocalOperator`). The networks are trained jointly to minimize a composite data-plus-physics loss.
 *   **Key Properties**:
     *   Continuous neural network representation of $D(x)$ and $u(x)$.
     *   Uses a "flux-form" residual loss to handle the $\alpha$-differentiation.
@@ -52,7 +51,7 @@ The physics and domain settings are fully configurable via the `Problem` interfa
 
 *   **`alpha`**: Stochastic interpretation ($0.0$ to $1.0$).
 *   **`mu`**: Degradation rate (controls the exponential decay length scale).
-*   **`d_profile`**: Shape of the ground truth D(x) (e.g., "sinusoidal", "steps").
+*   **`d_profile`**: Shape of the ground truth D(x) (`"sinusoidal"`, `"cos"`, or `"steps"`). The sinusoidal and cos profiles are sine- and cosine-phased oscillations respectively; cos has its maximum at x=0.
     *   *Note*: The "steps" profile applies a random phase shift to avoid grid alignment.
 *   **`bc_type`**: Boundary conditions (`dirichlet` or `neumann`). Neumann (zero-flux) BCs are only implemented for `alpha=1` (Fickian); other alpha values will print a warning about non-identifiability.
 *   **`sources`**: Location(s) of the point source(s) $z$.
@@ -66,9 +65,11 @@ The physics and domain settings are fully configurable via the `Problem` interfa
 *   **`particles`**: Learning from discrete particle snapshots (Poisson Point Process).
 
 ### Loss Functions
-*   **`mse`**: Mean Squared Error (Standard for dense, Gaussian-noise field data).
+Set via `field_loss` in `solve()`. Options for field mode:
+*   **`mse`**: Mean Squared Error (standard for dense, Gaussian-noise field data).
 *   **`rle`**: Relative Log Error ($\|\log u - \log \hat{u}\|^2$). Robust for fields that span many orders of magnitude (common in diffusion-death).
-*   **`nll`**: Negative Log Likelihood. The statistically correct loss for particle/count data (Poisson process).
+
+For particle mode, the Negative Log Likelihood (Poisson process NLL) is applied automatically and cannot be changed.
 
 ### Regularization
 *   **Smoothness**:
@@ -78,10 +79,15 @@ The physics and domain settings are fully configurable via the `Problem` interfa
     *   **`wreg_scale`**: Penalizes deviation of the mean log-diffusivity from a prior (derived via scalar fit seeded by DDI), preventing amplitude-diffusivity ambiguity.
 
 ### Variable Projection (VarPro)
-All methods use **Variable Projection** to handle the unknown source amplitude $b_0$. Instead of optimizing $b_0$ via gradient descent, we compute its optimal value $b_0^*$ in closed form at every step:
-*   For **MSE**: $b_0^* = \frac{\langle u_{data}, \hat{u}_{unit} \rangle}{\lVert\hat{u}_{unit}\rVert^2}$
-*   For **RLE**: Weighted Least Squares solution.
-*   For **Particles**: $b_0^* = \frac{N_{particles}}{M_{SNAPSHOTS} \int \hat{u}_{unit} dx}$
+All methods use **Variable Projection** to handle the unknown source amplitude $b_0$. Instead of optimizing $b_0$ via gradient descent, we compute its optimal value $b_0^*$ in closed form at every step. Here $u_d$ is the observed data field and $\hat{u}_0$ is the PDE solution with unit amplitude.
+
+For **MSE**:
+
+$$b_0^* = \frac{\langle u_d,\, \hat{u}_0 \rangle}{\lVert\hat{u}_0\rVert^2}$$
+
+For **RLE**: Weighted Least Squares solution. For **Particles** ($N$ particles, $M$ snapshots):
+
+$$b_0^* = \frac{N}{M \int \hat{u}_0 \, dx}$$
 
 **Fixed b0 mode:** When the source amplitude is known a priori (e.g., from experimental calibration), you can bypass VarPro by setting `b0_fixed_value` in `solve()`. This eliminates the amplitude-diffusivity ambiguity.
 

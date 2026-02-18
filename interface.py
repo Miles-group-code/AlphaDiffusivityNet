@@ -830,7 +830,7 @@ def solve(
     if use_rff is not None:
         config.arch.use_rff = use_rff
     if rff_scale is not None:
-        config.arch.rff_scale = rff_scale
+        config.arch.d_net_rff_scale = rff_scale
     if early_burnin is not None:
         config.train.early_burnin = early_burnin
     if early_patience is not None:
