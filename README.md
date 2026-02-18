@@ -236,7 +236,3 @@ If wandb is not installed, it will log to the local directory `runs/[run_name]/`
 *   `runexp.py`: **Batch Runner**. Executes multiple experiments defined in a YAML file, handling GPU allocation.
 *   `DenseNet.py`: Contains all neural network definitions (MLP, Siren, etc.) shared by BiLO and PINN.
 
-
-## License
-
-[Insert License Here]
