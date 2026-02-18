@@ -23,11 +23,12 @@ This repository implements three distinct solvers, each with different parameter
 *   **Key Properties**:
     *   Provides exact gradients of the discretized physics with respect to $D$.
     *   Hard-encodes the boundary conditions and linearity of the PDE.
-    *   Computational cost scales linearly with grid resolution ($O(N)$).
+    *   Computational cost scales linearly with grid resolution, $O(N)$.
     *   Uses direct parameterization ($D = \theta + D_{min}$, projected) to avoid gradient suppression.
 
 ### 2. PINN (Physics-Informed Neural Network)
-*   **Mechanism**: Parameterizes both $D(x)$ and $u(x)$ as separate neural networks (`DNet` and `LocalOperator`). The networks are trained jointly to minimize a composite loss: $\mathcal{L} = \mathcal{L}_{data} + \mathcal{L}_{physics}$.
+*   **Mechanism**: Parameterizes both $D(x)$ and $u(x)$ as separate neural networks (`DNet` and `LocalOperator`). The networks are trained jointly to minimize a composite loss:
+$$\mathcal{L} = \mathcal{L}_{data} + \mathcal{L}_{physics}$$
 *   **Key Properties**:
     *   Continuous neural network representation of $D(x)$ and $u(x)$.
     *   Uses a "flux-form" residual loss to handle the $\alpha$-differentiation.
