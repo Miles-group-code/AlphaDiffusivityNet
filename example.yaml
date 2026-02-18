@@ -1,0 +1,81 @@
+# YAML for running experiments with ExpScheduler.py
+
+# 1. Define anchors for shared configuration
+_logging: &logging
+  # Logging settings
+  log: "wandb.enabled true wandb.project AlphaDiffusivityNet run.outdir runs/sweep_results"
+
+_common: &common
+  # Physics and Data
+  physics: "physics.mu 5.0  physics.sources 0.5 "
+  data: " data.mode particles data.field_loss mse data.m_obs 1000 grid.n_res 201 run.seed 42"
+  ddi: "physics.b_true 100.0 data.b0_fixed_value 100.0 d_profile.use_ddi True train.scalar_fit_iters 500"
+  
+  # Method and Architecture
+  d_profile: " d_profile.pert_scale 0.0 d_profile.pert_freq 2.0 d_profile.profile_type cos"
+  arch: "arch.d_net_arch mlp arch.d_net_width 64 arch.d_net_depth 3 arch.d_net_rff_scale 5.0 arch.u_net_arch mmlp arch.u_net_width 256"
+  
+  # Training
+  lr: "train.lower_tol 0.01 train.lr_d_pre 0.001 train.lr_lower_pre 0.001 train.lr_d_fine 1e-4 train.lr_lower_fine 1e-4 train.use_scheduler false "
+  train: "train.log_every 10  train.pretrain_iters 2000 train.finetune_iters 5000"
+
+  early: "early_burnin 5000 early_patience 100 early_tol 1e-4"
+  # Regularization
+  reg: "reg.wreg_smooth 1e-4 reg.wreg_scale 1e-4 reg.w_jump 1.0 reg.w_resgrad 0.01 reg.w_bc 1.0  reg.smoothness_type h1 wreg_d_neumann 1.0"
+
+# 2. Define Experiments
+# Structure: Group -> Run -> Params
+_methods: &methods
+  pinn:
+    solver: "solver.method pinn"
+  bilo:
+    solver: "solver.method bilo arch.bilo_order 1"
+  # dto:
+  #   solver: "solver.method dto"
+
+example:
+  # This group_name will be passed to run.py and used for wandb.group / output folder
+  group: "group example"
+  # Mixin logging and common settings
+  <<: *logging
+  <<: *common
+  ito:
+    ito: "physics.alpha 0.0 physics.bc_type dirichlet"
+    freq05:
+      dparam: "d_profile.params 0.1,0.05,0.5"
+      <<: *methods
+    freq1:
+      dparam: "d_profile.params 0.1,0.05,1"
+      <<: *methods
+    freq15:
+      dparam: "d_profile.params 0.1,0.05,1.5"
+      <<: *methods
+    freq2:
+      dparam: "d_profile.params 0.1,0.05,2"
+      <<: *methods
+    freq25:
+      dparam: "d_profile.params 0.1,0.05,2.5"
+      <<: *methods
+    freq3:
+      dparam: "d_profile.params 0.1,0.05,3"
+      <<: *methods
+  fickian:
+    fickian: "physics.alpha 1.0 physics.bc_type neumann"
+    freq05:
+      dparam: "d_profile.params 0.1,0.05,0.5"
+      <<: *methods
+    freq1:
+      dparam: "d_profile.params 0.1,0.05,1"
+      <<: *methods
+    freq15:
+      dparam: "d_profile.params 0.1,0.05,1.5"
+      <<: *methods
+    freq2:
+      dparam: "d_profile.params 0.1,0.05,2"
+      <<: *methods
+    freq25:
+      dparam: "d_profile.params 0.1,0.05,2.5"
+      <<: *methods
+    freq3:
+      dparam: "d_profile.params 0.1,0.05,3"
+      <<: *methods
