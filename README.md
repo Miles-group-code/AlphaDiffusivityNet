@@ -227,19 +227,40 @@ If wandb is not installed, it will log to the local directory `runs/[run_name]/`
 
 ## Repository Structure
 
-*   `interface.py`: **Main Entry Point**. High-level API for defining problems and running solvers.
-*   `config.py`: Configuration dataclasses and validation.
-*   `physics.py`: Core physics definitions, finite-difference solvers, and regularization terms. Shared across all methods.
-*   `varpro.py`: Variable projection logic for amplitude estimation ($b_0$).
-*   `data.py`: Synthetic data generation (fields, particle simulations).
-*   `scale_estimation.py`: DDI + scalar-fit scale estimation.
-*   **Methods**:
-    *   `method_dto.py`: Discretize-Then-Optimize implementation.
-    *   `method_pinn.py`: PINN implementation.
-    *   `method_bilo.py`: BiLO implementation.
-*   `training_logger.py`: Training history tracking and progress formatters.
-*   `diagnostics.py`: Plotting and metric calculation tools.
-*   `run.py`: **CLI Entry Point**. Runs a single experiment from command line arguments.
-*   `runexp.py`: **Batch Runner**. Executes multiple experiments defined in a YAML file, handling GPU allocation.
-*   `DenseNet.py`: Contains all neural network definitions (MLP, Siren, etc.) shared by BiLO and PINN.
+The Python framework lives at the repository root. The scripts that regenerate
+the paper's figures are grouped for easy reference: **`matlab_paper_figures/`**
+(the identifiability figures) and **`python_paper_figures/`** (the
+neural-network recovery figures); see *Reproducing the paper figures* below.
+Superseded experiments and exploratory notebooks are kept in **`archived/`**.
+
+*   `interface.py` — **main entry point**: high-level API for defining problems and running solvers.
+*   `run.py` — **CLI entry point**: runs a single experiment from command-line arguments.
+*   `runexp.py` — **batch runner**: executes many experiments from a YAML file, handling GPU allocation.
+*   `config.py` — configuration dataclasses and validation.
+*   `physics.py` — physics definitions, finite-difference solvers, and regularization terms (shared by all methods).
+*   `method_dto.py`, `method_pinn.py`, `method_bilo.py` — the DTO, PINN, and BiLO solvers.
+*   `varpro.py` — variable projection for the source amplitude $b_0$.
+*   `data.py` — synthetic data generation (fields, particle simulations).
+*   `scale_estimation.py` — DDI + scalar-fit scale estimation.
+*   `DenseNet.py` — neural-network definitions (MLP, Siren, etc.) shared by BiLO and PINN.
+*   `diagnostics.py`, `training_logger.py` — plotting/metrics and training-history utilities.
+
+## Reproducing the paper figures
+
+The identifiability ("doppelganger") figures are produced by the self-contained
+MATLAB scripts in **`matlab_paper_figures/`**. Run each from inside that folder;
+each writes one combined multi-panel vector PDF.
+
+| Script | Figure |
+| :-- | :-- |
+| `Ito_Smooth.m` | Itô, diffuse (Gaussian) source, Dirichlet |
+| `Ito_Dirichlet_kink.m` | Itô, point source, Dirichlet (weak $C^0$ doppelganger) |
+| `Ito_Neumann_kink.m` | Itô, point source, Neumann |
+| `Fickian_Dirichlet.m` | Fickian flux ambiguity, Dirichlet |
+| `FickianRobin.m` | Fickian flux ambiguity, unknown Robin wall |
+| `itoUnknownRobin.m` | Itô, unknown Robin permeability |
+
+The neural-network recovery figures (DTO/PINN/BiLO comparisons) are produced by
+`Combined_Ito.py` and `Combined_Fickian.py` in **`python_paper_figures/`**, which
+drive the framework at the repository root.
 

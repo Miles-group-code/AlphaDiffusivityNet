@@ -4,7 +4,9 @@ import multiprocessing as mp
 import matplotlib.pyplot as plt
 from functools import partial
 from scipy.stats import gaussian_kde
-# Assuming these are available in your local environment/path
+# Make the framework at the repo root importable when run from python_paper_figures/
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import Config
 from interface import Problem, solve, show_settings
 import diagnostics
