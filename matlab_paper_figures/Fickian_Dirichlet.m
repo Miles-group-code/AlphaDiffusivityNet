@@ -61,13 +61,13 @@ ax2 = subplot(1,3,2);
 plot(x, D1, '-',  'Color', c1, 'LineWidth', lw); hold on;
 plot(x, D2, '--', 'Color', c2, 'LineWidth', lw);
 xlabel('$x$','Interpreter','latex'); ylabel('$D(x)$','Interpreter','latex'); title('Distinct diffusivities','FontWeight','normal');
-legend({'$D_1(x)$','$D_2(x)$'}, 'Interpreter','latex','Location','best');
+legend({'$D_1(x)$','$D_2(x)$'}, 'Interpreter','latex','Location','northeast');
 
 ax3 = subplot(1,3,3);
 stem(z, b0_1, '-',  'Color', c1, 'MarkerFaceColor',c1, 'MarkerSize',7, 'LineWidth',lw); hold on;
 stem(z, b0_2, '--', 'Color', c2, 'MarkerFaceColor',c2, 'MarkerSize',7, 'LineWidth',lw);
 xlabel('$x$','Interpreter','latex'); ylabel('$b_0$','Interpreter','latex'); title('Point sources','FontWeight','normal');
-legend({sprintf('$b_0^{(1)} = %g$',b0_1), sprintf('$b_0^{(2)} = %g$',b0_2)}, 'Interpreter','latex','Location','best');
+legend({sprintf('$b_0^{(1)} = %g$',b0_1), sprintf('$b_0^{(2)} = %g$',b0_2)}, 'Interpreter','latex','Location','northeast');
 xlim([0 1]); ylim([0 b0_2*1.5]);
 
 axs = [ax1 ax2 ax3]; tags = {'(a)','(b)','(c)'};
@@ -75,7 +75,8 @@ for ii = 1:numel(axs)
     a = axs(ii);
     box(a,'off'); grid(a,'on');
     set(a,'FontSize',11,'LineWidth',1.2,'GridAlpha',0.15,'GridLineWidth',0.5,'TickDir','out','TickLength',[0.015 0.025],'TickLabelInterpreter','tex');
-    a.TitleFontSizeMultiplier = 1.7; a.LabelFontSizeMultiplier = 1.7;
+    a.TitleFontSizeMultiplier = 1.45; a.LabelFontSizeMultiplier = 1.7;
+    p = a.Position; a.Position = [p(1) p(2) p(3) p(4)*0.90];   % top headroom so titles aren't clipped
     a.Title.FontWeight = 'normal'; a.Title.Units = 'normalized'; a.Title.Position(1:2) = [0.5 1.03];
     yl = ylim(a); ylim(a, [yl(1), yl(2)+0.12*(yl(2)-yl(1))]);
     text(a, 0.035, 0.95, tags{ii}, 'Units','normalized','Interpreter','tex', ...

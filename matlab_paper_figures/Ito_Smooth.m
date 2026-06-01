@@ -81,20 +81,21 @@ ax2 = subplot(1,3,2);
 plot(xmesh, D1(xmesh), '-',  'Color', c1, 'LineWidth', lw); hold on;
 plot(xmesh, D2,        '--', 'Color', c2, 'LineWidth', lw);
 xlabel('$x$','Interpreter','latex'); ylabel('$D(x)$','Interpreter','latex'); title('Distinct diffusivities','FontWeight','normal');
-legend({'$D_1(x)$','$D_2(x)$'}, 'Interpreter','latex','Location','best');
+legend({'$D_1(x)$','$D_2(x)$'}, 'Interpreter','latex','Location','northeast');
 
 ax3 = subplot(1,3,3);
 plot(xmesh, b1(xmesh), '-',  'Color', c1, 'LineWidth', lw); hold on;
 plot(xmesh, b2(xmesh), '--', 'Color', c2, 'LineWidth', lw);
 xlabel('$x$','Interpreter','latex'); ylabel('$b(x)$','Interpreter','latex'); title('Source terms','FontWeight','normal');
-legend({'$b_1(x)$','$b_2(x)$'}, 'Interpreter','latex','Location','best');
+legend({'$b_1(x)$','$b_2(x)$'}, 'Interpreter','latex','Location','northeast');
 
 axs = [ax1 ax2 ax3]; tags = {'(a)','(b)','(c)'};
 for ii = 1:numel(axs)
     a = axs(ii);
     box(a,'off'); grid(a,'on');
     set(a,'FontSize',11,'LineWidth',1.2,'GridAlpha',0.15,'GridLineWidth',0.5,'TickDir','out','TickLength',[0.015 0.025],'TickLabelInterpreter','tex');
-    a.TitleFontSizeMultiplier = 1.7; a.LabelFontSizeMultiplier = 1.7;
+    a.TitleFontSizeMultiplier = 1.45; a.LabelFontSizeMultiplier = 1.7;
+    p = a.Position; a.Position = [p(1) p(2) p(3) p(4)*0.90];   % top headroom so titles aren't clipped
     a.Title.FontWeight = 'normal'; a.Title.Units = 'normalized'; a.Title.Position(1:2) = [0.5 1.03];
     yl = ylim(a); ylim(a, [yl(1), yl(2)+0.12*(yl(2)-yl(1))]);
     text(a, 0.035, 0.95, tags{ii}, 'Units','normalized','Interpreter','tex', ...
