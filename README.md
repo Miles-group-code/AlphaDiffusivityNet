@@ -259,8 +259,7 @@ each writes one combined multi-panel vector PDF.
 | `Ito_Dirichlet_kink.m` | Itô, point source, Dirichlet (weak $C^0$ doppelganger) |
 | `Ito_Neumann_kink.m` | Itô, point source, Neumann |
 | `Fickian_Dirichlet.m` | Fickian flux ambiguity, Dirichlet |
-| `FickianRobin.m` | Fickian flux ambiguity, unknown Robin wall |
-| `itoUnknownRobin.m` | Itô, unknown Robin permeability |
+| `Ito_Robin_sameB0.m` | Itô, unknown Robin permeability (same-source degeneracy) |
 
 The neural-network recovery figures (DTO/PINN/BiLO comparisons) are produced by
 `Combined_Ito.py` and `Combined_Fickian.py` in **`python_paper_figures/`**, which

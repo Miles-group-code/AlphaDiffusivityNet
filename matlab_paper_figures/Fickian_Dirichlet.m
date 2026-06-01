@@ -12,7 +12,7 @@ clear; clc; close all;
 % --- shared figure style (python Okabe-Ito palette) ---
 c1 = [0.337 0.706 0.914];   % Model 1 (true)         blue   #56B4E9
 c2 = [0.000 0.620 0.451];   % Model 2 (doppelganger) green  #009E73
-lw = 2;                     % uniform line width
+lw = 2.5;                     % uniform line width
 
 N  = 4001;
 x  = linspace(0,1,N)';
@@ -49,7 +49,7 @@ dDp = gradient(dD, dx);
 fprintf('[dD''](z): slope %.3f -> %.3f  (C^1 kink at source)\n', mean(dDp(iz-5:iz-2)), mean(dDp(iz+2:iz+5)));
 
 %% --- Plot ---
-figure('Color','w','Position',[100 100 1200 400]);
+figure('Color','w','Position',[100 100 1500 450]);
 
 ax1 = subplot(1,3,1);
 plot(x, u1, '-',  'Color', c1, 'LineWidth', lw); hold on;
@@ -74,13 +74,14 @@ axs = [ax1 ax2 ax3]; tags = {'(a)','(b)','(c)'};
 for ii = 1:numel(axs)
     a = axs(ii);
     box(a,'off'); grid(a,'on');
-    set(a,'FontSize',11,'LineWidth',0.8,'GridAlpha',0.15,'TickLabelInterpreter','tex');
-    a.Title.FontWeight = 'normal'; a.Title.Units = 'normalized'; a.Title.Position(1:2) = [0.5 1.04];
+    set(a,'FontSize',11,'LineWidth',1.2,'GridAlpha',0.15,'GridLineWidth',0.5,'TickDir','out','TickLength',[0.015 0.025],'TickLabelInterpreter','tex');
+    a.TitleFontSizeMultiplier = 1.7; a.LabelFontSizeMultiplier = 1.7;
+    a.Title.FontWeight = 'normal'; a.Title.Units = 'normalized'; a.Title.Position(1:2) = [0.5 1.03];
     yl = ylim(a); ylim(a, [yl(1), yl(2)+0.12*(yl(2)-yl(1))]);
-    text(a, 0.035, 0.96, tags{ii}, 'Units','normalized','Interpreter','tex', ...
-         'FontWeight','bold','FontSize',12,'VerticalAlignment','top');
+    text(a, 0.035, 0.95, tags{ii}, 'Units','normalized','Interpreter','tex', ...
+         'FontWeight','bold','FontSize',18,'VerticalAlignment','top');
 end
-set(findall(gcf,'Type','legend'),'FontSize',9,'Box','off');
+set(findall(gcf,'Type','legend'),'FontSize',16,'Box','off');
 
 exportgraphics(gcf, 'Fickian_Dirichlet.pdf', 'ContentType', 'vector');
 

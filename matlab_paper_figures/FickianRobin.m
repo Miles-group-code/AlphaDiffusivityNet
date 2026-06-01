@@ -10,7 +10,7 @@ clear; clc; close all;
 % --- shared figure style (python Okabe-Ito palette) ---
 c1 = [0.337 0.706 0.914];   % Model 1 (true)         blue   #56B4E9
 c2 = [0.000 0.620 0.451];   % Model 2 (doppelganger) green  #009E73
-lw = 2;                     % uniform line width
+lw = 2.5;                     % uniform line width
 
 N  = 4001;
 x  = linspace(0,1,N)';
@@ -50,7 +50,7 @@ fprintf('min(D2) = %.4f   min|u1''| off-source = %.4f (u'' ~= 0 on each side)\n'
 fprintf('b0: %g -> %g   k0: %.3f -> %.3f   k1: %.3f -> %.3f\n', b0_1, b0_2, k0_1, k0_2, k1_1, k1_2);
 
 %% --- Plot ---
-figure('Color','w','Position',[80 80 1500 380]);
+figure('Color','w','Position',[80 80 1500 450]);
 
 ax1 = subplot(1,4,1);
 plot(x, u1, '-',  'Color', c1, 'LineWidth', lw); hold on;
@@ -82,13 +82,15 @@ axs = [ax1 ax2 ax3 ax4]; tags = {'(a)','(b)','(c)','(d)'};
 for ii = 1:numel(axs)
     a = axs(ii);
     box(a,'off'); grid(a,'on');
-    set(a,'FontSize',11,'LineWidth',0.8,'GridAlpha',0.15);
-    a.Title.FontWeight = 'normal'; a.Title.Units = 'normalized'; a.Title.Position(1:2) = [0.5 1.04];
+    set(a,'FontSize',11,'LineWidth',1.2,'GridAlpha',0.15,'GridLineWidth',0.5,'TickDir','out','TickLength',[0.015 0.025]);
+    a.TitleFontSizeMultiplier = 1.7; a.LabelFontSizeMultiplier = 1.7;
+    a.Title.FontWeight = 'normal'; a.Title.Units = 'normalized'; a.Title.Position(1:2) = [0.5 1.03];
     yl = ylim(a); ylim(a, [yl(1), yl(2)+0.12*(yl(2)-yl(1))]);
-    text(a, 0.035, 0.96, tags{ii}, 'Units','normalized','Interpreter','tex', ...
-         'FontWeight','bold','FontSize',12,'VerticalAlignment','top');
+    text(a, 0.035, 0.95, tags{ii}, 'Units','normalized','Interpreter','tex', ...
+         'FontWeight','bold','FontSize',18,'VerticalAlignment','top');
 end
-set(findall(gcf,'Type','legend'),'FontSize',9,'Box','off');
+set(findall(gcf,'Type','legend'),'FontSize',16,'Box','off');
+ax4.XAxis.FontSize = 18;   % kappa_0, kappa_L are category labels, not tick values
 
 exportgraphics(gcf, 'FickianRobin.pdf', 'ContentType', 'vector');
 

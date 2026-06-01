@@ -34,3 +34,6 @@ runs/
 matlab_paper_figures/*.pdf
 python_paper_figures/*.pdf
 python_paper_figures/*.png
+
+# Local backup copies made while editing
+*.bak
