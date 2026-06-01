@@ -2,6 +2,11 @@
 
 clear; clc; close all;
 
+% --- shared figure style (python Okabe-Ito palette) ---
+c1 = [0.337 0.706 0.914];   % Model 1 (true)         blue   #56B4E9
+c2 = [0.000 0.620 0.451];   % Model 2 (doppelganger) green  #009E73
+lw = 2;                     % uniform line width
+
 d = 10; % decay rate
 
 D1     = @(x) 1.5 + sin(4*x);
@@ -66,22 +71,34 @@ u2  = y2(1,:)';
 diff_norm = norm(u1 - u2);
 fprintf('||u1 - u2||_2 = %.3e\n', diff_norm);
 figure('Color', 'w', 'Position', [100, 100, 1200, 400]);
-subplot(1,3,1);
-plot(xmesh,u1,'b-','LineWidth',2.5,'DisplayName','u_1(x)'); hold on;
-plot(xmesh,u2,'r--','LineWidth',2,'DisplayName','u_2(x)');
-box off; legend('Location','north'); title('u_1(x) \equiv u_2(x) (Gaussian Source)');
-xlabel('x'); ylabel('u(x)');grid on;
-subplot(1,3,2);
-plot(xmesh, D1(xmesh),'b--','LineWidth',3,'DisplayName','D_1(x)'); hold on;
-plot(xmesh, D2,'r--','LineWidth',1.5,'DisplayName','D_2(x)');
-box off; legend('Location','best');
-title('D Comparison');grid on;
-xlabel('x'); ylabel('D(x)'); 
+ax1 = subplot(1,3,1);
+plot(xmesh, u1, '-',  'Color', c1, 'LineWidth', lw); hold on;
+plot(xmesh, u2, '--', 'Color', c2, 'LineWidth', lw);
+xlabel('$x$','Interpreter','latex'); ylabel('$u(x)$','Interpreter','latex'); title('Identical densities','FontWeight','normal');
+legend({'$u_1(x)$','$u_2(x)$'}, 'Interpreter','latex','Location','northeast');
 
-subplot(1,3,3);
-plot(xmesh, b1(xmesh), 'b-', 'LineWidth', 2, 'DisplayName', 'b_1(x) (Gaussian)'); hold on;
-plot(xmesh, b2(xmesh), 'r--', 'LineWidth', 2, 'DisplayName', 'b_2(x) (Shifted)');
-grid on;
-legend('Location', 'best');
-title('Different Source Terms b(x)');
-xlabel('x'); ylabel('Source Magnitude');
+ax2 = subplot(1,3,2);
+plot(xmesh, D1(xmesh), '-',  'Color', c1, 'LineWidth', lw); hold on;
+plot(xmesh, D2,        '--', 'Color', c2, 'LineWidth', lw);
+xlabel('$x$','Interpreter','latex'); ylabel('$D(x)$','Interpreter','latex'); title('Distinct diffusivities','FontWeight','normal');
+legend({'$D_1(x)$','$D_2(x)$'}, 'Interpreter','latex','Location','best');
+
+ax3 = subplot(1,3,3);
+plot(xmesh, b1(xmesh), '-',  'Color', c1, 'LineWidth', lw); hold on;
+plot(xmesh, b2(xmesh), '--', 'Color', c2, 'LineWidth', lw);
+xlabel('$x$','Interpreter','latex'); ylabel('$b(x)$','Interpreter','latex'); title('Source terms','FontWeight','normal');
+legend({'$b_1(x)$','$b_2(x)$'}, 'Interpreter','latex','Location','best');
+
+axs = [ax1 ax2 ax3]; tags = {'(a)','(b)','(c)'};
+for ii = 1:numel(axs)
+    a = axs(ii);
+    box(a,'off'); grid(a,'on');
+    set(a,'FontSize',11,'LineWidth',0.8,'GridAlpha',0.15,'TickLabelInterpreter','tex');
+    a.Title.FontWeight = 'normal'; a.Title.Units = 'normalized'; a.Title.Position(1:2) = [0.5 1.04];
+    yl = ylim(a); ylim(a, [yl(1), yl(2)+0.12*(yl(2)-yl(1))]);
+    text(a, 0.035, 0.96, tags{ii}, 'Units','normalized','Interpreter','tex', ...
+         'FontWeight','bold','FontSize',12,'VerticalAlignment','top');
+end
+set(findall(gcf,'Type','legend'),'FontSize',9,'Box','off');
+
+exportgraphics(gcf, 'Ito_Smooth.pdf', 'ContentType', 'vector');

@@ -2,6 +2,11 @@
 
 clear; clc; close all;
 
+% --- shared figure style (python Okabe-Ito palette) ---
+c1 = [0.337 0.706 0.914];   % Model 1 (true)         blue   #56B4E9
+c2 = [0.000 0.620 0.451];   % Model 2 (doppelganger) green  #009E73
+lw = 2;                     % uniform line width
+
 L  = 1;
 N  = 2001;
 x  = linspace(0, L, N)';
@@ -61,32 +66,37 @@ fprintf('  [u1''](z) = %+.6f  ← C^1 kink', kink_u1);
 
 %% --- Plotting ---
 figure('Color','w','Position',[60 80 1300 420]);
-subplot(1,3,1);
-plot(x, u1, 'b-',  'LineWidth', 2, 'DisplayName', 'u_1(x) (True)'); hold on;
-plot(x, u2, 'r--', 'LineWidth', 2, 'DisplayName', 'u_2(x) (Phantom)');
-xline(z, 'k:', 'LineWidth', 1.5, 'DisplayName', 'x=0.5');
-xlabel('x'); ylabel('u');
-title('Comparison of u_1(x) and u_2(x)');
-legend('Location','best'); grid on;
-ypad = 0.05*(max(u1)-min(u1));
-ylim([min(u1)-ypad, max(u1)+ypad]);
+ax1 = subplot(1,3,1);
+plot(x, u1, '-',  'Color', c1, 'LineWidth', lw); hold on;
+plot(x, u2, '--', 'Color', c2, 'LineWidth', lw);
+xlabel('$x$','Interpreter','latex'); ylabel('$u(x)$','Interpreter','latex'); title('Identical densities','FontWeight','normal');
+legend({'$u_1(x)$','$u_2(x)$'}, 'Interpreter','latex','Location','northeast');
+ypad = 0.05*(max(u1)-min(u1)); ylim([min(u1)-ypad, max(u1)+ypad]);
 
-subplot(1,3,2);
-plot(x, D1, 'b-',  'LineWidth', 2, 'DisplayName', 'D_1(x)'); hold on;
-plot(x, D2, 'r--', 'LineWidth', 2, 'DisplayName', 'D_2(x)');
-xline(z, 'k:', 'LineWidth', 1.5,'DisplayName', 'x=0.5');
-xlabel('x'); ylabel('D');
-title('Different D_1(x) and D_2(x)');
-legend('Location','best'); grid on;
+ax2 = subplot(1,3,2);
+plot(x, D1, '-',  'Color', c1, 'LineWidth', lw); hold on;
+plot(x, D2, '--', 'Color', c2, 'LineWidth', lw);
+xlabel('$x$','Interpreter','latex'); ylabel('$D(x)$','Interpreter','latex'); title('Distinct diffusivities','FontWeight','normal');
+legend({'$D_1(x)$','$D_2(x)$'}, 'Interpreter','latex','Location','best');
 
-subplot(1,3,3);
-stem(z, b0, 'b-', 'MarkerFaceColor','b', 'MarkerSize',8, ...
-     'LineWidth', 2, 'DisplayName', 'b_1 (True)'); hold on;
-stem(z, b0, 'r--', 'MarkerFaceColor','r', 'MarkerSize',4, ...
-     'LineWidth', 2, 'DisplayName', 'b_2 (Phantom)');
-xlabel('x'); ylabel('Magnitude');
-title('Point Sources b(x) with Same Magnitude');
+ax3 = subplot(1,3,3);
+stem(z, b0, '-',  'Color', c1, 'MarkerFaceColor',c1, 'MarkerSize',7, 'LineWidth',lw); hold on;
+stem(z, b0, '--', 'Color', c2, 'MarkerFaceColor',c2, 'MarkerSize',4, 'LineWidth',lw);
+xlabel('$x$','Interpreter','latex'); ylabel('$b_0$','Interpreter','latex'); title('Point sources','FontWeight','normal');
+legend({'$b_0^{(1)}$','$b_0^{(2)}$'}, 'Interpreter','latex','Location','best');
 xlim([0 1]); ylim([0 b0*1.5]);
-legend('Location','best'); grid on;
-text(z+0.03, b0*1.08, sprintf('b_1 = b_2 = %g', b0), ...
-     'FontSize', 9, 'Color','k');
+text(z+0.03, b0*1.08, sprintf('$b_0^{(1)} = b_0^{(2)} = %g$', b0), 'Interpreter','latex','FontSize', 9);
+
+axs = [ax1 ax2 ax3]; tags = {'(a)','(b)','(c)'};
+for ii = 1:numel(axs)
+    a = axs(ii);
+    box(a,'off'); grid(a,'on');
+    set(a,'FontSize',11,'LineWidth',0.8,'GridAlpha',0.15,'TickLabelInterpreter','tex');
+    a.Title.FontWeight = 'normal'; a.Title.Units = 'normalized'; a.Title.Position(1:2) = [0.5 1.04];
+    yl = ylim(a); ylim(a, [yl(1), yl(2)+0.12*(yl(2)-yl(1))]);
+    text(a, 0.035, 0.96, tags{ii}, 'Units','normalized','Interpreter','tex', ...
+         'FontWeight','bold','FontSize',12,'VerticalAlignment','top');
+end
+set(findall(gcf,'Type','legend'),'FontSize',9,'Box','off');
+
+exportgraphics(gcf, 'Ito_Neumann_kink.pdf', 'ContentType', 'vector');

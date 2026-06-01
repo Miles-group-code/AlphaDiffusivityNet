@@ -1,73 +1,96 @@
 %% --- Fickian Model with Dirichlet Boundary: Figure 5 ---
+% Point-source weak (C^0) doppelganger. A point source b0*delta(x-z) forces a
+% jump in u', so the Fickian flux freedom delta(D u') = C1 - db0*H(x-z) can only
+% stay continuous if the source strength also changes (db0 ~= 0). The resulting
+% delta D = (C1 - db0 H)/u' is continuous but KINKS at z: distinct (D1,b0_1) and
+% (D2,b0_2) produce the same density u. C^1-at-z (Assumption) excludes the kink.
+% Absorbing (homogeneous) Dirichlet walls u(0)=u(1)=0: u peaks at the source, so
+% u' flips sign across z but stays nonzero on each side, and delta D = g/u' is
+% finite throughout (the single jump node z is filled by the one-sided slope).
 clear; clc; close all;
 
-% D1(x) and its derivative
-% D1 = @(x) 1.5 + sin(4*x);
-D1 = @(x) 2 + 0.5*cos(4*pi*x);
-D1p = @(x) -2*pi*sin(4*pi*x);
+% --- shared figure style (python Okabe-Ito palette) ---
+c1 = [0.337 0.706 0.914];   % Model 1 (true)         blue   #56B4E9
+c2 = [0.000 0.620 0.451];   % Model 2 (doppelganger) green  #009E73
+lw = 2;                     % uniform line width
 
-b1 = @(x) 1.0 * (1./(0.1*sqrt(2*pi))) .* exp(-0.5*((x - 0.5)./0.1).^2);
+N  = 4001;
+x  = linspace(0,1,N)';
+dx = x(2)-x(1);
+z  = 0.5;  [~, iz] = min(abs(x - z));
 
-N = 1e4;
-xmesh = linspace(0,1,N);
+gamma = 5;            % decay > 0
+b0_1  = 10;           % true point-source strength
+db0   = 4;            % source perturbation
+b0_2  = b0_1 + db0;   % phantom strength (b0_1 ~= b0_2)
 
-% Fickian ODE: D1*u'' + D1p*u' + b1 = 0
-odefun1 = @(x,y) [ ...
-    y(2); ...
-    ( -b1(x) - D1p(x).*y(2) ) ./ D1(x) ...
-];
+D1 = 2 + 0.5*cos(4*pi*x);
 
-% u(0)=0, u(1)=1.5 u'(x) ~= 0
-bcfun   = @(ya,yb) [ya(1) - 0; yb(1) - 1.5];  
-sol1    = bvp4c(odefun1, bcfun, bvpinit(xmesh, @(x)[1.5*x; 1.5]));
-y1      = deval(sol1, xmesh);
-u1      = y1(1,:)';                   
-u1p     = y1(2,:)';                   
+% --- True solution: (D1 u')' - gamma u + b0_1 delta(x-z) = 0, u(0)=u(1)=0 ---
+u1  = fick_solve(D1, b0_1, gamma, 0, 0, iz, dx, N);
+u1p = gradient(u1, dx);
+u1p(iz) = (u1(iz) - u1(iz-1)) / dx;   % one-sided at the source jump node
 
+% --- Continuous-at-z flux constant: C1 = db0 * u1'(z^-) * D1(z) / b0_1 ---
+C1 = db0 * u1p(iz) * D1(iz) / b0_1;
 
-b1_vals = b1(xmesh)';
-Phi = cumtrapz(xmesh, b1_vals); 
+% --- delta D = (C1 - db0 H(x-z)) / u1' ; D2 = D1 + delta D ---
+g  = C1 - db0*(x > z);
+dD = g ./ u1p;
+D2 = D1 + dD;
 
-% D2(x) = D1(x) + C_flux / u'(x)
-C_flux = 0.5; 
-D2 = D1(xmesh)' + (C_flux ./ u1p);
+u2 = fick_solve(D2, b0_2, gamma, 0, 0, iz, dx, N);
 
-h = xmesh(2) - xmesh(1);
-D2p  = gradient(D2, h);
-
-D2i   = @(x) interp1(xmesh, D2,   x, 'pchip', 'extrap');
-D2pi  = @(x) interp1(xmesh, D2p,  x, 'pchip', 'extrap');
-b2=b1;
-% Re-solving using the exact same b1 source function
-odefun2 = @(x,y) [ ...
-    y(2); ...
-    ( -b2(x) - D2pi(x).*y(2) ) ./ D2i(x) ...
-];
-
-sol2 = bvp4c(odefun2, bcfun, bvpinit(xmesh, @(x) deval(sol1,x)));
-y2  = deval(sol2, xmesh);
-u2  = y2(1,:)';
+%% --- Verification ---
+fprintf('max|u1-u2| = %.2e  (%.4f%% of peak)\n', max(abs(u1-u2)), max(abs(u1-u2))/max(u1)*100);
+fprintf('min(D2) = %.4f   min|u1''| off-source = %.4f (u'' ~= 0 on each side)\n', ...
+        min(D2), min(abs(u1p([2:iz-3 iz+3:end-1]))));
+dDp = gradient(dD, dx);
+fprintf('[dD''](z): slope %.3f -> %.3f  (C^1 kink at source)\n', mean(dDp(iz-5:iz-2)), mean(dDp(iz+2:iz+5)));
 
 %% --- Plot ---
-diff_norm = norm(u1 - u2);
-fprintf('||u1 - u2||_2 = %.3e\n', diff_norm);
+figure('Color','w','Position',[100 100 1200 400]);
 
-figure('Color', 'w', 'Position', [100, 100, 1200, 400]);
+ax1 = subplot(1,3,1);
+plot(x, u1, '-',  'Color', c1, 'LineWidth', lw); hold on;
+plot(x, u2, '--', 'Color', c2, 'LineWidth', lw);
+xlabel('$x$','Interpreter','latex'); ylabel('$u(x)$','Interpreter','latex'); title('Identical densities','FontWeight','normal');
+legend({'$u_1(x)$','$u_2(x)$'}, 'Interpreter','latex','Location','northeast');
 
-subplot(1,3,1);
-plot(xmesh,u1,'b-','LineWidth',2,'DisplayName','u_1(x)'); hold on;
-plot(xmesh,u2,'r--','LineWidth',1.5,'DisplayName','u_2(x)');
-box off; legend('Location','northwest'); title('Identical Solutions u_1 \equiv u_2');
-xlabel('x'); ylabel('u(x)'); grid on;
+ax2 = subplot(1,3,2);
+plot(x, D1, '-',  'Color', c1, 'LineWidth', lw); hold on;
+plot(x, D2, '--', 'Color', c2, 'LineWidth', lw);
+xlabel('$x$','Interpreter','latex'); ylabel('$D(x)$','Interpreter','latex'); title('Distinct diffusivities','FontWeight','normal');
+legend({'$D_1(x)$','$D_2(x)$'}, 'Interpreter','latex','Location','best');
 
-subplot(1,3,2);
-plot(xmesh, D1(xmesh),'b-','LineWidth',2,'DisplayName','D_1(x)'); hold on;
-plot(xmesh, D2,'r--','LineWidth',2,'DisplayName','D_2(x)');
-box off; legend('Location','best'); title('Distinct Diffusion Coefficients'); 
-xlabel('x'); ylabel('D(x)'); grid on;
+ax3 = subplot(1,3,3);
+stem(z, b0_1, '-',  'Color', c1, 'MarkerFaceColor',c1, 'MarkerSize',7, 'LineWidth',lw); hold on;
+stem(z, b0_2, '--', 'Color', c2, 'MarkerFaceColor',c2, 'MarkerSize',7, 'LineWidth',lw);
+xlabel('$x$','Interpreter','latex'); ylabel('$b_0$','Interpreter','latex'); title('Point sources','FontWeight','normal');
+legend({sprintf('$b_0^{(1)} = %g$',b0_1), sprintf('$b_0^{(2)} = %g$',b0_2)}, 'Interpreter','latex','Location','best');
+xlim([0 1]); ylim([0 b0_2*1.5]);
 
-subplot(1,3,3);
-plot(xmesh, b1(xmesh), 'b-', 'LineWidth', 2, 'DisplayName', 'b_1(x)');hold on;
-plot(xmesh, b2(xmesh), 'r--', 'LineWidth', 2, 'DisplayName', 'b_2(x)');
-legend('Location', 'best'); title('Identical Source Terms');
-xlabel('x'); ylabel('Source Magnitude'); grid on;
+axs = [ax1 ax2 ax3]; tags = {'(a)','(b)','(c)'};
+for ii = 1:numel(axs)
+    a = axs(ii);
+    box(a,'off'); grid(a,'on');
+    set(a,'FontSize',11,'LineWidth',0.8,'GridAlpha',0.15,'TickLabelInterpreter','tex');
+    a.Title.FontWeight = 'normal'; a.Title.Units = 'normalized'; a.Title.Position(1:2) = [0.5 1.04];
+    yl = ylim(a); ylim(a, [yl(1), yl(2)+0.12*(yl(2)-yl(1))]);
+    text(a, 0.035, 0.96, tags{ii}, 'Units','normalized','Interpreter','tex', ...
+         'FontWeight','bold','FontSize',12,'VerticalAlignment','top');
+end
+set(findall(gcf,'Type','legend'),'FontSize',9,'Box','off');
+
+exportgraphics(gcf, 'Fickian_Dirichlet.pdf', 'ContentType', 'vector');
+
+%% --- Fickian conservative FDM: (D u')' - gamma u + b0 delta(x-z) = 0, Dirichlet ---
+function u = fick_solve(D, b0, gamma, uL, uR, iz, dx, N)
+  Dp = (D + [D(2:end); D(end)])/2;   Dm = ([D(1); D(1:end-1)] + D)/2;
+  main = -(Dp + Dm)/dx^2 - gamma;    lo = Dm(2:end)/dx^2;   up = Dp(1:end-1)/dx^2;
+  M = spdiags([[lo; 0] main [0; up]], [-1 0 1], N, N);
+  rhs = zeros(N,1);  rhs(iz) = -b0/dx;
+  M(1,:) = 0; M(1,1) = 1; rhs(1) = uL;
+  M(N,:) = 0; M(N,N) = 1; rhs(N) = uR;
+  u = M \ rhs;
+end

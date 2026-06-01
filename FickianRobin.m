@@ -1,90 +1,105 @@
-%% --- Fickian Model with Robin Boundary Figure 6 ---
+%% --- Fickian Model with Robin Boundary: Figure 6 ---
+% Point-source weak (C^0) doppelganger at an UNKNOWN-permeability Robin wall.
+% As in the Dirichlet case the point source forces delta(D u') = C1 - db0*H(x-z)
+% and a joint (D, b0) change; here the wall permeabilities kappa absorb the flux
+% offset, so the triple (D, b0, kappa) is non-identifiable. The perturbation
+% delta D = (C1 - db0 H)/u' kinks at z and is excluded by C^1-at-z (Assumption).
+% Robin form: -D u'(0) + k0 u(0) = q0 ; D u'(1) + k1 u(1) = q1.
 clear; clc; close all;
 
-% D1(x) and its derivative
-D1     = @(x) 1.5 + sin(4*x);
-D1p    = @(x) 4*cos(4*x);
+% --- shared figure style (python Okabe-Ito palette) ---
+c1 = [0.337 0.706 0.914];   % Model 1 (true)         blue   #56B4E9
+c2 = [0.000 0.620 0.451];   % Model 2 (doppelganger) green  #009E73
+lw = 2;                     % uniform line width
 
-b1 = @(x) 1.0 * (1./(0.1*sqrt(2*pi))) .* exp(-0.5*((x - 0.5)./0.1).^2);
+N  = 4001;
+x  = linspace(0,1,N)';
+dx = x(2)-x(1);
+z  = 0.5;  [~, iz] = min(abs(x - z));
 
-N = 1e4;
-xmesh = linspace(0,1,N);
+gamma = 5;             % decay > 0
+b0_1  = 10;            % true point-source strength
+db0   = 5;             % source perturbation
+b0_2  = b0_1 + db0;    % phantom strength
+k0_1  = 2;  k1_1 = 2;  % true Robin permeabilities
+q0    = 0;  q1   = 0;  % homogeneous (leaky) Robin -D u' + k u = 0, exterior at 0
 
-% Fickian ODE: D1*u'' + D1p*u' + b1 = 0
-odefun1 = @(x,y) [ ...
-    y(2); ...
-    ( -b1(x) - D1p(x).*y(2) ) ./ D1(x) ...
-];
+D1 = 2 + 0.5*sin(2*pi*x);
 
-%% --- Robin Boundary Conditions ---
-% Form: alpha * u + beta * u' = gamma
-% Left boundary (x = 0):  1 * u(0) - 0.5 * u'(0) = 0.2
-% Right boundary (x = 1): 1 * u(1) + 0.8 * u'(1) = 2.0
-alpha_a = 1.0; beta_a = -0.5; gamma_a = 0.2;
-alpha_b = 1.0; beta_b = 0.8;  gamma_b = 2.0;
+% --- True solution: u peaks at the source; u' nonzero on each side ---
+u1  = robin_solve(D1, b0_1, gamma, k0_1, k1_1, q0, q1, iz, dx, N);
+u1p = gradient(u1, dx);
+u1p(iz) = (u1(iz) - u1(iz-1)) / dx;   % one-sided at the source jump node
 
-bcfun = @(ya,yb) [ ...
-    alpha_a * ya(1) + beta_a * ya(2) - gamma_a; ... % Robin BC at x = 0
-    alpha_b * yb(1) + beta_b * yb(2) - gamma_b  ... % Robin BC at x = 1
-];
+% --- Continuous-at-z flux constant ---
+C1 = db0 * u1p(iz) * D1(iz) / b0_1;
 
+% --- delta D and the compensating permeabilities (k2 = k1 -/+ flux offset / u(wall)) ---
+g  = C1 - db0*(x > z);
+dD = g ./ u1p;
+D2 = D1 + dD;
+k0_2 = k0_1 + C1 / u1(1);
+k1_2 = k1_1 - (C1 - db0) / u1(N);
 
-sol1    = bvp4c(odefun1, bcfun, bvpinit(xmesh, @(x)[1.5*x + 0.2; 1.5]));
-y1      = deval(sol1, xmesh);
-u1      = y1(1,:)';                   
-u1p     = y1(2,:)';                   
+u2 = robin_solve(D2, b0_2, gamma, k0_2, k1_2, q0, q1, iz, dx, N);
 
-% Integrate b1 to find the flux profile
-b1_vals = b1(xmesh)';
-% Phi = cumtrapz(xmesh, b1_vals); 
-
-% D2(x) = D1(x) + C_flux / u'(x)
-C_flux = 0.5;
-D2 = D1(xmesh)' + (C_flux ./ u1p);
-
-h = xmesh(2) - xmesh(1);
-D2p  = gradient(D2, h);
-
-D2i   = @(x) interp1(xmesh, D2,   x, 'pchip', 'extrap');
-D2pi  = @(x) interp1(xmesh, D2p,  x, 'pchip', 'extrap');
-b2 = b1;
-
-odefun2 = @(x,y) [ ...
-    y(2); ...
-    ( -b2(x) - D2pi(x).*y(2) ) ./ D2i(x) ...
-];
-
-sol2 = bvp4c(odefun2, bcfun, bvpinit(xmesh, @(x) deval(sol1,x)));
-y2  = deval(sol2, xmesh);
-u2  = y2(1,:)';
+%% --- Verification ---
+fprintf('max|u1-u2| = %.2e  (%.4f%% of peak)\n', max(abs(u1-u2)), max(abs(u1-u2))/max(u1)*100);
+fprintf('min(D2) = %.4f   min|u1''| off-source = %.4f (u'' ~= 0 on each side)\n', ...
+        min(D2), min(abs(u1p([2:iz-3 iz+3:end-1]))));
+fprintf('b0: %g -> %g   k0: %.3f -> %.3f   k1: %.3f -> %.3f\n', b0_1, b0_2, k0_1, k0_2, k1_1, k1_2);
 
 %% --- Plot ---
-diff_norm = norm(u1 - u2);
-fprintf('||u1 - u2||_2 = %.3e\n', diff_norm);
-flux1 = D1(xmesh)'.*u1p;
-flux2 = D2.*u1p;
-C_test = flux2 - flux1;
-fprintf('std(flux2-flux1) = %.3e\n', std(C_test));
-fprintf('min(D2) = %.4e\n', min(D2));
-fprintf('max(D2) = %.4e\n', max(D2));
-fprintf('min(abs(u1p)) = %.4e\n', min(abs(u1p)));
+figure('Color','w','Position',[80 80 1500 380]);
 
-figure('Color', 'w', 'Position', [100, 100, 1200, 400]);
+ax1 = subplot(1,4,1);
+plot(x, u1, '-',  'Color', c1, 'LineWidth', lw); hold on;
+plot(x, u2, '--', 'Color', c2, 'LineWidth', lw);
+xlabel('$x$','Interpreter','latex'); ylabel('$u(x)$','Interpreter','latex'); title('Identical densities','FontWeight','normal');
+legend({'$u_1(x)$','$u_2(x)$'}, 'Interpreter','latex','Location','northeast');
 
-subplot(1,3,1);
-plot(xmesh,u1,'b-','LineWidth',2,'DisplayName','u_1(x)'); hold on;
-plot(xmesh,u2,'r--','LineWidth',2,'DisplayName','u_2(x)');
-box off; legend('Location','northwest'); title('Identical Solutions u_1 \equiv u_2');
-xlabel('x'); ylabel('u(x)'); grid on;
+ax2 = subplot(1,4,2);
+plot(x, D1, '-',  'Color', c1, 'LineWidth', lw); hold on;
+plot(x, D2, '--', 'Color', c2, 'LineWidth', lw);
+xlabel('$x$','Interpreter','latex'); ylabel('$D(x)$','Interpreter','latex'); title('Distinct diffusivities','FontWeight','normal');
+legend({'$D_1(x)$','$D_2(x)$'}, 'Interpreter','latex','Location','best');
 
-subplot(1,3,2);
-plot(xmesh, D1(xmesh),'b-','LineWidth',2,'DisplayName','D_1(x)'); hold on;
-plot(xmesh, D2,'r--','LineWidth',2,'DisplayName','D_2(x)');
-box off; legend('Location','best'); title('Distinct Diffusion Coefficients'); 
-xlabel('x'); ylabel('D(x)'); grid on;
+ax3 = subplot(1,4,3);
+stem(z, b0_1, '-',  'Color', c1, 'MarkerFaceColor',c1, 'MarkerSize',7, 'LineWidth',lw); hold on;
+stem(z, b0_2, '--', 'Color', c2, 'MarkerFaceColor',c2, 'MarkerSize',7, 'LineWidth',lw);
+xlabel('$x$','Interpreter','latex'); ylabel('$b_0$','Interpreter','latex'); title('Point sources','FontWeight','normal');
+legend({sprintf('$b_0^{(1)} = %g$',b0_1), sprintf('$b_0^{(2)} = %g$',b0_2)}, 'Interpreter','latex','Location','best');
+xlim([0 1]); ylim([0 b0_2*1.5]);
 
-subplot(1,3,3);
-plot(xmesh, b1(xmesh), 'b-', 'LineWidth', 2, 'DisplayName', 'b_1(x)');hold on;
-plot(xmesh, b2(xmesh), 'r--', 'LineWidth', 2, 'DisplayName', 'b_2(x)');
-legend('Location', 'best'); title('Identical Source Terms');
-xlabel('x'); ylabel('Source Magnitude'); grid on;
+ax4 = subplot(1,4,4);
+bh = bar([k0_1 k0_2; k1_1 k1_2]);
+bh(1).FaceColor = c1; bh(1).EdgeColor = 'none';
+bh(2).FaceColor = c2; bh(2).EdgeColor = 'none';
+set(ax4,'XTickLabel',{'$\kappa_0$','$\kappa_L$'},'TickLabelInterpreter','latex');
+ylabel('$\kappa$','Interpreter','latex'); title('Robin permeabilities','FontWeight','normal');
+
+axs = [ax1 ax2 ax3 ax4]; tags = {'(a)','(b)','(c)','(d)'};
+for ii = 1:numel(axs)
+    a = axs(ii);
+    box(a,'off'); grid(a,'on');
+    set(a,'FontSize',11,'LineWidth',0.8,'GridAlpha',0.15);
+    a.Title.FontWeight = 'normal'; a.Title.Units = 'normalized'; a.Title.Position(1:2) = [0.5 1.04];
+    yl = ylim(a); ylim(a, [yl(1), yl(2)+0.12*(yl(2)-yl(1))]);
+    text(a, 0.035, 0.96, tags{ii}, 'Units','normalized','Interpreter','tex', ...
+         'FontWeight','bold','FontSize',12,'VerticalAlignment','top');
+end
+set(findall(gcf,'Type','legend'),'FontSize',9,'Box','off');
+
+exportgraphics(gcf, 'FickianRobin.pdf', 'ContentType', 'vector');
+
+%% --- Fickian conservative FDM with Robin walls ---
+% -D u'(0) + k0 u(0) = q0 ;  D u'(1) + k1 u(1) = q1  (2nd-order one-sided)
+function u = robin_solve(D, b0, gamma, k0, k1, q0, q1, iz, dx, N)
+  Dp = (D + [D(2:end); D(end)])/2;   Dm = ([D(1); D(1:end-1)] + D)/2;
+  main = -(Dp + Dm)/dx^2 - gamma;    lo = Dm(2:end)/dx^2;   up = Dp(1:end-1)/dx^2;
+  M = spdiags([[lo; 0] main [0; up]], [-1 0 1], N, N);
+  rhs = zeros(N,1);  rhs(iz) = -b0/dx;
+  M(1,:) = 0; M(1,1) = 3*D(1)/(2*dx) + k0; M(1,2) = -4*D(1)/(2*dx); M(1,3) = D(1)/(2*dx); rhs(1) = q0;
+  M(N,:) = 0; M(N,N) = 3*D(N)/(2*dx) + k1; M(N,N-1) = -4*D(N)/(2*dx); M(N,N-2) = D(N)/(2*dx); rhs(N) = q1;
+  u = M \ rhs;
+end
