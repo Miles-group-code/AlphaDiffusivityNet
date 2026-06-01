@@ -154,7 +154,7 @@ solution = solve(problem, method="pinn", **settings)
 
 ## Known Limitations
 
-*   **Small D values (PINN/BiLO):** Softplus parameterization has gradient suppression proportional to D. At D = 0.01, gradients are ~100x weaker than at D = 1. If your nondimensional D is small (e.g., D/μ ≈ 0.01), use DTO or increase training iterations. See `README.md` troubleshooting for details.
+*   **Small D values (PINN/BiLO):** Softplus parameterization has gradient suppression proportional to D. At D = 0.01, gradients are ~100x weaker than at D = 1. If your nondimensional D is small (e.g., D/μ ≈ 0.01), use DTO or increase training iterations.
 *   **Single source only:** Multi-source support is planned but not yet implemented.
 
 ## Running Experiments
@@ -178,7 +178,7 @@ This script manages a queue of experiments and distributes them across available
 
 **Usage:**
 ```bash
-python runexp.py fic_all.yaml
+python runexp.py example.yaml
 ```
 **Example YAML File:**
 The nested YAML structure will be flattened into a list of experiments.
@@ -244,6 +244,8 @@ Superseded experiments and exploratory notebooks are kept in **`archived/`**.
 *   `scale_estimation.py` — DDI + scalar-fit scale estimation.
 *   `DenseNet.py` — neural-network definitions (MLP, Siren, etc.) shared by BiLO and PINN.
 *   `diagnostics.py`, `training_logger.py` — plotting/metrics and training-history utilities.
+*   `parseyaml.py` — expands a YAML sweep file into individual experiments for `runexp.py`.
+*   `example.yaml`, `exp_compare.yaml` — sample sweep configs; `run.sh` — an example single-run command.
 
 ## Reproducing the paper figures
 
