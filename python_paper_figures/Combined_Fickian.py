@@ -29,7 +29,7 @@ def run_single_trial_internal(args, b0=600, method="pinn", device="cpu"):
     custom_config.arch.d_net_depth = 3
     custom_config.arch.u_net_arch = "mmlp"
     custom_config.arch.u_net_width = 256
-    custom_config.arch.rff_scale = 250.0 
+    custom_config.arch.d_net_rff_scale = 5.0   # random-Fourier-feature bandwidth of the diffusivity network
     #custom_config.reg.wreg_d_neumann = 1.0  
     custom_config.train.lower_tol = 0.01
 
