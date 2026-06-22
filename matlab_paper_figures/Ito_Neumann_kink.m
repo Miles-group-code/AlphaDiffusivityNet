@@ -70,7 +70,7 @@ ax1 = subplot(1,3,1);
 plot(x, u1, '-',  'Color', c1, 'LineWidth', lw); hold on;
 plot(x, u2, '--', 'Color', c2, 'LineWidth', lw);
 xlabel('$x$','Interpreter','latex'); ylabel('$u(x)$','Interpreter','latex'); title('Identical densities','FontWeight','normal');
-legend({'$u_1(x)$','$u_2(x)$'}, 'Interpreter','latex','Location','northeast');
+legend({'$u_1(x)$','$u_2(x)$'}, 'Interpreter','latex','Location','southeast');
 ypad = 0.05*(max(u1)-min(u1)); ylim([min(u1)-ypad, max(u1)+ypad]);
 
 ax2 = subplot(1,3,2);
@@ -83,9 +83,8 @@ ax3 = subplot(1,3,3);
 stem(z, b0, '-',  'Color', c1, 'MarkerFaceColor',c1, 'MarkerSize',7, 'LineWidth',lw); hold on;
 stem(z, b0, '--', 'Color', c2, 'MarkerFaceColor',c2, 'MarkerSize',4, 'LineWidth',lw);
 xlabel('$x$','Interpreter','latex'); ylabel('$b_0$','Interpreter','latex'); title('Point sources','FontWeight','normal');
-legend({'$b_0^{(1)}$','$b_0^{(2)}$'}, 'Interpreter','latex','Location','northeast');
+legend({sprintf('$b_0^{(1)} = %g$',b0), sprintf('$b_0^{(2)} = %g$',b0)}, 'Interpreter','latex','Location','northeast');
 xlim([0 1]); ylim([0 b0*1.5]);
-text(z+0.03, b0*1.08, sprintf('$b_0^{(1)} = b_0^{(2)} = %g$', b0), 'Interpreter','latex','FontSize', 13);
 
 axs = [ax1 ax2 ax3]; tags = {'(a)','(b)','(c)'};
 for ii = 1:numel(axs)
