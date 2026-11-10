@@ -35,9 +35,12 @@ STYLES = {"DTO": "-", "PINN": "--", "BiLO": "-."}
 METHODS = ["DTO", "PINN", "BiLO"]
 RESULT_KEY = {"DTO": "dto_results", "PINN": "pinn_results", "BiLO": "bilo_results"}
 
-# A trial whose recovered b0 exceeds mult * b_true is treated as a non-converged
-# outlier. PINN is filtered more strictly because its failures overshoot hardest.
-FILTER_MULT = {"DTO": 10, "PINN": 3, "BiLO": 10}
+# A trial whose recovered b0 exceeds mult * (median b0 over the trials) is treated as a
+# failed fit and dropped. One rule for all methods, and it does not use the true value.
+# On the paper's runs it removes the same 4 of 1500 fits as a cut at mult * b_true. Every
+# fit it removes has also visibly failed in D: collapsed to ~0 over a quarter or more of
+# [0, 1], or blown up far above the true range.
+FILTER_MULT = {"DTO": 1.5, "PINN": 1.5, "BiLO": 1.5}
 
 # Font sizes, chosen for the panel sizes used in the manuscript. The y-tick
 # numbers are kept small: neither the D(x) scale nor the b0 density matters
@@ -66,7 +69,8 @@ def prepare(path):
     }
     for m in METHODS:
         res = data[RESULT_KEY[m]]
-        kept = [r for r in res if r["b_pred"] <= FILTER_MULT[m] * r["b_true"]]
+        b_median = np.median([r["b_pred"] for r in res])
+        kept = [r for r in res if r["b_pred"] <= FILTER_MULT[m] * b_median]
         d_arr = np.array([r["d_pred"] for r in kept])
         cond["d"][m] = {
             "x": np.asarray(res[0]["x_plot"]).ravel(),

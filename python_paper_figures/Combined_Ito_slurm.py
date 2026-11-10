@@ -11,19 +11,8 @@ from config import Config
 from interface import Problem, solve, show_settings
 import diagnostics
 
-def run_single_trial_internal(args, b0=600, method="pinn", device="cpu"):
-    """
-    Combined worker function that defines the problem and solves it.
-    """
-    seed, dto_config = args
-    
-    # Ensure reproducibility within the process
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.set_num_threads(1)   # one thread per worker; parallelism is across trials
-    dtype = torch.float32 if device == "mps" else torch.float64
-
-    # 1. Setup Configuration
+def make_config():
+    """Network architecture and solver settings shared by all Ito recovery runs."""
     custom_config = Config()
     custom_config.arch.d_net_arch = "mlp"
     custom_config.arch.d_net_width = 64
@@ -33,9 +22,11 @@ def run_single_trial_internal(args, b0=600, method="pinn", device="cpu"):
     custom_config.arch.d_net_rff_scale = 5.0   # random-Fourier-feature bandwidth of the diffusivity network
     #custom_config.reg.wreg_d_neumann = 1.0  
     custom_config.train.lower_tol = 0.01
+    return custom_config
 
-    # 2. Generate Problem
-    problem = Problem.synthetic(
+def make_problem(seed, b0, device, dtype):
+    """Synthetic Ito/Dirichlet particle snapshot for one trial (FREQ read from env)."""
+    return Problem.synthetic(
         alpha=0.0,
         mode="particles",
         d_profile="sinusoidal",
@@ -45,11 +36,29 @@ def run_single_trial_internal(args, b0=600, method="pinn", device="cpu"):
         b_true=b0,
         m_obs=1, 
         use_pde_sampling=True,
-        #bc_type="neumann",
+        bc_type="dirichlet",   # the Problem default, stated explicitly
         seed=seed,
         device=device,
         dtype=dtype,
     )
+
+def run_single_trial_internal(args, b0=600, method="pinn", device="cpu"):
+    """
+    Combined worker function that defines the problem and solves it.
+    """
+    seed, dto_config = args
+
+    # Ensure reproducibility within the process
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.set_num_threads(1)   # one thread per worker; parallelism is across trials
+    dtype = torch.float32 if device == "mps" else torch.float64
+
+    # 1. Setup Configuration
+    custom_config = make_config()
+
+    # 2. Generate Problem
+    problem = make_problem(seed, b0, device, dtype)
 
     # 3. Solve
     sol = solve(problem, method=method, config=custom_config, **dto_config)
@@ -66,6 +75,28 @@ def run_single_trial_internal(args, b0=600, method="pinn", device="cpu"):
         "b_true": problem.b_true, 
     }
 
+# Per-method settings for the Ito recovery runs. Kept at module level so that
+# Sweep_hyperparams.py reuses exactly these values.
+SHARED_CONFIG = {
+    "max_iters": 7000,
+    "smoothness_type": "h1",
+    "pert_scale": 0.0,
+    "pert_freq": 2,
+    "scalar_fit_iters": 500,
+    "log_every": 10,
+    "use_scheduler": True,
+    "use_ddi": True,
+    "early_burnin": 5000,
+    "early_patience": 100,
+    "early_tol": 1e-4,
+    "n_res": 201,
+}
+
+dto_config  = {**SHARED_CONFIG, "wreg_smooth": 10, "wreg_scale": 1, "lr_d_fine": 1e-2, "lr_lower_fine": 1e-6, "w_bc": 1.0}
+pinn_config = {**SHARED_CONFIG, "pinn_pretrain": "constant_d", "wreg_smooth": 5e-2, "wreg_scale": 1, "w_phys": 150, "w_jump": 20, "lr_d_fine": 1e-3, "lr_lower_fine": 5e-4, "w_bc": 1.0}
+bilo_config = {**SHARED_CONFIG, "wreg_smooth": 2, "wreg_scale": 1, "lr_d_fine": 5e-3, "lr_lower_fine": 1e-2, "w_jump": 1, "w_phys": 150, "w_resgrad": 0.001, "w_bc": 1.0}
+
+
 def main():
     # --- CONFIGURATION (sweep params via env; defaults reproduce the original) ---
     n_trials = int(os.environ.get("N_TRIALS", "100"))
@@ -73,26 +104,6 @@ def main():
     FREQ = float(os.environ.get("FREQ", "4.0"))    # D(x) freq: 4 -> sin(8pi x)
     tag  = f"b{B0}_t{n_trials}_{int(FREQ)}"
     
-    SHARED_CONFIG = {
-        "max_iters": 7000,
-        "smoothness_type": "h1",
-        "pert_scale": 0.0,
-        "pert_freq": 2,
-        "scalar_fit_iters": 500,
-        "log_every": 10,
-        "use_scheduler": True,
-        "use_ddi": True, 
-        "early_burnin": 5000,
-        "early_patience": 100,
-        "early_tol": 1e-4,
-        "n_res": 201,
-    }
-
-    # Configuration for individual models
-    dto_config  = {**SHARED_CONFIG, "wreg_smooth": 10, "wreg_scale": 1, "lr_d_fine": 1e-2, "lr_lower_fine": 1e-6, "w_bc": 1.0}
-    pinn_config = {**SHARED_CONFIG, "wreg_smooth": 5e-2, "wreg_scale": 1, "w_phys": 150, "w_jump": 20, "lr_d_fine": 1e-3, "lr_lower_fine": 5e-4, "w_bc": 1.0}
-    bilo_config = {**SHARED_CONFIG, "wreg_smooth": 2, "wreg_scale": 1, "lr_d_fine": 5e-3, "lr_lower_fine": 1e-2, "w_jump": 1, "w_phys": 150, "w_resgrad": 0.001, "w_bc": 1.0}
-
     # --- MULTIPROCESSING EXECUTION ---
     try:
         mp.set_start_method('spawn', force=True)

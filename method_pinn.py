@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import math
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -181,6 +182,29 @@ def _compute_physics_losses(
         )
 
     return res_loss, jump_loss, bc_loss
+
+
+def _set_constant_d(d_net: nn.Module, d_target: float, d_transform: str, d_min: float) -> None:
+    """Set the D-net so that D(x) == d_target exactly.
+
+    Zeroes the output-layer weights and sets the output bias to the inverse of the
+    output transform at d_target. Consumes no RNG.
+    """
+    net = d_net.net
+    if not hasattr(net, "output_layer"):
+        raise NotImplementedError(
+            f"pinn_pretrain='constant_d' needs a D-net with an output_layer; "
+            f"got {type(net).__name__}. Use pinn_pretrain='joint'."
+        )
+    if d_transform == "exp":
+        bias = math.log(d_target)
+    elif d_transform == "soft_plus":
+        bias = math.log(math.expm1(d_target - d_min))
+    else:  # fix_end: D = d_target + u * x * (1 - x)
+        bias = 0.0
+    with torch.no_grad():
+        net.output_layer.weight.zero_()
+        net.output_layer.bias.fill_(bias)
 
 
 def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
@@ -384,7 +408,9 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
     # =========================================================================
     # PRETRAIN PHASE
     # =========================================================================
-    if pretrain_iters > 0:
+    pinn_pretrain = cfg.train.pinn_pretrain
+    if pretrain_iters > 0 and pinn_pretrain == "joint":
+        # Legacy joint pretraining: D and u trained together on physics + scale anchor.
         optim_pre = torch.optim.Adam([
             {"params": d_net.parameters(), "lr": lr_d_pre},
             {"params": u_net.parameters(), "lr": lr_lower_pre},
@@ -423,6 +449,68 @@ def fit(data_bundle: PINNData, cfg: Config, verbose: bool = True) -> PINNResult:
         except KeyboardInterrupt:
             if verbose:
                 print(f"\n[PINN] Pretraining interrupted by user at step {step}. Continuing to finetune...")
+    elif pretrain_iters > 0:
+        # constant_d: as in BiLO, warm-start u to satisfy the physics for the constant
+        # pre-fit D. D(x) == d_target exactly and is frozen; only the u-net is trained,
+        # on the physics loss plus a supervised fit to the FDM solution for that D.
+        _set_constant_d(d_net, d_target, d_transform, d_min)
+        d_requires_grad = [p.requires_grad for p in d_net.parameters()]  # RFF stays frozen
+        for p in d_net.parameters():
+            p.requires_grad_(False)
+
+        u_fdm_np = physics.fdm_solve_alpha(
+            np.full(x_res.shape[0], d_target), alpha, mu,
+            x_res.view(-1).detach().cpu().numpy(), 1.0, sources, bc_type=bc_type
+        )
+        u_fdm_target = torch.tensor(u_fdm_np, device=device, dtype=dtype).view(-1, 1)
+
+        optim_pre = torch.optim.Adam(u_net.parameters(), lr=lr_lower_pre)
+        try:
+            for step in range(pretrain_iters + 1):
+                optim_pre.zero_grad(set_to_none=True)
+                res_loss, jump_loss, bc_loss = _compute_physics_losses(
+                    d_net, u_net, x_res, z_tensor, z_idx, alpha, mu, bc_type, domain
+                )
+                phys_loss = w_phys * res_loss + w_jump * jump_loss
+                if bc_type == "neumann":
+                    phys_loss = phys_loss + w_bc * bc_loss
+                u_hat_sup, _ = u_net(x_res, z_tensor)
+                loss_sup = torch.mean((u_hat_sup - u_fdm_target) ** 2)
+                pre_loss = phys_loss + loss_sup
+
+                if verbose and step % log_every == 0 and step < pretrain_iters:
+                    with torch.no_grad():
+                        u_rel_err = (torch.linalg.norm(u_hat_sup - u_fdm_target)
+                                     / torch.linalg.norm(u_fdm_target)).item()
+                    print(f"[PINN|pretrain:constant_d] Iter {step:05d} | Lpre: {pre_loss.item():.3e} | "
+                          f"Lres: {res_loss.item():.3e} | Ljump: {jump_loss.item():.3e} | "
+                          f"Lbc: {bc_loss.item():.3e} | Lsup: {loss_sup.item():.3e} | "
+                          f"rel_err_u: {u_rel_err:.3e}")
+
+                if step < pretrain_iters:
+                    pre_loss.backward()
+                    optim_pre.step()
+        except KeyboardInterrupt:
+            if verbose:
+                print(f"\n[PINN] Pretraining interrupted by user at step {step}. Continuing to finetune...")
+
+        for p, flag in zip(d_net.parameters(), d_requires_grad):
+            p.requires_grad_(flag)
+
+        if verbose:
+            with torch.no_grad():
+                d_pre = d_net(x_res)
+                mean_d = torch.mean(d_pre).item()
+                d_dev = torch.max(torch.abs(d_pre - d_target)).item()
+                u_rel_err = (
+                    torch.linalg.norm(u_hat_sup - u_fdm_target) / torch.linalg.norm(u_fdm_target)
+                ).item()
+            print(
+                f"[PINN|pretrain:constant_d] Iter {step:05d} | mean_D: {mean_d:.6e} "
+                f"(target {d_target:.6e}, max|D-target| {d_dev:.1e}) | Lres: {res_loss.item():.3e} | "
+                f"Ljump: {jump_loss.item():.3e} | Lbc: {bc_loss.item():.3e} | "
+                f"Lsup: {loss_sup.item():.3e} | rel_err_u: {u_rel_err:.3e}"
+            )
 
     # =========================================================================
     # FINETUNE OPTIMIZER SETUP

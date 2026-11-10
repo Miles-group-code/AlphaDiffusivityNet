@@ -98,8 +98,8 @@ def main():
 
     PINN_PARTICLE_CONFIG = {
         "pretrain_iters": 2000,
-        #"lr_d_pre": 0.001,
-        #"lr_lower_pre": 0.001,
+        "lr_d_pre": 0.001,      # inactive with constant_d pretraining (D is frozen)
+        "lr_lower_pre": 0.001,
         "wreg_smooth": 2, #10
         "wreg_scale": 1, #20
         "w_phys": 350,

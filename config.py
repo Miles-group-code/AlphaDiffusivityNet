@@ -147,6 +147,11 @@ class TrainConfig:
     lower_tol: float | None = None
     scalar_fit_iters: int = 500
     pretrain_iters: int = 1000
+    # PINN pretraining mode:
+    # - "constant_d": D-net set exactly to the scalar pre-fit and frozen; only the
+    #   u-net is trained (physics loss + supervised FDM solution), as in BiLO.
+    # - "joint": legacy joint D/u training on physics loss + scale anchor.
+    pinn_pretrain: Literal["constant_d", "joint"] = "constant_d"
     finetune_iters: int = 10000
     lr_d_pre: float = 1e-4
     lr_lower_pre: float = 1e-4
@@ -173,6 +178,8 @@ class TrainConfig:
             raise ValueError("scalar_fit_iters must be >= 0.")
         if self.optimizer not in {"adam", "lbfgs"}:
             raise ValueError("optimizer must be 'adam' or 'lbfgs'.")
+        if self.pinn_pretrain not in {"constant_d", "joint"}:
+            raise ValueError("pinn_pretrain must be 'constant_d' or 'joint'.")
         if self.lbfgs_max_iter <= 0:
             raise ValueError("lbfgs_max_iter must be > 0.")
         return

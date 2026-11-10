@@ -29,6 +29,7 @@ DEFAULT_SETTINGS = {
     # Training
     "max_iters": 10000,
     "pretrain_iters": 1000,
+    "pinn_pretrain": "constant_d",
     "lr_d": 1e-4,
     "lr_lower": 1e-4,
     "optimizer": "adam",
@@ -105,6 +106,7 @@ def show_settings(settings: Optional[Dict[str, Any]] = None) -> None:
     descriptions = {
         "max_iters": "Finetune iterations",
         "pretrain_iters": "Physics warmup (pinn/bilo)",
+        "pinn_pretrain": "'constant_d' or 'joint' (pinn only)",
         "lr_d": "Learning rate for D(x) (both phases)",
         "lr_d_pre": "LR for D(x) pretrain (overrides lr_d)",
         "lr_d_fine": "LR for D(x) finetune (overrides lr_d)",
@@ -637,6 +639,7 @@ def solve(
     *,
     max_iters: Optional[int] = None,
     pretrain_iters: Optional[int] = None,
+    pinn_pretrain: Optional[Literal["constant_d", "joint"]] = None,
     n_res: Optional[int] = None,
     lr_d: Optional[float] = None,
     lr_d_pre: Optional[float] = None,
@@ -678,6 +681,9 @@ def solve(
         method: "dto", "pinn", or "bilo".
         max_iters: Main training iterations (finetune phase).
         pretrain_iters: Warmup iterations for physics/anchor steps.
+        pinn_pretrain: PINN pretraining mode (PINN only). "constant_d" fixes D to the
+            scalar pre-fit and trains only u (physics + supervised FDM solution);
+            "joint" is the legacy joint D/u pretraining with a scale anchor.
         n_res: Number of solver grid points for D/u (overrides config.grid.n_res).
         lr_d: Learning rate for D(x) parameters (sets both pretrain + finetune).
         lr_d_pre: Learning rate for D(x) during pretrain (overrides lr_d for pretrain).
@@ -776,6 +782,8 @@ def solve(
         config.train.finetune_iters = max_iters
     if pretrain_iters is not None:
         config.train.pretrain_iters = pretrain_iters
+    if pinn_pretrain is not None:
+        config.train.pinn_pretrain = pinn_pretrain
     # Learning rates: general param sets both, specific params override individually
     if lr_d is not None:
         config.train.lr_d_fine = lr_d
@@ -852,6 +860,7 @@ def solve(
 
     if method_lower == "dto":
         _warn_irrelevant("pretrain_iters", pretrain_iters, "'pretrain_iters' is ignored for DTO.")
+        _warn_irrelevant("pinn_pretrain", pinn_pretrain, "'pinn_pretrain' is ignored for DTO.")
         _warn_irrelevant("lr_lower", lr_lower, "'lr_lower' is ignored for DTO.")
         _warn_irrelevant("w_data", w_data, "'w_data' is ignored for DTO.")
         _warn_irrelevant("w_phys", w_phys, "'w_phys' is ignored for DTO.")
@@ -865,6 +874,7 @@ def solve(
     elif method_lower == "bilo":
         _warn_irrelevant("w_data", w_data, "'w_data' is ignored for BiLO.")
         _warn_irrelevant("w_phys", w_phys, "'w_phys' is ignored for BiLO.")
+        _warn_irrelevant("pinn_pretrain", pinn_pretrain, "'pinn_pretrain' is ignored for BiLO.")
 
     if verbose:
         print(f"[Solve] Method: {method.upper()} | α: {problem.alpha} | Mode: {problem.mode}")

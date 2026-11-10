@@ -11,19 +11,8 @@ from config import Config
 from interface import Problem, solve, show_settings
 import diagnostics
 
-def run_single_trial_internal(args, b0=600, method="pinn", device="cpu"):
-    """
-    Combined worker function that defines the problem and solves it.
-    """
-    seed, dto_config = args
-    
-    # Ensure reproducibility within the process
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.set_num_threads(1)   # one thread per worker; parallelism is across trials
-    dtype = torch.float32 if device == "mps" else torch.float64
-
-    # 1. Setup Configuration
+def make_config():
+    """Network architecture and solver settings shared by all Fickian recovery runs."""
     custom_config = Config()
     custom_config.arch.d_net_arch = "mlp"
     custom_config.arch.d_net_width = 64
@@ -33,9 +22,11 @@ def run_single_trial_internal(args, b0=600, method="pinn", device="cpu"):
     custom_config.arch.d_net_rff_scale = 5.0   # random-Fourier-feature bandwidth of the diffusivity network
     #custom_config.reg.wreg_d_neumann = 1.0  
     custom_config.train.lower_tol = 0.01
+    return custom_config
 
-    # 2. Generate Problem
-    problem = Problem.synthetic(
+def make_problem(seed, b0, device, dtype):
+    """Synthetic Fickian/Neumann particle snapshot for one trial (FREQ read from env)."""
+    return Problem.synthetic(
         alpha=1.0,
         mode="particles",
         d_profile="sinusoidal",
@@ -50,6 +41,24 @@ def run_single_trial_internal(args, b0=600, method="pinn", device="cpu"):
         device=device,
         dtype=dtype,
     )
+
+def run_single_trial_internal(args, b0=600, method="pinn", device="cpu"):
+    """
+    Combined worker function that defines the problem and solves it.
+    """
+    seed, dto_config = args
+
+    # Ensure reproducibility within the process
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.set_num_threads(1)   # one thread per worker; parallelism is across trials
+    dtype = torch.float32 if device == "mps" else torch.float64
+
+    # 1. Setup Configuration
+    custom_config = make_config()
+
+    # 2. Generate Problem
+    problem = make_problem(seed, b0, device, dtype)
 
     # 3. Solve
     sol = solve(problem, method=method, config=custom_config, **dto_config)
@@ -66,6 +75,67 @@ def run_single_trial_internal(args, b0=600, method="pinn", device="cpu"):
         "b_true": problem.b_true, 
     }
 
+# Per-method settings for the Fickian recovery runs. Kept at module level so that
+# Sweep_hyperparams.py reuses exactly these values.
+SHARED_CONFIG = {
+    "max_iters": 7000,
+    #"field_loss": "mse",
+    "smoothness_type": "h1",
+    "pert_scale": 0.0,#0.9  0.7
+    "pert_freq": 2,#0.000001  10
+    "scalar_fit_iters": 500,
+    "log_every": 10,
+    "use_scheduler": True,
+    "use_ddi": True,
+    "early_burnin": 5000,
+    "early_patience": 100,
+    "early_tol": 1e-4,
+    "n_res": 201,
+}
+DTO_PARTICLE_CONFIG = {
+    "pretrain_iters": 2000,
+    #"lr_d_pre": 0.001,
+    #"lr_lower_pre": 0.001,
+    "wreg_smooth": 1, #10
+    "wreg_scale": 1e-1, #20
+    "lr_d_fine": 1e-4,
+    "lr_lower_fine": 1e-6,
+    "w_bc": 1.0,
+}
+dto_config = {**SHARED_CONFIG, **DTO_PARTICLE_CONFIG}
+
+PINN_PARTICLE_CONFIG = {
+    "pretrain_iters": 2000,
+    "pinn_pretrain": "constant_d",
+    # lr_d_pre is inactive with constant_d pretraining (D is frozen)
+    "lr_d_pre": 0.001,
+    "lr_lower_pre": 0.001,
+    "wreg_smooth": 2, #10
+    "wreg_scale": 1, #20
+    "w_phys": 350,
+    "lr_d_fine": 1e-2,
+    "lr_lower_fine": 1e-4,
+    "w_jump": 10,
+    "w_bc": 1.0,
+}
+pinn_config = {**SHARED_CONFIG, **PINN_PARTICLE_CONFIG}
+
+BILO_PARTICLE_CONFIG = {
+    "pretrain_iters": 2000,
+    "lr_d_pre": 0.001,
+    "lr_lower_pre": 0.001,
+    "wreg_smooth": 1,#1
+    "wreg_scale": 1,#10
+    "lr_d_fine": 1e-4,#5e-4,
+    "lr_lower_fine": 1e-3,#5e-3,
+    "w_jump": 10,#1
+    #"w_data": 2,
+    #"w_phys": 350,
+    "w_resgrad": 0.05,
+}
+bilo_config = {**SHARED_CONFIG, **BILO_PARTICLE_CONFIG}
+
+
 def main():
     # --- CONFIGURATION (sweep params via env; defaults reproduce the original) ---
     n_trials = int(os.environ.get("N_TRIALS", "100"))
@@ -73,61 +143,6 @@ def main():
     FREQ = float(os.environ.get("FREQ", "3.0"))    # D(x) freq: 3 -> sin(6pi x), 4 -> sin(8pi x)
     tag  = f"b{B0}_t{n_trials}_{int(FREQ)}"         # e.g. b250_t100_3
     
-    SHARED_CONFIG = {
-        "max_iters": 7000,
-        #"field_loss": "mse",
-        "smoothness_type": "h1",
-        "pert_scale": 0.0,#0.9  0.7
-        "pert_freq": 2,#0.000001  10
-        "scalar_fit_iters": 500,
-        "log_every": 10,
-        "use_scheduler": True,
-        "use_ddi": True, 
-        "early_burnin": 5000,
-        "early_patience": 100,
-        "early_tol": 1e-4,
-        "n_res": 201,
-    }
-    DTO_PARTICLE_CONFIG = {
-        "pretrain_iters": 2000,
-        #"lr_d_pre": 0.001,
-        #"lr_lower_pre": 0.001,
-        "wreg_smooth": 1, #10
-        "wreg_scale": 1e-1, #20
-        "lr_d_fine": 1e-4,
-        "lr_lower_fine": 1e-6,
-        "w_bc": 1.0,
-    }   
-    dto_config = {**SHARED_CONFIG, **DTO_PARTICLE_CONFIG}
-
-    PINN_PARTICLE_CONFIG = {
-        "pretrain_iters": 2000,
-        #"lr_d_pre": 0.001,
-        #"lr_lower_pre": 0.001,
-        "wreg_smooth": 2, #10
-        "wreg_scale": 1, #20
-        "w_phys": 350,
-        "lr_d_fine": 1e-2,
-        "lr_lower_fine": 1e-4,
-        "w_jump": 10,
-        "w_bc": 1.0,
-    }   
-    pinn_config = {**SHARED_CONFIG, **PINN_PARTICLE_CONFIG}
-
-    BILO_PARTICLE_CONFIG = {
-        "pretrain_iters": 2000,
-        "lr_d_pre": 0.001,
-        "lr_lower_pre": 0.001,
-        "wreg_smooth": 1,#1 
-        "wreg_scale": 1,#10
-        "lr_d_fine": 1e-4,#5e-4,
-        "lr_lower_fine": 1e-3,#5e-3,
-        "w_jump": 10,#1
-        #"w_data": 2,
-        #"w_phys": 350,
-        "w_resgrad": 0.05,
-    }   
-    bilo_config = {**SHARED_CONFIG, **BILO_PARTICLE_CONFIG}
     # --- MULTIPROCESSING EXECUTION ---
     try:
         mp.set_start_method('spawn', force=True)

@@ -34,6 +34,7 @@ This repository implements three distinct solvers, each with different parameter
     *   Enforces the source singularity via a specific jump condition penalty at $x=z$.
     *   Does not require solving a linear system.
     *   Uses softplus output activation ($D = \text{softplus}(\text{output}) + D_{min}$) for smooth gradients.
+    *   Pretraining (`pinn_pretrain`): with the default `"constant_d"`, $D$ is set exactly to the constant scalar pre-fit and frozen, and only the $u$ network is trained, on the physics loss plus a supervised fit to the FDM solution for that constant $D$ (as in BiLO). `"joint"` selects the earlier joint $D$/$u$ pretraining with a scale anchor.
 
 ### 3. BiLO (Bilevel Local Operator)
 *   **Mechanism**: A bilevel optimization approach.
@@ -263,5 +264,6 @@ each writes one combined multi-panel vector PDF.
 
 The neural-network recovery figures (DTO/PINN/BiLO comparisons) are produced by
 `Combined_Ito.py` and `Combined_Fickian.py` in **`python_paper_figures/`**, which
-drive the framework at the repository root.
+drive the framework at the repository root. See `python_paper_figures/README.md` for
+the run commands, the PINN pretraining settings, and the supplement's numerical study.
 

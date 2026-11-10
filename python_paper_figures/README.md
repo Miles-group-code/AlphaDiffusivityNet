@@ -62,6 +62,23 @@ N_TRIALS=100 B0=250  FREQ=3 python Combined_Fickian_slurm.py
 `Combined_Ito.py` and `Combined_Fickian.py` are non-cluster variants with the parameters
 set directly in the script.
 
+The paper's runs used the CPU in float64. On other hardware or library versions the
+fits are not guaranteed to reproduce bit for bit.
+
+### PINN pretraining
+
+The PINN fits use constant-D pretraining (`pinn_pretrain="constant_d"`, the solver
+default). Before fine-tuning, the D network is set exactly to the scalar pre-fit and
+frozen, and only the u network is trained, on the physics loss plus a supervised fit to
+the finite-difference solution for that constant D. This is the same warm start BiLO
+uses. The Fickian scripts pretrain the u network with learning rate `lr_lower_pre = 1e-3`,
+and the Itô scripts use the default `1e-4`. `lr_d_pre` has no effect in this mode, since
+D is frozen. `pinn_pretrain="joint"` selects the older joint pretraining of D and u on the
+physics loss plus a scale anchor.
+
+The PINN results in earlier versions of the paper used joint pretraining with pretraining
+learning rate `1e-4`. To reproduce them, check out commit `9a9a521`.
+
 ## 2. Render the figures
 
 Once all five `.pkl` files are present, build the three manuscript figures:
