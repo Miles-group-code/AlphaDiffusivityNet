@@ -91,3 +91,86 @@ This writes `fig_ito_recovery.pdf`, `fig_fickian_highfreq.pdf`, and
 `fig_fickian_lowfreq.pdf`. Each panel row shows one condition: the recovered `D(x)` (true
 profile, per-method median, and 10th to 90th percentile band over the trials) on the left,
 and the distribution of the inferred source strength `b0` on the right.
+
+## 3. Supplement: numerical study
+
+The supplement's study of the numerics (sensitivity to the smoothness weight and the PINN
+residual weight, training curves, failure modes, example snapshots, and the
+hyperparameter and error tables) comes from three scripts:
+
+1. `Sweep_hyperparams.py` runs the fits.
+2. `compute_supp_numerics_derived.py` computes the quantities that need a forward solve.
+3. `plot_supp_numerics.py` draws the figures and writes the tables.
+
+### Running the sweeps
+
+`Sweep_hyperparams.py` runs one condition on seeds `SEED0 ... SEED0 + N_TRIALS - 1`. It
+imports the paper settings from `Combined_Fickian_slurm.py` or `Combined_Ito_slurm.py`
+unchanged, and seed `s` gives the same data snapshot as trial `s` of those scripts. A
+baseline run therefore reproduces the recovery fits, and a sweep run scales one weight
+relative to the paper value on the same data. It is configured with environment variables:
+
+| variable    | meaning |
+|-------------|---------|
+| `CONV`      | `fickian` or `ito` (required) |
+| `B0`        | true source strength, e.g. `250` or `1000` (required) |
+| `FREQ`      | `D(x) = 0.1 + 0.05 sin(2π FREQ x)`, e.g. `3` or `4` (required) |
+| `SWEEP`     | `baseline` (paper settings, default), `wreg` (smoothness weight `wreg_smooth`), or `wphys` (PINN residual weight `w_phys`) |
+| `MULT`      | multiplier of the swept weight relative to the paper value (`wreg`, `wphys` only) |
+| `METHODS`   | comma list from `dto,pinn,bilo` (default: every method the sweep applies to) |
+| `N_TRIALS`  | number of seeds (default `100`) |
+| `SEED0`     | first seed (default `1`) |
+| `N_WORKERS` | worker processes (default: all cores but one; `SLURM_CPUS_PER_TASK` takes precedence) |
+| `SWEEP_DIR` | results root (default `sweep_results/` in this folder) |
+| `PILOT`     | `1` = very short training, results under `PILOT_<tag>/` (smoke test only) |
+
+The supplement uses these runs, all with `CONV=fickian FREQ=3`:
+
+```
+export CONV=fickian FREQ=3
+B0=1000 SWEEP=baseline python Sweep_hyperparams.py                       # DTO, PINN, BiLO
+B0=1000 SWEEP=wreg  MULT=<m> python Sweep_hyperparams.py                 # m = 0.1 0.2 0.5 2 5 10
+B0=1000 SWEEP=wphys MULT=<m> python Sweep_hyperparams.py                 # m = 0.1 0.2 0.5 2 5 10
+B0=1000 SWEEP=wphys MULT=<m> N_TRIALS=15 python Sweep_hyperparams.py     # m = 20 50 100
+B0=250  SWEEP=baseline METHODS=dto python Sweep_hyperparams.py
+B0=250  SWEEP=wreg MULT=<m> METHODS=dto python Sweep_hyperparams.py      # m = 0.1 0.2 0.5 2 5 10
+```
+
+Each fit is saved as `sweep_results/<Conv>_b<B0>_f<FREQ>_<sweep>[_x<mult>]/<method>_s<seed>.pkl`,
+for example `sweep_results/Fickian_b1000_f3_wreg_x0.5/bilo_s042.pkl`. Each file holds the
+recovered `D`, `u`, and `b0`, the particles, the training history (including the D error
+at every logged iteration), the compressed solver log (`log_bz2`), the run time, the
+settings, and the environment. A settings fingerprint (settings, network configuration,
+and md5 hashes of the code) is stored with each fit. A rerun skips every fit already on
+disk with a matching fingerprint and stops with an error on a mismatch, so an interrupted
+run resumes where it stopped. Failed fits write `<name>.err`, non-finite fits are kept as
+`<name>.nonfinite.pkl`, and the exit status is nonzero if any fit failed.
+
+The sweeps are expensive. On one core a fit takes about 4 minutes for DTO, 30 minutes for
+PINN, and 2 hours for BiLO, so the full set above is a few thousand core-hours. The
+runner parallelizes over fits, one thread each, and is meant for a cluster node. Under
+SLURM it uses `SLURM_CPUS_PER_TASK` workers. A quick check of the whole pipeline takes a
+few minutes:
+
+```
+PILOT=1 CONV=fickian B0=1000 FREQ=3 N_TRIALS=2 python Sweep_hyperparams.py
+```
+
+### Supplement figures and tables
+
+With the sweeps in `sweep_results/` and the Fickian recovery pickles
+`CCombined_Fickian_b{250,1000}_t100_3_data.pkl` from section 1 in this folder, run
+
+```
+python compute_supp_numerics_derived.py
+python plot_supp_numerics.py
+```
+
+The first script writes `supp_numerics_derived.pkl`: the data loss at the true D per
+seed, the forward consistency of each method's fit against an FDM solve, and the example
+snapshots. It takes a few minutes. The second also reads all five `CCombined_*_data.pkl`
+files for the error table and writes `fig_supp_smoothness.pdf`,
+`fig_supp_pinn_wres.pdf`, `fig_supp_training.pdf`, `fig_supp_snapshots.pdf`,
+`fig_supp_failure_modes.pdf`, `tab_supp_hyperparams.tex`, `tab_supp_errors.tex`, and
+`supp_numerics_summary.csv`. Both scripts honour `SWEEP_DIR`, and `OUT_DIR` sets where
+the outputs go.
