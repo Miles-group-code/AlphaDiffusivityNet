@@ -392,12 +392,18 @@ def _compute_bc_loss_neumann(
     bc_grad_details = {}
 
     # Compute gradient of neumann bc w.r.t d, d_x, d_xx, etc.
+    # For a perturbation h of D, delta(u_x) = sum_k [(u_{D^(k)})' h^(k) + u_{D^(k)} h^(k+1)].
+    # Autograd w.r.t. the D^(i) input only yields (u_{D^(i)})'; the product-rule term
+    # u_{D^(i-1)} is added explicitly (same correction as in _calc_physics_loss).
     for i in range(local_op.order+1):
         d0_term = d0_list[i]
         d1_term = d1_list[i]
         g0 = torch.autograd.grad(u0_x, d0_term, grad_outputs=torch.ones_like(u0), create_graph=True)[0]
         g1 = torch.autograd.grad(u1_x, d1_term, grad_outputs=torch.ones_like(u1), create_graph=True)[0]
-        
+        if i >= 1:
+            g0 = g0 + torch.autograd.grad(u0, d0_list[i-1], grad_outputs=torch.ones_like(u0), create_graph=True)[0]
+            g1 = g1 + torch.autograd.grad(u1, d1_list[i-1], grad_outputs=torch.ones_like(u1), create_graph=True)[0]
+
         term_loss = torch.mean(g0 ** 2 + g1 ** 2)
         total_bc_grad_loss = total_bc_grad_loss + term_loss
         bc_grad_details[f"bc_grad_d{i}"] = term_loss
