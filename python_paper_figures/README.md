@@ -171,6 +171,6 @@ seed, the forward consistency of each method's fit against an FDM solve, and the
 snapshots. It takes a few minutes. The second also reads all five `CCombined_*_data.pkl`
 files for the error table and writes `fig_supp_smoothness.pdf`,
 `fig_supp_pinn_wres.pdf`, `fig_supp_training.pdf`, `fig_supp_snapshots.pdf`,
-`fig_supp_failure_modes.pdf`, `tab_supp_hyperparams.tex`, `tab_supp_errors.tex`, and
+`fig_supp_failure_modes.pdf`, `fig_supp_shape_scatter.pdf`, `tab_supp_hyperparams.tex`, `tab_supp_errors.tex`, and
 `supp_numerics_summary.csv`. Both scripts honour `SWEEP_DIR`, and `OUT_DIR` sets where
 the outputs go.

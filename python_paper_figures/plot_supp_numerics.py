@@ -17,8 +17,11 @@ lambda_smooth sweep at b0 = 250 is added to the error panels of fig_supp_smoothn
     fig_supp_training.pdf     training curves at the main-text settings
     fig_supp_snapshots.pdf    example particle snapshots: u_true, each trial's own fits (u and D)
     fig_supp_failure_modes.pdf collapse / boundary growth of single-snapshot fits
+    fig_supp_shape_scatter.pdf correlation with the true D against L2 error, every single fit,
+                              with the median of single fits and the median curve
     tab_supp_hyperparams.tex  per-method loss weights and learning rates
-    tab_supp_errors.tex       per-trial and median-curve errors, all five conditions
+    tab_supp_errors.tex       per-trial and median-curve errors and correlations with the
+                              true D, all five conditions
     supp_numerics_summary.csv every sweep number used in the text
 
 Run from this folder:  python plot_supp_numerics.py
@@ -517,7 +520,13 @@ def recovery_stats(path):
         # median D is the error of the plotted median.
         keep = b <= cutoff
         D, b, err = D[keep], b[keep], err[keep]
+        # Pearson correlation with D_true over the whole x_plot grid: how well the fit
+        # follows where D is high or low, whatever its mean and scale (undefined for a
+        # constant D).
+        corr = np.array([np.corrcoef(d, d_true)[0, 1] for d in D])
+        medcurve_corr = float(np.corrcoef(np.median(D, axis=0), d_true)[0, 1])
         out[m] = {"err": err, "medcurve": rel_l2(np.median(D, axis=0), d_true),
+                  "corr": corr, "medcurve_corr": medcurve_corr,
                   "b_rel": np.abs(b - b_true) / b_true,
                   "n_filtered": n_filtered,
                   "flat": rel_l2(np.full_like(d_true, np.trapz(d_true, x)), d_true)}
@@ -525,9 +534,16 @@ def recovery_stats(path):
 
 
 def table_errors():
-    lines = [r"\begin{tabular}{ll r l ccc}", r"\toprule",
-             r"Model & $D_{\mathrm{true}}-0.1$ & $b_0$ & Method & per-trial error of $D$ & "
-             r"error of median $D$ & per-trial error of $b_0$ \\", r"\midrule"]
+    def fmt_corr(v):
+        """Correlation for a table cell, with a math minus sign for negatives."""
+        return f"${v:.2f}$" if v < 0 else f"{v:.2f}"
+
+    lines = [r"\begin{tabular}{ll r l ccccc}", r"\toprule",
+             r" & & & & \multicolumn{2}{c}{error of $D$} & \multicolumn{2}{c}{correlation of $D$} & "
+             r"error of $b_0$ \\",
+             r"\cmidrule(lr){5-6}\cmidrule(lr){7-8}\cmidrule(lr){9-9}",
+             r"Model & $D_{\mathrm{true}}-0.1$ & $b_0$ & Method & per trial & median $D$ & "
+             r"per trial & median $D$ & per trial \\", r"\midrule"]
     total_filtered = 0
     removed = []
     for i, (model, prof, b0, path) in enumerate(RECOVERY_CONDITIONS):
@@ -538,6 +554,9 @@ def table_errors():
         best_err = min(round(float(np.median(st[m]["err"])), 2) for m in METHODS)
         best_med = min(round(float(st[m]["medcurve"]), 2) for m in METHODS)
         best_b = min(round(float(np.median(st[m]["b_rel"])), 3) for m in METHODS)
+        # For the correlations the largest value is the best.
+        best_corr = max(round(float(np.median(st[m]["corr"])), 2) for m in METHODS)
+        best_medcorr = max(round(float(st[m]["medcurve_corr"]), 2) for m in METHODS)
 
         def shade(value, best, digits):
             return r"\cellcolor{mint}" if round(float(value), digits) == best else ""
@@ -547,21 +566,30 @@ def table_errors():
             total_filtered += s["n_filtered"]
             if s["n_filtered"]:
                 removed.append(f"{path} {m}: {s['n_filtered']}")
-            lead = f"{model} & $0.05{prof[1:]} & {b0}" if j == 0 else " & & "
+            # The model name goes on two lines ("It\^o," / "Dirichlet") to keep the table narrow.
+            conv, bc = model.split(", ")
+            lead = (f"{conv}, & $0.05{prof[1:]} & {b0}" if j == 0
+                    else f"{bc} & & " if j == 1 else " & & ")
             lines.append(
                 f"{lead} & {m} & {shade(np.median(s['err']), best_err, 2)}{np.median(s['err']):.2f} "
                 f"[{np.percentile(s['err'], 10):.2f}, {np.percentile(s['err'], 90):.2f}] & "
                 f"{shade(s['medcurve'], best_med, 2)}{s['medcurve']:.2f} & "
+                f"{shade(np.median(s['corr']), best_corr, 2)}{fmt_corr(np.median(s['corr']))} "
+                f"[{fmt_corr(np.percentile(s['corr'], 10))}, "
+                f"{fmt_corr(np.percentile(s['corr'], 90))}] & "
+                f"{shade(s['medcurve_corr'], best_medcorr, 2)}{fmt_corr(s['medcurve_corr'])} & "
                 f"{shade(np.median(s['b_rel']), best_b, 3)}{np.median(s['b_rel']):.3f} "
                 f"[{np.percentile(s['b_rel'], 10):.3f}, {np.percentile(s['b_rel'], 90):.3f}] \\\\")
-        lines.append(f" & & & constant $D$ & {st['DTO']['flat']:.2f} & {st['DTO']['flat']:.2f} & -- \\\\")
+        lines.append(f" & & & constant $D$ & {st['DTO']['flat']:.2f} & {st['DTO']['flat']:.2f} "
+                     f"& -- & -- & -- \\\\")
         if i < len(RECOVERY_CONDITIONS) - 1:
             lines.append(r"\midrule")
     lines += [r"\bottomrule", r"\end{tabular}"]
     with open(os.path.join(OUT_DIR, "tab_supp_errors.tex"), "w", encoding="utf-8") as f:
         f.write("% Written by plot_supp_numerics.py from the CCombined_*_data.pkl runs. "
                 "Do not edit by hand.\n")
-        f.write(f"% Relative L2 errors, median [10th, 90th percentile] over the trials kept by "
+        f.write(f"% Relative L2 errors and Pearson correlations with D_true over the whole x grid "
+                f"(undefined for constant D), median [10th, 90th percentile] over the trials kept by "
                 f"the b0 outlier filter of the recovery figures (drop b0 > {FILTER_MULT['DTO']:g} "
                 f"times the median over trials, all methods), which removed {total_filtered} of 1500 trials"
                 + (": " + "; ".join(removed) if removed else "") + ".\n")
@@ -616,6 +644,7 @@ def main():
     figure_smoothness(stats_wreg, refs, stats_b250)
     figure_pinn_wres(stats_wres, refs)
     figure_failure_modes()
+    figure_shape_scatter()
     table_hyperparams()
     table_errors()
     write_summary(stats_wreg, stats_wres, refs, stats_b250, refs_b250)
@@ -740,6 +769,70 @@ def figure_failure_modes():
                "fraction of fits\n$\\leftarrow$ growth      collapse $\\rightarrow$", "c")
     ax.legend(fontsize=LEGEND, loc="upper center")
     save(fig, "fig_supp_failure_modes.pdf")
+
+
+def figure_shape_scatter():
+    """Correlation with D_true against relative L2 error, one light dot per single fit (the
+    fits and values of tab_supp_errors.tex). Per method, a marker at the median of the single
+    fits and an arrow to a star at the pointwise median curve. The best constant D (the true
+    mean) has an L2 error but no correlation, so it is a vertical line, not a point."""
+    stats = [recovery_stats(path) for *_, path in RECOVERY_CONDITIONS]
+    const_label = "best constant $D$ (true mean)"
+    fig = plt.figure(figsize=(16, 7.5), constrained_layout=True)
+    axes = fig.subplots(2, 3)
+    n_chunks = 10
+    for i, ((model, prof, b0, _), st, ax) in enumerate(zip(RECOVERY_CONDITIONS, stats, axes.flat)):
+        ax.axhline(0, color="0.6", lw=1, zorder=1, label="zero correlation")
+        ax.axvline(st["DTO"]["flat"], color="0.62", ls=":", lw=1.1, zorder=1, label=const_label)
+        # Interleave the methods in small chunks so that no cloud is drawn entirely on top.
+        for c in range(n_chunks):
+            for m in METHODS:
+                s = st[m]
+                sl = slice(c * len(s["err"]) // n_chunks, (c + 1) * len(s["err"]) // n_chunks)
+                ax.scatter(s["err"][sl], s["corr"][sl], color=COLORS[m], marker=MARKERS[m],
+                           lw=0, zorder=2, label=f"{m}, single fits" if c == 0 else "_nolegend_",
+                           s=16, alpha=0.35)
+        for m in METHODS:
+            s = st[m]
+            star = (s["medcurve"], s["medcurve_corr"])
+            single = (np.median(s["err"]), np.median(s["corr"]))
+            ax.annotate("", xy=star, xytext=single, zorder=3,
+                        arrowprops=dict(arrowstyle="-|>", color=COLORS[m], lw=1.2,
+                                        mutation_scale=11, shrinkA=6, shrinkB=9))
+            ax.scatter(*single, s=55, marker=MARKERS[m], color=COLORS[m],
+                       edgecolor="black", lw=1, zorder=4)
+            ax.scatter(*star, s=260, marker="*", color=COLORS[m], edgecolor="black",
+                       lw=1.2, zorder=5)
+        name = model.replace("It\\^o", "It\u00f4")
+        style_axes(ax, f"{name}, {prof}, $b_0={b0}$", r"rel. $L^2$ error of $D$",
+                   r"correlation with $D_{\mathrm{true}}$", "abcde"[i])
+        # Panel letter bottom left: the top-left corner holds the best fits (DTO star in (e)).
+        ax.texts[-1].set_position((0.03, 0.04))
+        ax.texts[-1].set_va("bottom")
+        # Log scale: the clouds sit at 0.2-1.5, but a few fits reach errors of ~4.4.
+        ax.set_xscale("log")
+        ax.set_xlim(0.15, 5)
+        ax.set_xticks([0.2, 0.5, 1, 2, 5])
+        ax.set_xticklabels(["0.2", "0.5", "1", "2", "5"])
+        ax.minorticks_off()
+        ax.set_ylim(-1, 1)
+        if i % 3:
+            ax.set_ylabel("")
+    h, l = axes.flat[0].get_legend_handles_labels()
+    hh = [h[l.index(f"{m}, single fits")] for m in METHODS]
+    ll = [f"{m}, single fits" for m in METHODS]
+    # Method colours come from the single-fit entries; one generic entry per summary.
+    hh += [plt.Line2D([], [], ls="none", marker="o", ms=8, mfc="0.7", mec="black"),
+           plt.Line2D([], [], ls="none", marker="*", ms=16, mfc="0.7", mec="black")]
+    ll += ["median of single fits", "pointwise median curve"]
+    hh += [h[l.index(const_label)], h[l.index("zero correlation")]]
+    ll += [const_label, "zero correlation"]
+    axes.flat[5].axis("off")
+    leg = axes.flat[5].legend(hh, ll, fontsize=LEGEND + 4, loc="center")
+    for lh in leg.legend_handles[:3]:
+        lh.set_alpha(0.8)
+        lh.set_sizes([60])
+    save(fig, "fig_supp_shape_scatter.pdf")
 
 
 MAX_ITERS = 7000
