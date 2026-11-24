@@ -148,6 +148,7 @@ def evaluate_bilo(
         curr_d = torch.autograd.grad(curr_d, x, grad_outputs=torch.ones_like(curr_d), create_graph=True)[0]
         d_list.append(curr_d)
 
+    # maybe: d_list = [t * 1.0 for t in d_list]  (exp saves its output, so d_x depends on node d and grad(., d_list[0]) also flows through d_x)
     u, phi_z = local_op(x, d_list, z_tensor)
     return d_list, u, phi_z
 
